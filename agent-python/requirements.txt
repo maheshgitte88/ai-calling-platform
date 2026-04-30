@@ -1,0 +1,24 @@
+# LiveKit Agents
+livekit-agents>=1.4.0
+livekit-plugins-deepgram>=1.4.0
+livekit-plugins-assemblyai>=1.4.0
+livekit-plugins-elevenlabs>=1.4.0
+livekit-plugins-cartesia>=1.4.0
+livekit-plugins-inworld>=1.4.0
+livekit-plugins-sarvam>=1.4.0
+livekit-plugins-openai>=1.4.0
+livekit-plugins-google>=1.4.0
+livekit-plugins-xai>=1.4.0
+
+# LiveKit Server SDK (SIP, etc.)
+livekit-api>=0.10.0
+
+# LLM/GenAI providers
+openai>=1.0.0
+google-generativeai>=0.8.0
+
+# MongoDB
+pymongo>=4.6.0
+
+# Utilities
+python-dotenv>=1.0.0
