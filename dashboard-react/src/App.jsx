@@ -16,20 +16,26 @@ export default function App() {
         <Route path="/interview/join" element={<InterviewJoin />} />
         <Route
           path="*"
-          element={(
+          element={
             <Layout>
               <Routes>
                 <Route path="/" element={<Clients />} />
                 <Route path="/clients" element={<Clients />} />
-                <Route path="/clients/:clientId/config" element={<ClientConfig />} />
+                <Route
+                  path="/clients/:clientId/config"
+                  element={<ClientConfig />}
+                />
                 <Route path="/calls" element={<Calls />} />
                 <Route path="/campaigns" element={<Campaigns />} />
                 <Route path="/interviews" element={<Interviews />} />
                 <Route path="/playground" element={<Playground />} />
-                <Route path="/interview-candidate" element={<InterviewCandidate />} />
+                <Route
+                  path="/interview-candidate"
+                  element={<InterviewCandidate />}
+                />
               </Routes>
             </Layout>
-          )}
+          }
         />
       </Routes>
     </BrowserRouter>
