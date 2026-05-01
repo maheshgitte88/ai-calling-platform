@@ -1,11 +1,14 @@
 import { Link, useLocation } from "react-router-dom";
-import { Phone, Users, PhoneCall, FileSpreadsheet, Play } from "lucide-react";
+import { Phone, Users, PhoneCall, FileSpreadsheet, Play, Video, ClipboardList } from "lucide-react";
+import PoweredByHirecorrecto from "./PoweredByHirecorrecto";
 
 const nav = [
   { path: "/clients", label: "Clients", icon: Users },
   { path: "/calls", label: "Calls", icon: PhoneCall },
   { path: "/campaigns", label: "Campaigns", icon: FileSpreadsheet },
+  { path: "/interviews", label: "Interviews", icon: ClipboardList },
   { path: "/playground", label: "Playground", icon: Play },
+  { path: "/interview-candidate", label: "Interview Candidate", icon: Video },
 ];
 
 export default function Layout({ children }) {
@@ -34,7 +37,10 @@ export default function Layout({ children }) {
           ))}
         </nav>
       </aside>
-      <main style={styles.main}>{children}</main>
+      <main style={styles.main}>
+        <div style={{ flex: 1, minHeight: 0 }}>{children}</div>
+        <PoweredByHirecorrecto style={{ paddingTop: 20, paddingBottom: 4 }} />
+      </main>
     </div>
   );
 }
@@ -75,5 +81,9 @@ const styles = {
     padding: "2rem",
     background: "#f8fafc",
     overflow: "auto",
+    display: "flex",
+    flexDirection: "column",
+    minHeight: "100vh",
+    boxSizing: "border-box",
   },
 };

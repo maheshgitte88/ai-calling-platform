@@ -143,7 +143,20 @@ Each client has a config document:
 
 - Full architecture and scaling guide: `docs/ARCHITECTURE.md`
 - End-to-end call lifecycle and status flow: `docs/CALL_FLOW.md`
+- Video interview agent end-to-end guide: `docs/LIVEKIT_VIDEO_INTERVIEW_E2E.md`
 - SIP setup notes: `docs/SIP.md`
+
+## Interview Agent (Phase 1)
+
+- Backend endpoints:
+  - `POST /api/interviews/session/start`
+  - `POST /api/interviews/session/:sessionId/end`
+  - `GET /api/interviews/session/:sessionId`
+  - `POST /api/interviews/session/:sessionId/event`
+- Candidate UI route: `/interview-candidate` (in `dashboard-react`)
+- Python worker entrypoint: `agent-python/interview_agent_entrypoint.py`
+  - Run with: `python interview_agent_entrypoint.py dev`
+  - Use `INTERVIEW_AGENT_NAME=ai-interview-agent` in backend + agent env to target this worker.
 
 ## License
 

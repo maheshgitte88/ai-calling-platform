@@ -12,10 +12,11 @@ const dispatchClient = new AgentDispatchClient(
  * @param {Object} params
  * @param {string} params.roomName - LiveKit room name
  * @param {Record<string, unknown>} params.callMetadata - Metadata passed to agent (callId, clientId, phone, etc.)
+ * @param {string} [params.agentName] - Optional LiveKit agent name override
  * @returns {Promise<{dispatchId: string}>}
  */
-export async function createDispatch({ roomName, callMetadata }) {
-  const dispatch = await dispatchClient.createDispatch(roomName, env.AGENT_NAME, {
+export async function createDispatch({ roomName, callMetadata, agentName }) {
+  const dispatch = await dispatchClient.createDispatch(roomName, agentName || env.AGENT_NAME, {
     metadata: JSON.stringify(callMetadata),
   });
   return { dispatchId: dispatch.id };

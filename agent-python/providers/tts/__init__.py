@@ -30,12 +30,22 @@ def get_tts(provider: str, api_key: str, voice: str, model: str = None, target_l
             model=_model,
         )
     if provider == "deepgram":
-        # Aura / Aura 2 - model: aura, aura-2, aura-asteria-en. Voice: apollo, athena, odysseus, theia
-        return deepgram.TTS(
-            api_key=api_key,
-            model=model or "aura-2",
-            voice=voice or "athena",
-        )
+        # Deepgram model compatibility varies by account/plugin version.
+        # Normalize to a broadly supported legacy model when needed.
+        resolved_model = (model or "aura-asteria-en").strip()
+        if resolved_model == "aura-2":
+            resolved_model = "aura-asteria-en"
+        kwargs = {
+            "api_key": api_key,
+            "model": resolved_model,
+            "voice": voice or "athena",
+        }
+        try:
+            return deepgram.TTS(**kwargs)
+        except TypeError:
+            # Compatibility fallback for plugin versions where `voice` is unsupported.
+            kwargs.pop("voice", None)
+            return deepgram.TTS(**kwargs)
     if provider == "inworld":
         return inworld.TTS(
             api_key=api_key,

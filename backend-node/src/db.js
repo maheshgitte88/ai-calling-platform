@@ -35,6 +35,10 @@ export const COLLECTIONS = {
   CONTACTS: "contacts",
   CALLS: "calls",
   TRANSCRIPT_ENTRIES: "transcript_entries",
+  INTERVIEWS: "interviews",
+  INTERVIEW_SESSIONS: "interview_sessions",
+  INTERVIEW_EVENTS: "interview_events",
+  INTERVIEW_EVALUATIONS: "interview_evaluations",
   PROVIDERS: "providers",
   USERS: "users",
 };
@@ -51,4 +55,9 @@ export async function createIndexes() {
   await d.collection(COLLECTIONS.CONTACTS).createIndex({ campaign_id: 1 });
   await d.collection(COLLECTIONS.CLIENTS).createIndex({ created_at: -1 });
   await d.collection(COLLECTIONS.CAMPAIGNS).createIndex({ client_id: 1 });
+  await d.collection(COLLECTIONS.INTERVIEW_SESSIONS).createIndex({ session_id: 1 }, { unique: true });
+  await d.collection(COLLECTIONS.INTERVIEW_SESSIONS).createIndex({ interview_id: 1, candidate_id: 1 });
+  await d.collection(COLLECTIONS.INTERVIEW_SESSIONS).createIndex({ created_at: -1 });
+  await d.collection(COLLECTIONS.INTERVIEW_EVENTS).createIndex({ session_id: 1, created_at: 1 });
+  await d.collection(COLLECTIONS.INTERVIEW_EVALUATIONS).createIndex({ session_id: 1 }, { unique: true });
 }

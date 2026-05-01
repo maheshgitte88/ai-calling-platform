@@ -3,10 +3,12 @@ import cors from "cors";
 import multer from "multer";
 import fs from "node:fs";
 import path from "node:path";
+import crypto from "node:crypto";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
 import { getDb, COLLECTIONS } from "./db.js";
 import { createDispatch, cancelDispatch } from "./livekit.js";
+import { env } from "./config.js";
 import { callQueue } from "./queues.js";
 import { parseContactsFromSheet, safeRemoveFile } from "./excel.js";
 import { LLM_PROVIDERS, STT_PROVIDERS, TTS_PROVIDERS, SIP_PROVIDERS } from "./providers.js";
@@ -26,6 +28,43 @@ function digitsOnly(value) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function b64url(input) {
+  return Buffer.from(input).toString("base64url");
+}
+
+function fromB64url(input) {
+  return Buffer.from(input, "base64url").toString("utf8");
+}
+
+function getJoinTokenSecret() {
+  return env.INTERVIEW_JOIN_TOKEN_SECRET || env.LIVEKIT_API_SECRET;
+}
+
+function signInterviewJoinToken(payload) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const encodedHeader = b64url(JSON.stringify(header));
+  const encodedPayload = b64url(JSON.stringify(payload));
+  const unsigned = `${encodedHeader}.${encodedPayload}`;
+  const sig = crypto.createHmac("sha256", getJoinTokenSecret()).update(unsigned).digest("base64url");
+  return `${unsigned}.${sig}`;
+}
+
+function verifyInterviewJoinToken(token) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 3) throw new Error("Invalid join token format");
+  const [encodedHeader, encodedPayload, sig] = parts;
+  const unsigned = `${encodedHeader}.${encodedPayload}`;
+  const expected = crypto.createHmac("sha256", getJoinTokenSecret()).update(unsigned).digest("base64url");
+  const sigBuf = Buffer.from(sig);
+  const expectedBuf = Buffer.from(expected);
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    throw new Error("Invalid join token signature");
+  }
+  const payload = JSON.parse(fromB64url(encodedPayload));
+  if (!payload?.exp || Date.now() > payload.exp) throw new Error("Join token expired");
+  return payload;
 }
 
 // ----- Schemas -----
@@ -136,6 +175,82 @@ const BulkCallsSchema = z.object({
       fromNumber: z.string().optional(),
     }).partial().optional(),
   }).partial().optional(),
+});
+
+const StartInterviewSessionSchema = z.object({
+  candidateId: z.string().min(1),
+  interviewId: z.string().min(1),
+  candidate: z.object({
+    name: z.string().optional(),
+    email: z.string().optional(),
+    yearsExperience: z.number().optional(),
+    skills: z.array(z.string()).optional(),
+  }).partial().optional(),
+  interviewMeta: z.object({
+    title: z.string().optional(),
+    language: z.string().optional(),
+    durationMinutes: z.number().int().positive().max(180).optional(),
+    mustAskTopics: z.array(z.string()).optional(),
+    scoringRubric: z.record(z.number()).optional(),
+    customFields: z.record(z.unknown()).optional(),
+    instructions: z.string().optional(),
+  }).partial().optional(),
+  jd: z.object({
+    id: z.string().optional(),
+    title: z.string().optional(),
+    text: z.string().optional(),
+    url: z.string().optional(),
+    version: z.string().optional(),
+  }).partial().optional(),
+  interviewRules: z.object({
+    forbidExternalHelp: z.boolean().optional(),
+    requireCameraOn: z.boolean().optional(),
+    requireScreenShare: z.boolean().optional(),
+    languagePolicy: z.string().optional(),
+    antiCheatLevel: z.enum(["off", "basic", "strict"]).optional(),
+  }).partial().optional(),
+  providerConfig: z.object({
+    llm: z.object({
+      provider: z.string().optional(),
+      apiKey: z.string().optional(),
+      model: z.string().optional(),
+    }).partial().optional(),
+    stt: z.object({
+      provider: z.string().optional(),
+      apiKey: z.string().optional(),
+      model: z.string().optional(),
+      language: z.string().nullish(),
+      mode: z.string().nullish(),
+    }).partial().optional(),
+    tts: z.object({
+      provider: z.string().optional(),
+      apiKey: z.string().optional(),
+      voice: z.string().optional(),
+      model: z.string().optional(),
+      targetLanguageCode: z.string().nullish(),
+    }).partial().optional(),
+  }).partial().optional(),
+  vision: z.object({
+    enabled: z.boolean().optional(),
+    sampleEverySeconds: z.number().positive().max(120).optional(),
+  }).partial().optional(),
+});
+
+const EndInterviewSessionSchema = z.object({
+  reason: z.string().optional(),
+});
+
+const StandardTokenEndpointSchema = z.object({
+  room_name: z.string().optional(),
+  participant_identity: z.string().optional(),
+  participant_name: z.string().optional(),
+  participant_metadata: z.string().optional(),
+  participant_attributes: z.record(z.string()).optional(),
+  room_config: z.unknown().optional(),
+});
+
+const ResolveInterviewSessionSchema = z.object({
+  joinToken: z.string().min(1),
 });
 
 // ----- Health -----
@@ -552,6 +667,319 @@ app.get("/api/campaigns", async (req, res) => {
   const filter = clientId ? { client_id: clientId } : {};
   const items = await db.collection(COLLECTIONS.CAMPAIGNS).find(filter).sort({ created_at: -1 }).limit(100).toArray();
   res.json({ items });
+});
+
+// ----- Interview sessions (candidate video) -----
+function buildInterviewRoomName(interviewId, candidateId) {
+  return `interview-${interviewId}-${candidateId}-${Date.now()}`.slice(0, 128);
+}
+
+function candidateIdentity(candidateId) {
+  return `candidate_${candidateId}`;
+}
+
+app.post("/api/interviews/session/start", async (req, res) => {
+  try {
+    const payload = StartInterviewSessionSchema.parse(req.body);
+    const db = getDb();
+    const { AccessToken } = await import("livekit-server-sdk");
+
+    const sessionId = uuidv4();
+    const roomName = buildInterviewRoomName(payload.interviewId, payload.candidateId);
+    const participantIdentity = candidateIdentity(payload.candidateId);
+    const participantName = payload.candidate?.name || "Candidate";
+    const durationMinutes = payload.interviewMeta?.durationMinutes ?? 35;
+    const expiresAt = new Date(Date.now() + Math.max(5, durationMinutes + 10) * 60 * 1000);
+
+    const token = new AccessToken(env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET, {
+      identity: participantIdentity,
+      name: participantName,
+      ttl: `${Math.max(5, durationMinutes + 10)}m`,
+    });
+    token.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true, canPublishData: true });
+
+    const dispatchMetadata = {
+      mode: "video_interview",
+      sessionId,
+      interviewId: payload.interviewId,
+      candidateId: payload.candidateId,
+      candidateProfile: payload.candidate ?? {},
+      jd: payload.jd ?? {},
+      interviewRules: payload.interviewRules ?? {},
+      interviewMeta: {
+        title: payload.interviewMeta?.title ?? "AI Interview",
+        language: payload.interviewMeta?.language ?? "en",
+        durationMinutes,
+        mustAskTopics: payload.interviewMeta?.mustAskTopics ?? [],
+        scoringRubric: payload.interviewMeta?.scoringRubric ?? {},
+        customFields: payload.interviewMeta?.customFields ?? {},
+        instructions: payload.interviewMeta?.instructions ?? "",
+      },
+      providerConfig: payload.providerConfig ?? {
+        stt: { provider: "deepgram", model: "nova-3" },
+        tts: { provider: "deepgram", model: "aura-asteria-en" },
+      },
+      vision: {
+        enabled: payload.vision?.enabled ?? false,
+        sampleEverySeconds: payload.vision?.sampleEverySeconds ?? 10,
+      },
+    };
+
+    await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).insertOne({
+      session_id: sessionId,
+      interview_id: payload.interviewId,
+      candidate_id: payload.candidateId,
+      room_name: roomName,
+      participant_identity: participantIdentity,
+      participant_name: participantName,
+      dispatch_id: null,
+      status: "waiting",
+      ended_reason: null,
+      metadata: dispatchMetadata,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    });
+
+    const joinToken = signInterviewJoinToken({
+      sid: sessionId,
+      cid: payload.candidateId,
+      iid: payload.interviewId,
+      exp: Date.now() + 45 * 60 * 1000,
+      n: crypto.randomBytes(8).toString("hex"),
+    });
+    const candidateJoinUrl = `${env.APP_BASE_URL.replace(/\/$/, "")}/interview/join?token=${encodeURIComponent(joinToken)}`;
+
+    res.status(201).json({
+      sessionId,
+      roomName,
+      participantIdentity,
+      participantName,
+      token: await token.toJwt(),
+      wsUrl: env.LIVEKIT_URL,
+      expiresAt: expiresAt.toISOString(),
+      candidateJoinUrl,
+      joinToken,
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post("/api/interviews/session/resolve", async (req, res) => {
+  try {
+    const { joinToken } = ResolveInterviewSessionSchema.parse(req.body ?? {});
+    const decoded = verifyInterviewJoinToken(joinToken);
+    const db = getDb();
+    const session = await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).findOne({ session_id: decoded.sid });
+    if (!session) return res.status(404).json({ error: "Interview session not found" });
+    if (session.candidate_id !== decoded.cid) return res.status(403).json({ error: "Candidate mismatch" });
+    if (session.status === "completed") return res.status(400).json({ error: "Interview already completed" });
+    if (session.status === "ended") return res.status(400).json({ error: "Interview already ended" });
+
+    let activeSession = session;
+    if (!session.dispatch_id) {
+      const sid = session.session_id;
+      // Only one request may move waiting → dispatching. Do not match dispatch_id:null while status is
+      // already "dispatching", or concurrent resolves (e.g. React Strict Mode) both call createDispatch.
+      const claim = await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+        { session_id: sid, dispatch_id: null, status: "waiting" },
+        { $set: { status: "dispatching", dispatch_requested_at: nowIso(), updated_at: nowIso() } }
+      );
+
+      if (claim.modifiedCount === 1) {
+        try {
+          const { dispatchId } = await createDispatch({
+            roomName: session.room_name,
+            callMetadata: session.metadata || {},
+            agentName: env.INTERVIEW_AGENT_NAME || env.AGENT_NAME,
+          });
+          await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+            { session_id: sid },
+            { $set: { dispatch_id: dispatchId, status: "waiting", updated_at: nowIso() } }
+          );
+        } catch (dispatchErr) {
+          await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+            { session_id: sid },
+            { $set: { status: "waiting", updated_at: nowIso() } }
+          );
+          throw dispatchErr;
+        }
+      }
+
+      for (let attempt = 0; attempt < 40; attempt += 1) {
+        activeSession = await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).findOne({ session_id: sid });
+        if (activeSession?.dispatch_id) break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
+      if (!activeSession?.dispatch_id) {
+        return res.status(409).json({ error: "Agent is being prepared. Please retry in a moment." });
+      }
+    }
+
+    const { AccessToken } = await import("livekit-server-sdk");
+    const token = new AccessToken(env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET, {
+      identity: activeSession.participant_identity,
+      name: activeSession.participant_name || "Candidate",
+      ttl: "45m",
+    });
+    token.addGrant({
+      roomJoin: true,
+      room: activeSession.room_name,
+      canPublish: true,
+      canSubscribe: true,
+      canPublishData: true,
+    });
+
+    await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+      { session_id: activeSession.session_id },
+      { $set: { join_last_resolved_at: nowIso(), updated_at: nowIso() } }
+    );
+
+    res.json({
+      sessionId: activeSession.session_id,
+      roomName: activeSession.room_name,
+      participantIdentity: activeSession.participant_identity,
+      participantName: activeSession.participant_name,
+      token: await token.toJwt(),
+      wsUrl: env.LIVEKIT_URL,
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get("/api/interviews/sessions", async (req, res) => {
+  const db = getDb();
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+  const filter = {};
+  if (req.query.status) filter.status = req.query.status;
+  if (req.query.candidateId) filter.candidate_id = req.query.candidateId;
+  if (req.query.interviewId) filter.interview_id = req.query.interviewId;
+  const items = await db.collection(COLLECTIONS.INTERVIEW_SESSIONS)
+    .find(filter)
+    .sort({ created_at: -1 })
+    .limit(limit)
+    .toArray();
+  const sessionIds = items.map((it) => it.session_id).filter(Boolean);
+  const evalBySession = new Map();
+  if (sessionIds.length) {
+    const evals = await db.collection(COLLECTIONS.INTERVIEW_EVALUATIONS)
+      .find({ session_id: { $in: sessionIds } })
+      .project({ session_id: 1, overallPercent: 1, scores: 1 })
+      .toArray();
+    for (const ev of evals) {
+      if (ev?.session_id) evalBySession.set(ev.session_id, ev);
+    }
+  }
+  const enriched = items.map((it) => {
+    const ev = evalBySession.get(it.session_id);
+    const overall =
+      ev?.overallPercent ??
+      (typeof ev?.scores?.overall === "number" ? ev.scores.overall : null);
+    return { ...it, latest_overall_score: overall ?? null };
+  });
+  res.json({ items: enriched });
+});
+
+app.post("/api/interviews/session/:sessionId/end", async (req, res) => {
+  try {
+    const { reason } = EndInterviewSessionSchema.parse(req.body ?? {});
+    const db = getDb();
+    const session = await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).findOne({ session_id: req.params.sessionId });
+    if (!session) return res.status(404).json({ error: "Interview session not found" });
+
+    if (session.dispatch_id && ["created", "waiting", "dispatching", "in_progress"].includes(session.status)) {
+      try {
+        await cancelDispatch(session.dispatch_id);
+      } catch {
+        // best effort
+      }
+    }
+
+    await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+      { session_id: req.params.sessionId },
+      { $set: { status: "ended", ended_reason: reason || "candidate_ended", updated_at: nowIso() } }
+    );
+
+    res.json({ ok: true, sessionId: req.params.sessionId });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get("/api/interviews/session/:sessionId", async (req, res) => {
+  const db = getDb();
+  const session = await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).findOne({ session_id: req.params.sessionId });
+  if (!session) return res.status(404).json({ error: "Interview session not found" });
+
+  const events = await db.collection(COLLECTIONS.INTERVIEW_EVENTS)
+    .find({ session_id: req.params.sessionId })
+    .sort({ created_at: 1 })
+    .toArray();
+  const evaluation = await db.collection(COLLECTIONS.INTERVIEW_EVALUATIONS).findOne({ session_id: req.params.sessionId });
+
+  res.json({ session, events, evaluation: evaluation || null });
+});
+
+app.get("/api/interviews/evaluations/:sessionId", async (req, res) => {
+  const db = getDb();
+  const evaluation = await db.collection(COLLECTIONS.INTERVIEW_EVALUATIONS).findOne({ session_id: req.params.sessionId });
+  if (!evaluation) return res.status(404).json({ error: "Evaluation not found" });
+  res.json(evaluation);
+});
+
+app.post("/api/interviews/session/:sessionId/event", async (req, res) => {
+  try {
+    const body = z.object({
+      type: z.string().min(1),
+      payload: z.record(z.unknown()).default({}),
+    }).parse(req.body);
+
+    const db = getDb();
+    const session = await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).findOne({ session_id: req.params.sessionId });
+    if (!session) return res.status(404).json({ error: "Interview session not found" });
+
+    await db.collection(COLLECTIONS.INTERVIEW_EVENTS).insertOne({
+      id: uuidv4(),
+      session_id: req.params.sessionId,
+      type: body.type,
+      payload: body.payload,
+      created_at: nowIso(),
+    });
+
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// LiveKit-standardized endpoint token format for frontend TokenSource.endpoint()
+app.post("/api/interviews/getToken", async (req, res) => {
+  try {
+    const body = StandardTokenEndpointSchema.parse(req.body ?? {});
+    const { AccessToken, RoomConfiguration } = await import("livekit-server-sdk");
+    const roomName = body.room_name || "interview-room";
+    const participantIdentity = body.participant_identity || "candidate-identity";
+    const participantName = body.participant_name || "Candidate";
+
+    const at = new AccessToken(env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET, {
+      identity: participantIdentity,
+      name: participantName,
+      metadata: body.participant_metadata || "",
+      attributes: body.participant_attributes || {},
+      ttl: "45m",
+    });
+    at.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true, canPublishData: true });
+
+    if (body.room_config) {
+      at.roomConfig = new RoomConfiguration(body.room_config);
+    }
+
+    const participantToken = await at.toJwt();
+    res.status(201).json({ server_url: env.LIVEKIT_URL, participant_token: participantToken });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // ----- Playground: token for testing -----

@@ -9,6 +9,10 @@ livekit-plugins-sarvam>=1.4.0
 livekit-plugins-openai>=1.4.0
 livekit-plugins-google>=1.4.0
 livekit-plugins-xai>=1.4.0
+livekit-plugins-silero>=1.4.0
+livekit-plugins-turn-detector>=1.4.0
+livekit-plugins-noise-cancellation>=0.2.0
+livekit-plugins-simli>=1.5.0
 
 # LiveKit Server SDK (SIP, etc.)
 livekit-api>=0.10.0

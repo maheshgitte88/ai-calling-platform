@@ -44,4 +44,25 @@ export const api = {
     request(`/campaigns/${campaignId}/start`, { method: "POST" }),
   getPlaygroundToken: (body) =>
     request("/playground/token", { method: "POST", body: JSON.stringify(body) }),
+  startInterviewSession: (body) =>
+    request("/interviews/session/start", { method: "POST", body: JSON.stringify(body) }),
+  resolveInterviewSession: (body) =>
+    request("/interviews/session/resolve", { method: "POST", body: JSON.stringify(body) }),
+  endInterviewSession: (sessionId, body = {}) =>
+    request(`/interviews/session/${sessionId}/end`, { method: "POST", body: JSON.stringify(body) }),
+  getInterviewSession: (sessionId) =>
+    request(`/interviews/session/${sessionId}`),
+  addInterviewSessionEvent: (sessionId, body) =>
+    request(`/interviews/session/${sessionId}/event`, { method: "POST", body: JSON.stringify(body) }),
+  getInterviewSessions: (params) => {
+    const sp = new URLSearchParams();
+    if (params?.limit) sp.set("limit", String(params.limit));
+    if (params?.status) sp.set("status", params.status);
+    if (params?.candidateId) sp.set("candidateId", params.candidateId);
+    if (params?.interviewId) sp.set("interviewId", params.interviewId);
+    const qs = sp.toString();
+    return request(`/interviews/sessions${qs ? `?${qs}` : ""}`);
+  },
+  getInterviewEvaluation: (sessionId) =>
+    request(`/interviews/evaluations/${sessionId}`),
 };
