@@ -27,6 +27,8 @@ import {
 import { api } from "../services/api";
 import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
 
+const SESSION_POLL_INTERVAL_MS = 60000;
+
 function useJoinToken() {
   return useMemo(() => {
     const params = new URLSearchParams(window.location.search);
@@ -125,11 +127,12 @@ export default function InterviewJoin() {
       return undefined;
     }
     const tick = async () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       try {
         const data = await api.getInterviewSession(resolved.sessionId);
         const st = data?.session?.status;
         const hasEval = Boolean(data?.evaluation);
-        if (st === "completed" || hasEval) {
+        if (st === "completed" || st === "ended" || hasEval) {
           clearPoll();
           setCompletion(data);
           setPhase("completed");
@@ -139,8 +142,15 @@ export default function InterviewJoin() {
       }
     };
     tick();
-    pollRef.current = setInterval(tick, 3500);
-    return () => clearPoll();
+    pollRef.current = setInterval(tick, SESSION_POLL_INTERVAL_MS);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") tick();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      clearPoll();
+    };
   }, [phase, resolved?.sessionId]);
 
   const handleRoomConnected = useCallback(() => {
