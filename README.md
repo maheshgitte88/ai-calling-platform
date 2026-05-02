@@ -144,6 +144,8 @@ Each client has a config document:
 - Full architecture and scaling guide: `docs/ARCHITECTURE.md`
 - End-to-end call lifecycle and status flow: `docs/CALL_FLOW.md`
 - Video interview agent end-to-end guide: `docs/LIVEKIT_VIDEO_INTERVIEW_E2E.md`
+- Full app deployment on AWS EC2: `docs/AWS_EC2_APP_DEPLOYMENT.md`
+- LiveKit/SIP deployment on EC2: `docs/LiveKitEC2.md`
 - SIP setup notes: `docs/SIP.md`
 
 ## Interview Agent (Phase 1)
