@@ -19,7 +19,14 @@ const initialState = {
     candidateName: "",
     title: "",
     language: "en",
+    languagePolicy: "",
     durationMinutes: 35,
+    yearsExperience: "",
+    skills: "",
+    jdTitle: "",
+    jdText: "",
+    questionsText: "",
+    extraInstructions: "",
     visionEnabled: false,
   },
   connection: { state: "disconnected", reconnectAttempts: 0, lastError: "" },
@@ -105,17 +112,45 @@ export default function InterviewCandidate() {
     if (!canStart || state.phase !== "idle") return;
     dispatch({ type: "phase", value: "creating_session" });
     try {
+      const langPol = state.interviewForm.languagePolicy
+        .split(/[,;]/)
+        .map((s) => s.trim().toLowerCase())
+        .filter(Boolean);
+      const preparedQs = state.interviewForm.questionsText
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const skillList = state.interviewForm.skills
+        .split(/[,;]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      const yeRaw = state.interviewForm.yearsExperience;
+      const yearsExp =
+        yeRaw === "" || yeRaw == null ? undefined : Number(yeRaw);
+
       const resp = await api.startInterviewSession({
         candidateId: state.interviewForm.candidateId.trim(),
         interviewId: state.interviewForm.interviewId.trim(),
         candidate: {
           name: state.interviewForm.candidateName || undefined,
+          yearsExperience: Number.isFinite(yearsExp) ? yearsExp : undefined,
+          skills: skillList.length ? skillList : undefined,
         },
         interviewMeta: {
           title: state.interviewForm.title || undefined,
           language: state.interviewForm.language || "en",
+          languagePolicy: langPol.length ? langPol : undefined,
           durationMinutes: Number(state.interviewForm.durationMinutes) || 35,
+          questions: preparedQs.length ? preparedQs : undefined,
+          instructions: state.interviewForm.extraInstructions?.trim() || undefined,
         },
+        jd:
+          state.interviewForm.jdTitle?.trim() || state.interviewForm.jdText?.trim()
+            ? {
+                title: state.interviewForm.jdTitle?.trim() || undefined,
+                text: state.interviewForm.jdText?.trim() || undefined,
+              }
+            : undefined,
         vision: {
           enabled: state.interviewForm.visionEnabled,
           sampleEverySeconds: 10,
@@ -200,9 +235,31 @@ export default function InterviewCandidate() {
           />
           <input
             style={styles.input}
-            placeholder="language"
+            placeholder="Primary language (e.g. en)"
             value={state.interviewForm.language}
             onChange={(e) => dispatch({ type: "update_form", payload: { language: e.target.value } })}
+          />
+          <input
+            style={styles.input}
+            placeholder="Language policy: en, hi, ta (optional)"
+            value={state.interviewForm.languagePolicy}
+            onChange={(e) => dispatch({ type: "update_form", payload: { languagePolicy: e.target.value } })}
+          />
+          <input
+            style={styles.input}
+            type="number"
+            min={0}
+            max={80}
+            step="0.5"
+            placeholder="Years experience (optional)"
+            value={state.interviewForm.yearsExperience}
+            onChange={(e) => dispatch({ type: "update_form", payload: { yearsExperience: e.target.value } })}
+          />
+          <input
+            style={styles.input}
+            placeholder="Skills: React, Node, … (comma-separated)"
+            value={state.interviewForm.skills}
+            onChange={(e) => dispatch({ type: "update_form", payload: { skills: e.target.value } })}
           />
           <input
             style={styles.input}
@@ -214,6 +271,38 @@ export default function InterviewCandidate() {
             onChange={(e) => dispatch({ type: "update_form", payload: { durationMinutes: e.target.value } })}
           />
         </div>
+        <div style={styles.gridFull}>
+          <input
+            style={styles.input}
+            placeholder="JD title (optional)"
+            value={state.interviewForm.jdTitle}
+            onChange={(e) => dispatch({ type: "update_form", payload: { jdTitle: e.target.value } })}
+          />
+        </div>
+        <label style={styles.labelMuted}>Job description (optional)</label>
+        <textarea
+          style={styles.textarea}
+          rows={3}
+          placeholder="Paste JD text for the AI to use as context…"
+          value={state.interviewForm.jdText}
+          onChange={(e) => dispatch({ type: "update_form", payload: { jdText: e.target.value } })}
+        />
+        <label style={styles.labelMuted}>Prepared questions (one per line, optional)</label>
+        <textarea
+          style={styles.textarea}
+          rows={5}
+          placeholder="What is your experience with…&#10;Describe a time when…"
+          value={state.interviewForm.questionsText}
+          onChange={(e) => dispatch({ type: "update_form", payload: { questionsText: e.target.value } })}
+        />
+        <label style={styles.labelMuted}>Extra instructions for the AI (optional, added on top of defaults)</label>
+        <textarea
+          style={styles.textarea}
+          rows={2}
+          placeholder="e.g. Emphasize system design; allow code discussion in English only."
+          value={state.interviewForm.extraInstructions}
+          onChange={(e) => dispatch({ type: "update_form", payload: { extraInstructions: e.target.value } })}
+        />
         <label style={{ display: "block", marginTop: 8 }}>
           <input
             type="checkbox"
@@ -453,6 +542,30 @@ const styles = {
     display: "grid",
     gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
     gap: 10,
+  },
+  gridFull: {
+    marginTop: 10,
+    display: "grid",
+    gridTemplateColumns: "1fr",
+    gap: 10,
+  },
+  labelMuted: {
+    display: "block",
+    marginTop: 10,
+    marginBottom: 4,
+    fontSize: "0.82rem",
+    fontWeight: 600,
+    color: "#64748b",
+  },
+  textarea: {
+    width: "100%",
+    boxSizing: "border-box",
+    border: "1px solid #cbd5e1",
+    borderRadius: 8,
+    padding: "0.55rem 0.7rem",
+    fontSize: "0.92rem",
+    fontFamily: "inherit",
+    resize: "vertical",
   },
   input: {
     border: "1px solid #cbd5e1",

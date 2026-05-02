@@ -172,6 +172,10 @@ async def generate_structured_evaluation(
     interview_meta = meta.get("interviewMeta") or {}
     title = interview_meta.get("title") or "Interview"
     must_ask = interview_meta.get("mustAskTopics") or []
+    planned_questions = interview_meta.get("questions") or []
+    cand = meta.get("candidateProfile") or {}
+    cand_skills = ", ".join(str(s) for s in (cand.get("skills") or [])) if cand.get("skills") else ""
+    cand_exp = cand.get("yearsExperience")
 
     system = (
         "You evaluate interview transcripts. Reply with ONLY valid JSON matching this shape:\n"
@@ -202,10 +206,24 @@ async def generate_structured_evaluation(
         "problemSolving = practical / real-work problem handling.\n"
     )
 
+    jd_hint = (jd.get("title") or "") + (
+        f" | {(jd.get('text') or jd.get('summary') or '')[:1200]}"
+        if (jd.get("text") or jd.get("summary"))
+        else ""
+    )
+    plan_q = "\n".join(f"  - {q}" for q in planned_questions) if planned_questions else "N/A"
+    cand_line = (
+        "Candidate profile: "
+        f"yearsExperience={cand_exp if cand_exp is not None else 'N/A'}, "
+        f"skills={cand_skills or 'N/A'}"
+    )
+
     user = (
         f"Interview title: {title}\n"
-        f"Role / JD hints: {jd.get('title') or jd.get('summary') or 'N/A'}\n"
-        f"Must-ask topics: {', '.join(must_ask) if must_ask else 'N/A'}\n\n"
+        f"Role / JD: {jd_hint or 'N/A'}\n"
+        f"Must-ask topics: {', '.join(must_ask) if must_ask else 'N/A'}\n"
+        f"Planned / reference questions (if the interviewer was given a list, align evaluation with these themes):\n{plan_q}\n"
+        f"{cand_line}\n\n"
         f"Transcript:\n{transcript_text}\n"
     )
 

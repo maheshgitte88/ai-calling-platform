@@ -85,29 +85,101 @@ def provider_key(kind: str, provider: str) -> str | None:
     return None
 
 
+INTERVIEW_AGENT_DEFAULT_INSTRUCTIONS = """
+You are a professional AI interviewer conducting a structured live interview.
+
+Core behavior (always follow):
+- Keep tone professional, fair, and encouraging.
+- After a short greeting, move to substantive questions aligned with the job description and any prepared question list.
+- Ask one clear question at a time; listen to the full answer before the next question.
+- Use brief follow-ups only to clarify, probe depth, or when the answer is incomplete.
+- Keep your spoken lines concise for real-time voice.
+- Close politely when the session ends or the candidate leaves.
+
+If a numbered "Prepared questions" list is present, you MUST work through it in order (you may add short follow-ups). If time is short, prioritize the remaining prepared questions. If there is no list, derive questions from the JD, must-ask topics, and the candidate profile.
+
+Language: conduct the interview primarily in the Primary language. If the candidate switches language, respond within Supported languages when reasonable.
+""".strip()
+
+
 def build_prompt(meta: dict) -> str:
     candidate = meta.get("candidateProfile") or {}
     interview_meta = meta.get("interviewMeta") or {}
+    jd = meta.get("jd") or {}
     must_ask_topics = interview_meta.get("mustAskTopics") or []
-    topic_text = ", ".join(must_ask_topics) if must_ask_topics else "general role fit"
-    language = interview_meta.get("language", "en")
+    topic_text = ", ".join(must_ask_topics) if must_ask_topics else "(none specified — infer from JD)"
+    primary_language = interview_meta.get("language", "en")
     title = interview_meta.get("title", "AI interview")
-    candidate_name = candidate.get("name", "candidate")
 
-    return (
-        "You are a professional AI interviewer.\n"
-        f"Interview title: {title}\n"
-        f"Language: {language}\n"
-        f"Candidate: {candidate_name}\n"
-        f"Must ask topics: {topic_text}\n"
-        "Rules:\n"
-        "- Keep tone professional and encouraging.\n"
-        "- After a brief greeting, move into substantive interview questions (role, experience, technical, scenarios).\n"
-        "- Ask one clear question at a time.\n"
-        "- Ask follow-ups only when needed.\n"
-        "- Keep responses concise for voice conversation.\n"
-        "- Close interview politely when instructed to end.\n"
-    )
+    lp_raw = interview_meta.get("languagePolicy")
+    if isinstance(lp_raw, str) and lp_raw.strip():
+        language_policy = [x.strip().lower() for x in lp_raw.replace(";", ",").split(",") if x.strip()]
+    elif isinstance(lp_raw, list) and lp_raw:
+        language_policy = [str(x).strip().lower() for x in lp_raw if str(x).strip()]
+    else:
+        language_policy = [str(primary_language).strip().lower() or "en"]
+
+    extra_instructions = (
+        interview_meta.get("instructionsAdditional")
+        or interview_meta.get("instructions")
+        or ""
+    ).strip()
+
+    prepared_questions = interview_meta.get("questions") or []
+    if prepared_questions and not isinstance(prepared_questions, list):
+        prepared_questions = []
+
+    lines: list[str] = [INTERVIEW_AGENT_DEFAULT_INSTRUCTIONS, ""]
+
+    if extra_instructions:
+        lines.append("Additional instructions from the employer (apply together with the defaults above):")
+        lines.append(extra_instructions)
+        lines.append("")
+
+    lines.append(f"Interview title: {title}")
+    lines.append(f"Primary language: {primary_language}")
+    lines.append(f"Supported languages (language policy): {', '.join(language_policy)}")
+    lines.append("")
+
+    cand_name = candidate.get("name") or "the candidate"
+    lines.append(f"Candidate name: {cand_name}")
+    if candidate.get("email"):
+        lines.append(f"Candidate email (reference): {candidate.get('email')}")
+    ye = candidate.get("yearsExperience")
+    if ye is not None and ye != "":
+        lines.append(f"Years of experience (reference): {ye}")
+    skills = candidate.get("skills") or []
+    if skills:
+        lines.append(f"Candidate skills (reference): {', '.join(str(s) for s in skills)}")
+    lines.append("")
+
+    lines.append("Job description / role context (use for questioning and context):")
+    if jd.get("title"):
+        lines.append(f"Role title: {jd.get('title')}")
+    jd_body = (jd.get("text") or jd.get("summary") or "").strip()
+    if jd_body:
+        if len(jd_body) > 8000:
+            jd_body = jd_body[:8000] + "\n[truncated]"
+        lines.append(jd_body)
+    else:
+        lines.append("(No JD body supplied — rely on title, topics, and prepared questions.)")
+    lines.append("")
+
+    lines.append(f"Must-ask topic areas: {topic_text}")
+    lines.append("")
+
+    if prepared_questions:
+        lines.append("Prepared questions (ask in this order, one at a time):")
+        for i, q in enumerate(prepared_questions, start=1):
+            lines.append(f"  {i}. {q}")
+        lines.append("")
+    else:
+        lines.append(
+            "No fixed prepared question list — generate appropriate questions from the JD, topics, and candidate profile."
+        )
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def resolve_provider_cfg(meta: dict) -> dict:
@@ -244,9 +316,16 @@ async def run_interview(ctx: JobContext, meta: dict):
         upsert=True,
     )
 
+    im = meta.get("interviewMeta") or {}
+    has_prepared = bool(im.get("questions"))
     await session.generate_reply(
         instructions=(
-            "Start interview now. Greet candidate and ask first question based on must-ask topics."
+            "Start the interview now: give a brief greeting, then ask the first substantive question. "
+            + (
+                "Use prepared question 1 exactly as the core ask (you may add one short clarification if needed)."
+                if has_prepared
+                else "Base the first question on the JD, must-ask topics, and candidate profile."
+            )
         )
     )
 

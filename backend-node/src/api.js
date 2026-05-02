@@ -183,22 +183,29 @@ const StartInterviewSessionSchema = z.object({
   candidate: z.object({
     name: z.string().optional(),
     email: z.string().optional(),
-    yearsExperience: z.number().optional(),
+    yearsExperience: z.coerce.number().nonnegative().optional(),
     skills: z.array(z.string()).optional(),
   }).partial().optional(),
   interviewMeta: z.object({
     title: z.string().optional(),
+    /** Primary conversation language (STT/TTS bias), e.g. en */
     language: z.string().optional(),
+    /** Allowed language codes for the candidate (multilingual policy), e.g. ["en","hi"] */
+    languagePolicy: z.array(z.string().min(2).max(16)).optional(),
     durationMinutes: z.number().int().positive().max(180).optional(),
     mustAskTopics: z.array(z.string()).optional(),
+    /** Exact interview questions the AI must ask in order */
+    questions: z.array(z.string().min(1).max(4000)).optional(),
     scoringRubric: z.record(z.number()).optional(),
     customFields: z.record(z.unknown()).optional(),
+    /** Optional employer-specific instructions (merged on top of agent defaults) */
     instructions: z.string().optional(),
   }).partial().optional(),
   jd: z.object({
     id: z.string().optional(),
     title: z.string().optional(),
     text: z.string().optional(),
+    summary: z.string().optional(),
     url: z.string().optional(),
     version: z.string().optional(),
   }).partial().optional(),
@@ -206,7 +213,8 @@ const StartInterviewSessionSchema = z.object({
     forbidExternalHelp: z.boolean().optional(),
     requireCameraOn: z.boolean().optional(),
     requireScreenShare: z.boolean().optional(),
-    languagePolicy: z.string().optional(),
+    /** Legacy single string, comma-separated, or array — merged into languagePolicy */
+    languagePolicy: z.union([z.string(), z.array(z.string().min(2).max(16))]).optional(),
     antiCheatLevel: z.enum(["off", "basic", "strict"]).optional(),
   }).partial().optional(),
   providerConfig: z.object({
@@ -670,6 +678,32 @@ app.get("/api/campaigns", async (req, res) => {
 });
 
 // ----- Interview sessions (candidate video) -----
+function normalizeInterviewLanguagePolicy(interviewMeta, interviewRules, primaryLanguage) {
+  const primary = String(primaryLanguage || "en").trim().toLowerCase() || "en";
+  const metaArr = interviewMeta?.languagePolicy;
+  if (Array.isArray(metaArr) && metaArr.length > 0) {
+    const out = [...new Set(metaArr.map((c) => String(c).trim().toLowerCase()).filter(Boolean))];
+    if (out.length) return out;
+  }
+  const rulesPol = interviewRules?.languagePolicy;
+  if (Array.isArray(rulesPol) && rulesPol.length > 0) {
+    const out = [...new Set(rulesPol.map((c) => String(c).trim().toLowerCase()).filter(Boolean))];
+    if (out.length) return out;
+  }
+  if (typeof rulesPol === "string" && rulesPol.trim()) {
+    const out = [...new Set(
+      rulesPol.split(/[,;]/).map((s) => s.trim().toLowerCase()).filter(Boolean),
+    )];
+    if (out.length) return out;
+  }
+  return [primary];
+}
+
+function normalizeInterviewQuestions(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((q) => String(q).trim()).filter((q) => q.length > 0);
+}
+
 function buildInterviewRoomName(interviewId, candidateId) {
   return `interview-${interviewId}-${candidateId}-${Date.now()}`.slice(0, 128);
 }
@@ -698,6 +732,15 @@ app.post("/api/interviews/session/start", async (req, res) => {
     });
     token.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true, canPublishData: true });
 
+    const primaryLanguage = payload.interviewMeta?.language ?? "en";
+    const languagePolicy = normalizeInterviewLanguagePolicy(
+      payload.interviewMeta,
+      payload.interviewRules,
+      primaryLanguage,
+    );
+    const preparedQuestions = normalizeInterviewQuestions(payload.interviewMeta?.questions);
+    const instructionsAdditional = (payload.interviewMeta?.instructions ?? "").trim();
+
     const dispatchMetadata = {
       mode: "video_interview",
       sessionId,
@@ -708,12 +751,17 @@ app.post("/api/interviews/session/start", async (req, res) => {
       interviewRules: payload.interviewRules ?? {},
       interviewMeta: {
         title: payload.interviewMeta?.title ?? "AI Interview",
-        language: payload.interviewMeta?.language ?? "en",
+        language: primaryLanguage,
+        languagePolicy,
         durationMinutes,
         mustAskTopics: payload.interviewMeta?.mustAskTopics ?? [],
+        questions: preparedQuestions,
         scoringRubric: payload.interviewMeta?.scoringRubric ?? {},
         customFields: payload.interviewMeta?.customFields ?? {},
-        instructions: payload.interviewMeta?.instructions ?? "",
+        /** Optional employer-only add-on; agent merges with built-in defaults */
+        instructionsAdditional,
+        /** Backward compatibility for older agents reading `instructions` */
+        instructions: instructionsAdditional,
       },
       providerConfig: payload.providerConfig ?? {
         stt: { provider: "deepgram", model: "nova-3" },

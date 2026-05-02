@@ -1,14 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   LiveKitRoom,
+  ParticipantTile,
   RoomAudioRenderer,
-  VideoConference,
+  useRoomContext,
+  useTracks,
+  useVoiceAssistant,
 } from "@livekit/components-react";
+import { ParticipantKind, Track } from "livekit-client";
 import {
   AlertCircle,
+  Camera,
+  CameraOff,
   CheckCircle2,
+  Mic,
+  MicOff,
   Loader2,
   RefreshCw,
+  ScreenShare,
+  ScreenShareOff,
   Sparkles,
   Video,
   LogOut,
@@ -218,6 +228,7 @@ export default function InterviewJoin() {
 
           <div style={styles.roomWrap}>
             <LiveKitRoom
+              className="ij-room-shell"
               token={resolved.token}
               serverUrl={resolved.wsUrl}
               connect={phase !== "completed"}
@@ -229,7 +240,11 @@ export default function InterviewJoin() {
               style={styles.lkRoom}
             >
               {phase === "room_connecting" && <ConnectingOverlay />}
-              <VideoConference />
+              <InterviewTwoUpStage
+                candidateIdentity={resolved.participantIdentity}
+                onLeave={handleLeaveInterview}
+                leaving={leaving}
+              />
               <RoomAudioRenderer />
             </LiveKitRoom>
           </div>
@@ -258,6 +273,113 @@ export default function InterviewJoin() {
         <PoweredByHirecorrecto compact />
       </div>
     </>
+  );
+}
+
+function InterviewTwoUpStage({ candidateIdentity, onLeave, leaving }) {
+  const room = useRoomContext();
+  const [busy, setBusy] = useState("");
+  const cameraRefs = useTracks([{ source: Track.Source.Camera, withPlaceholder: true }], {
+    onlySubscribed: false,
+  });
+  const { agent, videoTrack } = useVoiceAssistant();
+
+  const candidateRef = useMemo(() => {
+    const found = cameraRefs.find((t) => t.participant?.identity === candidateIdentity);
+    if (found) return found;
+    return room?.localParticipant
+      ? { participant: room.localParticipant, source: Track.Source.Camera }
+      : undefined;
+  }, [cameraRefs, candidateIdentity, room]);
+
+  const fallbackAgentRef = useMemo(() => {
+    const agentByIdentity = agent
+      ? cameraRefs.find((t) => t.participant?.identity === agent.identity)
+      : undefined;
+    if (agentByIdentity) return agentByIdentity;
+    return cameraRefs.find(
+      (t) =>
+        t.participant?.identity !== candidateIdentity &&
+        t.participant?.kind === ParticipantKind.AGENT,
+    );
+  }, [cameraRefs, candidateIdentity, agent]);
+
+  const aiRef = videoTrack || fallbackAgentRef;
+
+  const micEnabled = Boolean(room?.localParticipant?.isMicrophoneEnabled);
+  const camEnabled = Boolean(room?.localParticipant?.isCameraEnabled);
+  const shareEnabled = Boolean(room?.localParticipant?.isScreenShareEnabled);
+
+  const withBusy = async (key, fn) => {
+    if (!room?.localParticipant) return;
+    setBusy(key);
+    try {
+      await fn();
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return (
+    <div style={styles.stageRoot}>
+      <div style={styles.tileGrid}>
+        <div style={styles.tileCard}>
+          {candidateRef ? <ParticipantTile trackRef={candidateRef} style={styles.tile} /> : <EmptyTile label="Candidate" />}
+        </div>
+        <div style={styles.tileCard}>
+          {aiRef ? <ParticipantTile trackRef={aiRef} style={styles.tile} /> : <EmptyTile label="AI interviewer" />}
+        </div>
+      </div>
+
+      <div style={styles.controlsRow}>
+        <button
+          type="button"
+          style={styles.controlBtn}
+          disabled={busy !== ""}
+          onClick={() =>
+            withBusy("mic", () => room.localParticipant.setMicrophoneEnabled(!micEnabled))
+          }
+        >
+          {micEnabled ? <Mic size={16} /> : <MicOff size={16} />}
+          {micEnabled ? "Microphone" : "Mic off"}
+        </button>
+        <button
+          type="button"
+          style={styles.controlBtn}
+          disabled={busy !== ""}
+          onClick={() =>
+            withBusy("cam", () => room.localParticipant.setCameraEnabled(!camEnabled))
+          }
+        >
+          {camEnabled ? <Camera size={16} /> : <CameraOff size={16} />}
+          {camEnabled ? "Camera" : "Cam off"}
+        </button>
+        <button
+          type="button"
+          style={styles.controlBtn}
+          disabled={busy !== ""}
+          onClick={() =>
+            withBusy("share", () => room.localParticipant.setScreenShareEnabled(!shareEnabled))
+          }
+        >
+          {shareEnabled ? <ScreenShareOff size={16} /> : <ScreenShare size={16} />}
+          {shareEnabled ? "Stop share" : "Share screen"}
+        </button>
+        <button type="button" style={styles.leaveBtnBottom} onClick={onLeave} disabled={leaving}>
+          <LogOut size={16} />
+          {leaving ? "Leaving…" : "Leave"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function EmptyTile({ label }) {
+  return (
+    <div style={styles.emptyTile}>
+      <div style={styles.emptyAvatar} />
+      <span style={styles.emptyLabel}>{label}</span>
+    </div>
   );
 }
 
@@ -398,10 +520,13 @@ function CompletionScreen({ completion, participantName }) {
 
 const styles = {
   shell: {
-    minHeight: "100vh",
+    height: "100vh",
     background: "linear-gradient(165deg, #0f172a 0%, #1e1b4b 45%, #0f172a 100%)",
-    padding: "clamp(12px, 3vw, 24px)",
+    padding: "clamp(10px, 2vw, 16px)",
     boxSizing: "border-box",
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
   },
   header: {
     display: "flex",
@@ -444,11 +569,93 @@ const styles = {
     overflow: "hidden",
     border: "1px solid rgba(148,163,184,0.2)",
     boxShadow: "0 25px 50px -12px rgba(0,0,0,0.45)",
-    minHeight: "min(72vh, 820px)",
+    flex: 1,
+    minHeight: 0,
+    maxHeight: "calc(100vh - 130px)",
   },
   lkRoom: {
-    minHeight: "min(72vh, 820px)",
+    height: "100%",
+    minHeight: 0,
     background: "#020617",
+  },
+  stageRoot: {
+    height: "100%",
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+    padding: 8,
+    boxSizing: "border-box",
+    gap: 8,
+  },
+  tileGrid: {
+    flex: 1,
+    minHeight: 0,
+    display: "grid",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: 8,
+  },
+  tileCard: {
+    minHeight: 0,
+    borderRadius: 10,
+    overflow: "hidden",
+    border: "1px solid rgba(148,163,184,0.25)",
+    background: "#0b1220",
+  },
+  tile: {
+    width: "100%",
+    height: "100%",
+  },
+  emptyTile: {
+    width: "100%",
+    height: "100%",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 12,
+    color: "#94a3b8",
+  },
+  emptyAvatar: {
+    width: 86,
+    height: 86,
+    borderRadius: "50%",
+    background: "rgba(148,163,184,0.25)",
+  },
+  emptyLabel: {
+    fontSize: "0.82rem",
+    fontWeight: 600,
+  },
+  controlsRow: {
+    display: "flex",
+    gap: 8,
+    justifyContent: "center",
+    alignItems: "center",
+    flexWrap: "wrap",
+    paddingBottom: 4,
+  },
+  controlBtn: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    background: "rgba(15,23,42,0.85)",
+    color: "#e2e8f0",
+    border: "1px solid rgba(148,163,184,0.3)",
+    borderRadius: 8,
+    padding: "8px 12px",
+    cursor: "pointer",
+    fontSize: "0.84rem",
+  },
+  leaveBtnBottom: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    background: "rgba(127,29,29,0.22)",
+    color: "#fecaca",
+    border: "1px solid rgba(248,113,113,0.45)",
+    borderRadius: 8,
+    padding: "8px 12px",
+    cursor: "pointer",
+    fontSize: "0.84rem",
   },
   hint: {
     marginTop: 14,
