@@ -1,4 +1,6 @@
-const API_BASE = "/api";
+// Amplify / CDN: set VITE_API_BASE_URL to your API origin (e.g. https://ec2-or-domain). Empty = same origin /api.
+const API_ORIGIN = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+const API_BASE = API_ORIGIN ? `${API_ORIGIN}/api` : "/api";
 
 async function request(path, options = {}) {
   const res = await fetch(`${API_BASE}${path}`, {

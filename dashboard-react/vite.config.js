@@ -8,7 +8,7 @@ export default defineConfig({
     allowedHosts: ["hardship-wasting-passport.ngrok-free.dev"],
     proxy: {
       "/api": {
-        target: "http://localhost:4040",
+        target: "http://13.234.90.206:4040",
         changeOrigin: true,
       },
     },
