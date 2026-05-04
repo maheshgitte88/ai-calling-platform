@@ -3,11 +3,12 @@ import {
   LiveKitRoom,
   ParticipantTile,
   RoomAudioRenderer,
+  useConnectionState,
   useRoomContext,
   useTracks,
   useVoiceAssistant,
 } from "@livekit/components-react";
-import { ParticipantKind, Track } from "livekit-client";
+import { ConnectionState, ParticipantKind, Track } from "livekit-client";
 import {
   AlertCircle,
   Camera,
@@ -198,6 +199,47 @@ export default function InterviewJoin() {
           0% { background-position: 0% 50%; }
           100% { background-position: 200% 50%; }
         }
+        /* Two-up stage: 2 columns on tablet/desktop; stacked row on mobile (candidate top, AI bottom). */
+        .ij-tile-grid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 8px;
+        }
+        @media (max-width: 720px) {
+          .ij-tile-grid {
+            grid-template-columns: 1fr;
+            grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+          }
+        }
+        .ij-interview-toolbar {
+          flex-wrap: nowrap;
+        }
+        .ij-toolbar-badge {
+          flex-shrink: 0;
+        }
+        .ij-toolbar-live-long {
+          display: inline;
+        }
+        .ij-toolbar-live-short {
+          display: none;
+        }
+        @media (max-width: 420px) {
+          .ij-toolbar-live-long {
+            display: none;
+          }
+          .ij-toolbar-live-short {
+            display: inline;
+          }
+          .ij-toolbar-leave-text-long {
+            display: none;
+          }
+          .ij-toolbar-leave-text-short {
+            display: inline;
+          }
+        }
+        .ij-toolbar-leave-text-short {
+          display: none;
+        }
       `}</style>
 
       {phase === "resolve_loading" && <ResolveLoadingScreen />}
@@ -212,30 +254,6 @@ export default function InterviewJoin() {
 
       {(phase === "room_connecting" || phase === "live") && resolved && (
         <div style={styles.shell}>
-          <header style={styles.header}>
-            <div style={styles.headerLeft}>
-              <span style={styles.badge}>
-                <Video size={16} strokeWidth={2} />
-                Live interview
-              </span>
-              <span style={styles.headerMeta}>
-                {resolved.participantName ? `${resolved.participantName} · ` : ""}
-                Room connected
-              </span>
-            </div>
-            {phase === "live" && (
-              <button
-                type="button"
-                style={styles.leaveBtn}
-                onClick={handleLeaveInterview}
-                disabled={leaving}
-              >
-                <LogOut size={16} />
-                {leaving ? "Leaving…" : "Leave interview"}
-              </button>
-            )}
-          </header>
-
           <div style={styles.roomWrap}>
             <LiveKitRoom
               className="ij-room-shell"
@@ -249,13 +267,22 @@ export default function InterviewJoin() {
               data-lk-theme="default"
               style={styles.lkRoom}
             >
-              {phase === "room_connecting" && <ConnectingOverlay />}
-              <InterviewTwoUpStage
-                candidateIdentity={resolved.participantIdentity}
-                onLeave={handleLeaveInterview}
-                leaving={leaving}
-              />
-              <RoomAudioRenderer />
+              <div style={styles.roomColumn}>
+                <InterviewJoinToolbar
+                  participantName={resolved.participantName}
+                  onLeave={handleLeaveInterview}
+                  leaving={leaving}
+                />
+                {phase === "room_connecting" && <ConnectingOverlay />}
+                <div style={styles.stageStretch}>
+                  <InterviewTwoUpStage
+                    candidateIdentity={resolved.participantIdentity}
+                    onLeave={handleLeaveInterview}
+                    leaving={leaving}
+                  />
+                </div>
+                <RoomAudioRenderer />
+              </div>
             </LiveKitRoom>
           </div>
 
@@ -283,6 +310,56 @@ export default function InterviewJoin() {
         <PoweredByHirecorrecto compact />
       </div>
     </>
+  );
+}
+
+function connectionStatusUi(state) {
+  switch (state) {
+    case ConnectionState.Connected:
+      return { dot: "#22c55e", label: "Connected", text: "#86efac" };
+    case ConnectionState.Connecting:
+      return { dot: "#f59e0b", label: "Connecting", text: "#fcd34d" };
+    case ConnectionState.Reconnecting:
+    case ConnectionState.SignalReconnecting:
+      return { dot: "#fb923c", label: "Reconnecting", text: "#fdba74" };
+    case ConnectionState.Disconnected:
+    default:
+      return { dot: "#ef4444", label: "Offline", text: "#fca5a5" };
+  }
+}
+
+function InterviewJoinToolbar({ participantName, onLeave, leaving }) {
+  const conn = useConnectionState();
+  const ui = connectionStatusUi(conn);
+  const displayName = (participantName && String(participantName).trim()) || "You";
+  return (
+    <header className="ij-interview-toolbar" style={styles.toolbar}>
+      <span className="ij-toolbar-badge" style={styles.toolbarBadge}>
+        <Video size={14} strokeWidth={2} aria-hidden />
+        <span className="ij-toolbar-live-long">Live interview</span>
+        <span className="ij-toolbar-live-short">Live</span>
+      </span>
+      <div style={styles.toolbarCenter}>
+        <span style={styles.toolbarName} title={displayName}>
+          {displayName}
+        </span>
+        <span style={styles.toolbarStatus} title={`Room ${ui.label}`}>
+          <span style={{ ...styles.statusDot, background: ui.dot }} aria-hidden />
+          <span style={{ ...styles.statusLabel, color: ui.text }}>{ui.label}</span>
+        </span>
+      </div>
+      <button
+        type="button"
+        style={styles.leaveBtnToolbar}
+        onClick={onLeave}
+        disabled={leaving}
+        aria-label={leaving ? "Leaving interview" : "Leave interview"}
+      >
+        <LogOut size={15} aria-hidden />
+        <span className="ij-toolbar-leave-text-long">{leaving ? "Leaving…" : "Leave interview"}</span>
+        <span className="ij-toolbar-leave-text-short">{leaving ? "…" : "Leave"}</span>
+      </button>
+    </header>
   );
 }
 
@@ -332,7 +409,7 @@ function InterviewTwoUpStage({ candidateIdentity, onLeave, leaving }) {
 
   return (
     <div style={styles.stageRoot}>
-      <div style={styles.tileGrid}>
+      <div style={styles.tileGrid} className="ij-tile-grid">
         <div style={styles.tileCard}>
           {candidateRef ? <ParticipantTile trackRef={candidateRef} style={styles.tile} /> : <EmptyTile label="Candidate" />}
         </div>
@@ -538,40 +615,96 @@ const styles = {
     flexDirection: "column",
     overflow: "hidden",
   },
-  header: {
+  roomColumn: {
+    height: "100%",
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+    position: "relative",
+  },
+  toolbar: {
+    flexShrink: 0,
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
-    flexWrap: "wrap",
-    gap: 12,
-    marginBottom: 16,
+    gap: 8,
+    padding: "8px 10px",
+    borderBottom: "1px solid rgba(148,163,184,0.18)",
+    background: "rgba(15,23,42,0.96)",
+    zIndex: 25,
+    position: "relative",
+    boxSizing: "border-box",
   },
-  headerLeft: { display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" },
-  badge: {
+  toolbarBadge: {
     display: "inline-flex",
     alignItems: "center",
-    gap: 8,
+    gap: 6,
     background: "rgba(99,102,241,0.25)",
     border: "1px solid rgba(165,180,252,0.35)",
     color: "#e0e7ff",
-    padding: "8px 14px",
+    padding: "6px 12px",
     borderRadius: 999,
-    fontSize: "0.875rem",
+    fontSize: "0.8rem",
     fontWeight: 600,
   },
-  headerMeta: { color: "#94a3b8", fontSize: "0.85rem" },
-  leaveBtn: {
+  toolbarCenter: {
+    flex: 1,
+    minWidth: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+  toolbarName: {
+    color: "#e2e8f0",
+    fontSize: "0.8rem",
+    fontWeight: 600,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    minWidth: 0,
+    flex: "1 1 36%",
+    maxWidth: "50%",
+  },
+  toolbarStatus: {
     display: "inline-flex",
     alignItems: "center",
-    gap: 8,
+    gap: 5,
+    flexShrink: 0,
+  },
+  statusDot: {
+    width: 7,
+    height: 7,
+    borderRadius: "50%",
+    flexShrink: 0,
+    boxShadow: "0 0 0 1px rgba(0,0,0,0.35)",
+  },
+  statusLabel: {
+    fontSize: "0.72rem",
+    fontWeight: 600,
+    letterSpacing: "0.02em",
+    textTransform: "uppercase",
+  },
+  leaveBtnToolbar: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    flexShrink: 0,
     background: "rgba(239,68,68,0.15)",
     border: "1px solid rgba(248,113,113,0.45)",
     color: "#fecaca",
-    padding: "10px 16px",
-    borderRadius: 10,
+    padding: "7px 11px",
+    borderRadius: 8,
     cursor: "pointer",
-    fontSize: "0.875rem",
+    fontSize: "0.78rem",
     fontWeight: 500,
+  },
+  stageStretch: {
+    flex: 1,
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+    position: "relative",
   },
   roomWrap: {
     position: "relative",
@@ -581,7 +714,7 @@ const styles = {
     boxShadow: "0 25px 50px -12px rgba(0,0,0,0.45)",
     flex: 1,
     minHeight: 0,
-    maxHeight: "calc(100vh - 130px)",
+    maxHeight: "calc(100vh - 80px)",
   },
   lkRoom: {
     height: "100%",
@@ -600,9 +733,7 @@ const styles = {
   tileGrid: {
     flex: 1,
     minHeight: 0,
-    display: "grid",
-    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
-    gap: 8,
+    /* display / columns: see .ij-tile-grid in <style> for responsive layout */
   },
   tileCard: {
     minHeight: 0,

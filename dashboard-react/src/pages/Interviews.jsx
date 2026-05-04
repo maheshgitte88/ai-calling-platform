@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   X,
   User,
@@ -7,6 +7,8 @@ import {
   Calendar,
   Hash,
   FileJson,
+  Printer,
+  MessageSquare,
 } from "lucide-react";
 import { api } from "../services/api";
 import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
@@ -85,6 +87,140 @@ function InterviewDetailModal({ detail, onClose }) {
   const title = session?.metadata?.interviewMeta?.title || session?.interview_id || "Interview";
   const status = session?.status || "—";
   const created = session?.created_at ? new Date(session.created_at).toLocaleString() : "—";
+  const finalTranscript = useMemo(() => getFinalTranscriptLines(detail), [detail]);
+
+  const handlePrintPdf = () => {
+    const candidateName = session?.participant_name || session?.candidate_id || "Candidate";
+    const recommendation = ev?.recommendation || "—";
+    const summary = ev?.summary || "No summary available.";
+    const rows = Array.isArray(ev?.questions)
+      ? ev.questions
+          .map(
+            (q, idx) => `
+              <tr>
+                <td>${idx + 1}</td>
+                <td>${escapeHtml(q?.question || "—")}</td>
+                <td>${escapeHtml(q?.answer || "—")}</td>
+                <td>${escapeHtml(verdictLabel(q?.verdict))}</td>
+                <td>${q?.pointsEarned != null && q?.pointsMax != null ? `${q.pointsEarned}/${q.pointsMax}` : "—"}</td>
+              </tr>
+            `,
+          )
+          .join("")
+      : "";
+
+    const lines = getFinalTranscriptLines(detail);
+    const transcriptBlock =
+      lines.length > 0
+        ? lines
+            .map(
+              (l) =>
+                `<div class="tr-line"><span class="tr-role">${escapeHtml(transcriptRoleLabel(l.role))}:</span> ${escapeHtml(l.text)}</div>`,
+            )
+            .join("")
+        : `<p class="small">No finalized transcript lines in this session log.</p>`;
+
+    const html = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Interview Result - ${escapeHtml(candidateName)}</title>
+    <style>
+      body { font-family: Arial, sans-serif; color: #0f172a; margin: 24px; line-height: 1.45; }
+      h1 { margin: 0 0 8px; font-size: 22px; }
+      h2 { margin: 18px 0 8px; font-size: 16px; }
+      .meta { margin: 0 0 2px; color: #475569; font-size: 13px; }
+      .pill { display: inline-block; border: 1px solid #cbd5e1; border-radius: 999px; padding: 2px 10px; font-size: 12px; margin-top: 8px; }
+      table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 12px; }
+      th, td { border: 1px solid #e2e8f0; padding: 8px; vertical-align: top; text-align: left; }
+      th { background: #f8fafc; }
+      .scores { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+      .score-box { border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px 10px; min-width: 120px; }
+      .small { color: #64748b; font-size: 12px; }
+      .tr-line { margin: 0 0 10px; font-size: 12px; }
+      .tr-role { font-weight: 700; color: #334155; margin-right: 6px; }
+    </style>
+  </head>
+  <body>
+    <h1>Interview Result</h1>
+    <p class="meta"><strong>Candidate:</strong> ${escapeHtml(candidateName)}</p>
+    <p class="meta"><strong>Interview:</strong> ${escapeHtml(title)}</p>
+    <p class="meta"><strong>Status:</strong> ${escapeHtml(status)}</p>
+    <p class="meta"><strong>Created:</strong> ${escapeHtml(created)}</p>
+    <p class="pill">Recommendation: ${escapeHtml(recommendation)}</p>
+
+    <h2>Summary</h2>
+    <p>${escapeHtml(summary)}</p>
+
+    <h2>Scores</h2>
+    <div class="scores">
+      <div class="score-box"><div class="small">Overall</div><div>${ev?.overallPercent ?? "—"}%</div></div>
+      <div class="score-box"><div class="small">Communication</div><div>${ev?.scores?.communication ?? "—"}</div></div>
+      <div class="score-box"><div class="small">Technical depth</div><div>${ev?.scores?.technicalDepth ?? "—"}</div></div>
+      <div class="score-box"><div class="small">Problem solving</div><div>${ev?.scores?.problemSolving ?? "—"}</div></div>
+    </div>
+
+    <h2>Questions & Answers</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Question</th>
+          <th>Answer</th>
+          <th>Verdict</th>
+          <th>Points</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows || `<tr><td colspan="5">No question-level evaluation available.</td></tr>`}
+      </tbody>
+    </table>
+
+    <h2>Final transcript</h2>
+    <p class="small">Candidate lines include only finalized speech-to-text (no partials).</p>
+    ${transcriptBlock}
+  </body>
+</html>`;
+
+    // Hidden iframe avoids popup blockers and Chrome returning null/opaque windows when
+    // window.open(..., "noopener") is used (blank tab + no document access).
+    const iframe = document.createElement("iframe");
+    iframe.setAttribute("title", "Interview result print");
+    iframe.setAttribute("aria-hidden", "true");
+    Object.assign(iframe.style, {
+      position: "fixed",
+      right: "0",
+      bottom: "0",
+      width: "0",
+      height: "0",
+      border: "0",
+      opacity: "0",
+      pointerEvents: "none",
+    });
+    document.body.appendChild(iframe);
+
+    const cleanup = () => {
+      if (iframe.parentNode) iframe.parentNode.removeChild(iframe);
+    };
+
+    let printed = false;
+    const runPrint = () => {
+      if (printed) return;
+      const win = iframe.contentWindow;
+      if (!win?.document?.body) return;
+      printed = true;
+      try {
+        win.focus();
+        win.print();
+      } finally {
+        setTimeout(cleanup, 800);
+      }
+    };
+
+    iframe.onload = () => requestAnimationFrame(() => setTimeout(runPrint, 150));
+    iframe.srcdoc = html;
+    window.setTimeout(runPrint, 600);
+  };
 
   useEffect(() => {
     const onKey = (e) => {
@@ -291,6 +427,10 @@ function InterviewDetailModal({ detail, onClose }) {
           </div>
           <div style={styles.footerRight}>
             <PoweredByHirecorrecto compact style={{ opacity: 0.85 }} />
+            <button type="button" style={styles.footerBtnSecondary} onClick={handlePrintPdf}>
+              <Printer size={15} />
+              Print PDF
+            </button>
             <button type="button" style={styles.footerBtnPrimary} onClick={onClose}>
               Close
             </button>
@@ -378,6 +518,42 @@ function verdictLabel(v) {
     could_not_answer: "No answer",
   };
   return m[v] || v || "—";
+}
+
+/** Final lines only: user must have is_final; assistant/agent lines are always kept. */
+function getFinalTranscriptLines(detail) {
+  const events = detail?.events || [];
+  return events
+    .filter((e) => e?.type === "transcript" && e.payload && typeof e.payload.text === "string")
+    .filter((e) => {
+      const p = e.payload;
+      const role = String(p.role || "").toLowerCase();
+      if (role === "assistant" || role === "agent") return true;
+      if (role === "user") return p.is_final === true;
+      return Boolean(p.is_final);
+    })
+    .map((e) => ({
+      role: e.payload.role,
+      text: String(e.payload.text || "").trim(),
+      created_at: e.payload.created_at || e.created_at,
+    }))
+    .filter((l) => l.text.length > 0);
+}
+
+function transcriptRoleLabel(role) {
+  const r = String(role || "").toLowerCase();
+  if (r === "user") return "Candidate";
+  if (r === "assistant" || r === "agent") return "Interviewer";
+  return role || "Speaker";
+}
+
+function escapeHtml(input) {
+  return String(input ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 const styles = {
@@ -549,6 +725,38 @@ const styles = {
     color: "#334155",
     lineHeight: 1.55,
   },
+  transcriptHint: {
+    margin: "0 0 10px",
+    fontSize: "0.78rem",
+    color: "#64748b",
+    lineHeight: 1.45,
+  },
+  transcriptBox: {
+    maxHeight: 280,
+    overflowY: "auto",
+    border: "1px solid #e2e8f0",
+    borderRadius: 8,
+    padding: "10px 12px",
+    background: "#f8fafc",
+  },
+  transcriptLine: {
+    marginBottom: 10,
+    fontSize: "0.88rem",
+    lineHeight: 1.45,
+    color: "#334155",
+  },
+  transcriptRole: {
+    fontWeight: 700,
+    color: "#475569",
+    marginRight: 8,
+  },
+  transcriptText: { wordBreak: "break-word" },
+  transcriptEmpty: {
+    margin: 0,
+    fontSize: "0.88rem",
+    color: "#94a3b8",
+    fontStyle: "italic",
+  },
   scoresTop: {
     display: "flex",
     flexWrap: "wrap",
@@ -712,6 +920,19 @@ const styles = {
   footerLeft: { minWidth: 0 },
   footerRight: { display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" },
   footerHint: { fontSize: "0.78rem", color: "#94a3b8" },
+  footerBtnSecondary: {
+    border: "1px solid #cbd5e1",
+    background: "#fff",
+    color: "#0f172a",
+    padding: "9px 14px",
+    borderRadius: 10,
+    fontSize: "0.86rem",
+    fontWeight: 600,
+    cursor: "pointer",
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 7,
+  },
   footerBtnPrimary: {
     border: "none",
     background: "#0f172a",
