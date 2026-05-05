@@ -77,12 +77,21 @@ def provider_key(kind: str, provider: str) -> str | None:
         ("tts", "deepgram"): ["DEEPGRAM_API_KEY"],
         ("tts", "elevenlabs"): ["ELEVENLABS_API_KEY"],
         ("tts", "cartesia"): ["CARTESIA_API_KEY"],
+        ("tts", "xai"): ["XAI_API_KEY"],
+        ("tts", "murf"): ["MURF_API_KEY"],
     }
     for key in provider_key_map.get((kind, provider), []):
         value = (os.getenv(key) or "").strip()
         if value:
             return value
     return None
+
+
+def clean_api_key(value: str | None) -> str:
+    v = (value or "").strip()
+    if not v or v == "***":
+        return ""
+    return v
 
 
 INTERVIEW_AGENT_DEFAULT_INSTRUCTIONS = """
@@ -275,21 +284,21 @@ def resolve_provider_cfg(meta: dict) -> dict:
         "llm": {
             "provider": llm_provider,
             "model": llm.get("model") or DEFAULT_LLM_MODEL,
-            "api_key": (llm.get("apiKey") or "").strip() or provider_key("llm", llm_provider) or "",
+            "api_key": clean_api_key(llm.get("apiKey")) or provider_key("llm", llm_provider) or "",
         },
         "stt": {
             "provider": stt_provider,
             "model": stt.get("model") or DEFAULT_STT_MODEL,
             "language": stt.get("language"),
             "mode": stt.get("mode"),
-            "api_key": (stt.get("apiKey") or "").strip() or provider_key("stt", stt_provider) or "",
+            "api_key": clean_api_key(stt.get("apiKey")) or provider_key("stt", stt_provider) or "",
         },
         "tts": {
             "provider": tts_provider,
             "model": tts.get("model") or DEFAULT_TTS_MODEL,
             "voice": tts.get("voice") or DEFAULT_TTS_VOICE,
             "target_language_code": tts.get("targetLanguageCode"),
-            "api_key": (tts.get("apiKey") or "").strip() or provider_key("tts", tts_provider) or "",
+            "api_key": clean_api_key(tts.get("apiKey")) or provider_key("tts", tts_provider) or "",
         },
     }
 
@@ -309,6 +318,15 @@ async def run_interview(ctx: JobContext, meta: dict):
 
     prompt = build_prompt(meta)
     provider_cfg = resolve_provider_cfg(meta)
+    logging.info(
+        "[Interview] Runtime providers: llm=%s, stt=%s, tts=%s model=%s voice=%s key_present=%s",
+        provider_cfg["llm"]["provider"],
+        provider_cfg["stt"]["provider"],
+        provider_cfg["tts"]["provider"],
+        provider_cfg["tts"]["model"],
+        provider_cfg["tts"]["voice"],
+        bool(provider_cfg["tts"]["api_key"]),
+    )
     llm = get_llm(provider_cfg["llm"]["provider"], provider_cfg["llm"]["api_key"], provider_cfg["llm"]["model"])
     stt = get_stt(
         provider_cfg["stt"]["provider"],

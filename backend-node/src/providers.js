@@ -192,6 +192,18 @@ export const TTS_PROVIDERS = [
     voiceHint: "Voice: ara, eve, rex, sal, leo. XAI_API_KEY from console.x.ai",
   },
   {
+    id: "murf",
+    name: "Murf AI",
+    models: [
+      { id: "FALCON", name: "FALCON (default)" },
+      { id: "GEN2", name: "GEN2" },
+    ],
+    voices: [
+      { id: "en-US-matthew", name: "Matthew (en-US)" },
+    ],
+    voiceHint: "Use Murf voice ID format {locale}-{name}, e.g. en-US-matthew. Set MURF_API_KEY.",
+  },
+  {
     id: "sarvam",
     name: "Sarvam AI",
     models: [

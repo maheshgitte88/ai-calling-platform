@@ -131,6 +131,7 @@ def _provider_env_key(kind: str, provider: str) -> str | None:
         ("tts", "inworld"): ["INWORLD_API_KEY"],
         ("tts", "sarvam"): ["SARVAM_API_KEY"],
         ("tts", "xai"): ["XAI_API_KEY"],
+        ("tts", "murf"): ["MURF_API_KEY"],
     }
     keys = provider_key_map.get((kind, provider), [])
     for key in keys:

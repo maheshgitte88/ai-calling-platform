@@ -1,12 +1,12 @@
 """
 TTS provider factory - creates LiveKit TTS instances from client config.
-Supports: ElevenLabs, Cartesia, Deepgram (Aura), INWORLD, Sarvam.
+Supports: ElevenLabs, Cartesia, Deepgram (Aura), INWORLD, Sarvam, xAI, Murf.
 Voice: ElevenLabs/Cartesia use voice_id (UUID or name), Deepgram/INWORLD/Sarvam use voice/speaker name.
 """
 
 import os
 
-from livekit.plugins import elevenlabs, cartesia, deepgram, inworld, sarvam, xai
+from livekit.plugins import elevenlabs, cartesia, deepgram, inworld, sarvam, xai, murf
 
 
 def get_tts(provider: str, api_key: str, voice: str, model: str = None, target_language_code: str = None):
@@ -32,13 +32,13 @@ def get_tts(provider: str, api_key: str, voice: str, model: str = None, target_l
     if provider == "deepgram":
         # Deepgram model compatibility varies by account/plugin version.
         # Normalize to a broadly supported legacy model when needed.
-        resolved_model = (model or "aura-asteria-en").strip()
+        resolved_model = (model or "aura-2-draco-en").strip()
         if resolved_model == "aura-2":
-            resolved_model = "aura-asteria-en"
+            resolved_model = "aura-2-draco-en"
         kwargs = {
             "api_key": api_key,
             "model": resolved_model,
-            "voice": voice or "athena",
+            "voice": voice or "draco",
         }
         try:
             return deepgram.TTS(**kwargs)
@@ -58,6 +58,16 @@ def get_tts(provider: str, api_key: str, voice: str, model: str = None, target_l
             api_key=key,
             voice=voice or "ara",
             language=target_language_code or "auto",
+        )
+    if provider == "murf":
+        key = (api_key or "").strip() or os.getenv("MURF_API_KEY")
+        resolved_model = (model or "GEN2").strip().upper()
+        if resolved_model not in {"GEN2", "GEN2"}:
+            resolved_model = "GEN2"
+        return murf.TTS(
+            api_key=key,
+            voice=voice or "en-IN-Arnab",
+            model=resolved_model,
         )
     if provider == "sarvam":
         key = (api_key or "").strip() or os.getenv("SARVAM_API_KEY")
