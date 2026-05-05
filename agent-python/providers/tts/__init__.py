@@ -62,12 +62,17 @@ def get_tts(provider: str, api_key: str, voice: str, model: str = None, target_l
     if provider == "murf":
         key = (api_key or "").strip() or os.getenv("MURF_API_KEY")
         resolved_model = (model or "GEN2").strip().upper()
-        if resolved_model not in {"GEN2", "GEN2"}:
+        if resolved_model not in {"GEN2", "FALCON"}:
             resolved_model = "GEN2"
+        # Murf serves GEN2 from api.murf.ai; global.api.murf.ai supports Falcon.
+        base_url = (os.getenv("MURF_BASE_URL") or "").strip()
+        if not base_url:
+            base_url = "https://api.murf.ai" if resolved_model == "GEN2" else "https://global.api.murf.ai"
         return murf.TTS(
             api_key=key,
             voice=voice or "en-IN-Arnab",
             model=resolved_model,
+            base_url=base_url,
         )
     if provider == "sarvam":
         key = (api_key or "").strip() or os.getenv("SARVAM_API_KEY")
