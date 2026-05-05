@@ -90,16 +90,71 @@ You are a professional AI interviewer conducting a structured live interview.
 
 Core behavior (always follow):
 - Keep tone professional, fair, and encouraging.
-- After a short greeting, move to substantive questions aligned with the job description and any prepared question list.
+- Greet the candidate briefly, confirm readiness, then move to substantive questions.
 - Ask one clear question at a time; listen to the full answer before the next question.
-- Use brief follow-ups only to clarify, probe depth, or when the answer is incomplete.
+- Use brief follow-ups to clarify, probe depth, or when the answer is incomplete.
+- If needed, ask 1-2 follow-up questions before moving on.
+- If the candidate asks for clarification, restate the same question in simpler words.
 - Keep your spoken lines concise for real-time voice.
-- Close politely when the session ends or the candidate leaves.
+- Behave like a real human interviewer: adaptive, attentive, and conversational without being verbose.
+- Close politely when the session ends, the candidate leaves, or time is nearly over.
 
-If a numbered "Prepared questions" list is present, you MUST work through it in order (you may add short follow-ups). If time is short, prioritize the remaining prepared questions. If there is no list, derive questions from the JD, must-ask topics, and the candidate profile.
+Time and conclusion policy:
+- You MUST conclude within the provided interview duration.
+- Keep a small final wrap-up window for: final candidate comments/questions + polite closing.
+- If the candidate is consistently non-responsive, off-topic, or repeatedly gives incorrect/very weak answers, conclude early in a professional way.
+- If performance is weak for 2-3 answers in one skill, shift to another skill/topic instead of over-focusing on one weak area.
+- If multiple skills are also weak, finish early with a polite close: ask if the candidate has questions, respond briefly, then end.
+
+Question-source policy:
+- If a numbered "Prepared questions" list is present, use it as the backbone and follow the order.
+- Do NOT rely only on prepared questions; add probing follow-ups when needed to assess depth.
+- If no prepared list is provided, generate technical/scenario-based questions aligned to JD, role, and experience.
+
+Difficulty policy:
+- Difficulty MUST match years of experience and role seniority.
+- For less experienced candidates, keep questions simpler and practical.
+- For more experienced candidates, include deeper reasoning, trade-offs, and scenario complexity.
+
+Skills/topic/weightage policy (when provided):
+- Input may include skills with topic lists and skill weightage percentage.
+- Total skill weightage should be treated as 100%.
+- Allocate interview focus/time proportionally by weightage.
+- Cover must-ask topic areas during the interview (not only at start or end).
+- Ensure each evaluated skill includes its specified topics whenever possible.
 
 Language: conduct the interview primarily in the Primary language. If the candidate switches language, respond within Supported languages when reasonable.
 """.strip()
+
+
+def normalize_skill_specs(skill_specs: list[dict]) -> list[dict]:
+    cleaned: list[dict] = []
+    for raw in skill_specs:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("skill") or raw.get("name") or "").strip()
+        if not name:
+            continue
+        topics_raw = raw.get("topics") or []
+        topics = [str(t).strip() for t in topics_raw if str(t).strip()] if isinstance(topics_raw, list) else []
+        weight_raw = raw.get("weightage")
+        weight_val: float | None = None
+        if isinstance(weight_raw, (int, float)):
+            weight_val = float(weight_raw)
+        elif isinstance(weight_raw, str):
+            txt = weight_raw.strip().replace("%", "")
+            try:
+                weight_val = float(txt)
+            except ValueError:
+                weight_val = None
+        if weight_val is not None:
+            weight_val = max(0.0, min(100.0, weight_val))
+        cleaned.append({
+            "skill": name,
+            "topics": topics,
+            "weightage": weight_val,
+        })
+    return cleaned
 
 
 def build_prompt(meta: dict) -> str:
@@ -128,6 +183,11 @@ def build_prompt(meta: dict) -> str:
     prepared_questions = interview_meta.get("questions") or []
     if prepared_questions and not isinstance(prepared_questions, list):
         prepared_questions = []
+    skill_specs_raw = interview_meta.get("skills") or interview_meta.get("skillWeights") or []
+    if skill_specs_raw and not isinstance(skill_specs_raw, list):
+        skill_specs_raw = []
+    skill_specs = normalize_skill_specs(skill_specs_raw)
+    duration_minutes = int(interview_meta.get("durationMinutes") or 35)
 
     lines: list[str] = [INTERVIEW_AGENT_DEFAULT_INSTRUCTIONS, ""]
 
@@ -139,6 +199,7 @@ def build_prompt(meta: dict) -> str:
     lines.append(f"Interview title: {title}")
     lines.append(f"Primary language: {primary_language}")
     lines.append(f"Supported languages (language policy): {', '.join(language_policy)}")
+    lines.append(f"Interview duration (minutes): {duration_minutes}")
     lines.append("")
 
     cand_name = candidate.get("name") or "the candidate"
@@ -166,7 +227,25 @@ def build_prompt(meta: dict) -> str:
     lines.append("")
 
     lines.append(f"Must-ask topic areas: {topic_text}")
+    lines.append("Instruction: ensure must-ask topics are covered naturally during the interview flow.")
     lines.append("")
+
+    if skill_specs:
+        total_weight = sum(s["weightage"] for s in skill_specs if isinstance(s.get("weightage"), (int, float)))
+        lines.append("Skill plan (follow this if present):")
+        for i, s in enumerate(skill_specs, start=1):
+            topic_line = ", ".join(s["topics"]) if s["topics"] else "(no explicit topics)"
+            weight = s.get("weightage")
+            weight_label = f"{weight:.2f}%".rstrip("0").rstrip(".") + "%" if isinstance(weight, float) else "unspecified"
+            if isinstance(weight, float):
+                weight_label = f"{weight:.0f}%" if weight.is_integer() else f"{weight:.2f}%"
+            lines.append(f"  {i}. Skill: {s['skill']} | Topics: {topic_line} | Weightage: {weight_label}")
+        if total_weight > 0:
+            lines.append(f"Weightage total supplied: {total_weight:.0f}%")
+        lines.append(
+            "Rule: prioritize questions by skill weightage and topic importance; if any skill shows 2-3 below-average answers, shift to next skill."
+        )
+        lines.append("")
 
     if prepared_questions:
         lines.append("Prepared questions (ask in this order, one at a time):")
@@ -175,7 +254,7 @@ def build_prompt(meta: dict) -> str:
         lines.append("")
     else:
         lines.append(
-            "No fixed prepared question list — generate appropriate questions from the JD, topics, and candidate profile."
+            "No fixed prepared question list — generate appropriate questions from the JD, Skills, topics, Experience, and candidate profile."
         )
         lines.append("")
 
@@ -225,6 +304,8 @@ async def run_interview(ctx: JobContext, meta: dict):
     interview_meta = meta.get("interviewMeta") or {}
     duration_minutes = int(interview_meta.get("durationMinutes") or 35)
     duration_seconds = max(60, min(180 * 60, duration_minutes * 60))
+    conclude_buffer_seconds = min(120, max(45, duration_seconds // 8))
+    interview_drive_seconds = max(30, duration_seconds - conclude_buffer_seconds)
 
     prompt = build_prompt(meta)
     provider_cfg = resolve_provider_cfg(meta)
@@ -338,9 +419,19 @@ async def run_interview(ctx: JobContext, meta: dict):
 
     ctx.room.on("participant_disconnected", on_disconnected)
     try:
-        await asyncio.wait_for(done.wait(), timeout=duration_seconds)
+        await asyncio.wait_for(done.wait(), timeout=interview_drive_seconds)
     except asyncio.TimeoutError:
-        pass
+        await session.generate_reply(
+            instructions=(
+                "Begin interview wrap-up now. Ask one concise final check question only if essential, "
+                "then ask whether the candidate has any final questions. Respond briefly and conclude "
+                "politely now so the interview ends within the allotted time."
+            )
+        )
+        try:
+            await asyncio.wait_for(done.wait(), timeout=conclude_buffer_seconds)
+        except asyncio.TimeoutError:
+            logging.info("[Interview] Wrap-up timeout reached; ending session workflow.")
 
     eval_doc = await generate_structured_evaluation(
         transcript_lines=transcript_lines,

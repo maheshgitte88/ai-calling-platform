@@ -23,6 +23,8 @@ const initialState = {
     durationMinutes: 35,
     yearsExperience: "",
     skills: "",
+    mustAskTopics: "",
+    skillPlanText: "",
     jdTitle: "",
     jdText: "",
     questionsText: "",
@@ -101,6 +103,33 @@ function deriveAgentState(rawState, connected) {
   return { stateValue, canListen, isFinished };
 }
 
+function parseSkillPlan(text) {
+  if (!text?.trim()) return [];
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const skills = [];
+  for (const line of lines) {
+    const [skillRaw, topicsRaw = "", weightRaw = ""] = line.split("|").map((p) => p.trim());
+    if (!skillRaw) continue;
+    const topics = topicsRaw
+      ? topicsRaw.split(",").map((t) => t.trim()).filter(Boolean)
+      : [];
+    let weightage;
+    if (weightRaw) {
+      const parsed = Number(weightRaw.replace("%", "").trim());
+      if (Number.isFinite(parsed)) weightage = parsed;
+    }
+    skills.push({
+      skill: skillRaw,
+      topics,
+      weightage,
+    });
+  }
+  return skills;
+}
+
 export default function InterviewCandidate() {
   const [state, dispatch] = useReducer(reducer, initialState);
 
@@ -120,10 +149,15 @@ export default function InterviewCandidate() {
         .split("\n")
         .map((s) => s.trim())
         .filter(Boolean);
+      const mustAskTopics = state.interviewForm.mustAskTopics
+        .split(/[\n,;]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
       const skillList = state.interviewForm.skills
         .split(/[,;]/)
         .map((s) => s.trim())
         .filter(Boolean);
+      const skillPlan = parseSkillPlan(state.interviewForm.skillPlanText);
       const yeRaw = state.interviewForm.yearsExperience;
       const yearsExp =
         yeRaw === "" || yeRaw == null ? undefined : Number(yeRaw);
@@ -141,7 +175,9 @@ export default function InterviewCandidate() {
           language: state.interviewForm.language || "en",
           languagePolicy: langPol.length ? langPol : undefined,
           durationMinutes: Number(state.interviewForm.durationMinutes) || 35,
+          mustAskTopics: mustAskTopics.length ? mustAskTopics : undefined,
           questions: preparedQs.length ? preparedQs : undefined,
+          skills: skillPlan.length ? skillPlan : undefined,
           instructions: state.interviewForm.extraInstructions?.trim() || undefined,
         },
         jd:
@@ -294,6 +330,24 @@ export default function InterviewCandidate() {
           placeholder="What is your experience with…&#10;Describe a time when…"
           value={state.interviewForm.questionsText}
           onChange={(e) => dispatch({ type: "update_form", payload: { questionsText: e.target.value } })}
+        />
+        <label style={styles.labelMuted}>Must-ask topics (comma or newline separated, optional)</label>
+        <textarea
+          style={styles.textarea}
+          rows={2}
+          placeholder="System design, API security, debugging"
+          value={state.interviewForm.mustAskTopics}
+          onChange={(e) => dispatch({ type: "update_form", payload: { mustAskTopics: e.target.value } })}
+        />
+        <label style={styles.labelMuted}>
+          Skills plan (one per line: Skill | topic1, topic2 | weightage%)
+        </label>
+        <textarea
+          style={styles.textarea}
+          rows={4}
+          placeholder={"JavaScript | closures, async, event loop | 40%\nNode.js | streams, scaling, API design | 35%\nCommunication | collaboration, ownership | 25%"}
+          value={state.interviewForm.skillPlanText}
+          onChange={(e) => dispatch({ type: "update_form", payload: { skillPlanText: e.target.value } })}
         />
         <label style={styles.labelMuted}>Extra instructions for the AI (optional, added on top of defaults)</label>
         <textarea

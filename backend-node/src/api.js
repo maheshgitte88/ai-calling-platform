@@ -177,6 +177,12 @@ const BulkCallsSchema = z.object({
   }).partial().optional(),
 });
 
+const InterviewSkillSpecSchema = z.object({
+  skill: z.string().min(1),
+  topics: z.array(z.string().min(1)).optional(),
+  weightage: z.union([z.number(), z.string()]).optional(),
+});
+
 const StartInterviewSessionSchema = z.object({
   candidateId: z.string().min(1),
   interviewId: z.string().min(1),
@@ -196,6 +202,8 @@ const StartInterviewSessionSchema = z.object({
     mustAskTopics: z.array(z.string()).optional(),
     /** Exact interview questions the AI must ask in order */
     questions: z.array(z.string().min(1).max(4000)).optional(),
+    /** Structured interview focus plan: skill + topics + weightage */
+    skills: z.array(z.union([z.string().min(1), InterviewSkillSpecSchema])).optional(),
     scoringRubric: z.record(z.number()).optional(),
     customFields: z.record(z.unknown()).optional(),
     /** Optional employer-specific instructions (merged on top of agent defaults) */
@@ -704,6 +712,34 @@ function normalizeInterviewQuestions(raw) {
   return raw.map((q) => String(q).trim()).filter((q) => q.length > 0);
 }
 
+function normalizeInterviewSkillSpecs(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (typeof item === "string") {
+      const name = item.trim();
+      if (!name) continue;
+      out.push({ skill: name, topics: [], weightage: null });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const skill = String(item.skill || item.name || "").trim();
+    if (!skill) continue;
+    const topics = Array.isArray(item.topics)
+      ? item.topics.map((t) => String(t).trim()).filter(Boolean)
+      : [];
+    let weightage = null;
+    if (typeof item.weightage === "number" && Number.isFinite(item.weightage)) {
+      weightage = item.weightage;
+    } else if (typeof item.weightage === "string" && item.weightage.trim()) {
+      const parsed = Number(item.weightage.replace("%", "").trim());
+      if (Number.isFinite(parsed)) weightage = parsed;
+    }
+    out.push({ skill, topics, weightage });
+  }
+  return out;
+}
+
 function buildInterviewRoomName(interviewId, candidateId) {
   return `interview-${interviewId}-${candidateId}-${Date.now()}`.slice(0, 128);
 }
@@ -739,6 +775,7 @@ app.post("/api/interviews/session/start", async (req, res) => {
       primaryLanguage,
     );
     const preparedQuestions = normalizeInterviewQuestions(payload.interviewMeta?.questions);
+    const interviewSkills = normalizeInterviewSkillSpecs(payload.interviewMeta?.skills);
     const instructionsAdditional = (payload.interviewMeta?.instructions ?? "").trim();
 
     const dispatchMetadata = {
@@ -756,6 +793,7 @@ app.post("/api/interviews/session/start", async (req, res) => {
         durationMinutes,
         mustAskTopics: payload.interviewMeta?.mustAskTopics ?? [],
         questions: preparedQuestions,
+        skills: interviewSkills,
         scoringRubric: payload.interviewMeta?.scoringRubric ?? {},
         customFields: payload.interviewMeta?.customFields ?? {},
         /** Optional employer-only add-on; agent merges with built-in defaults */
