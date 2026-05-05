@@ -801,10 +801,9 @@ app.post("/api/interviews/session/start", async (req, res) => {
         /** Backward compatibility for older agents reading `instructions` */
         instructions: instructionsAdditional,
       },
-      providerConfig: payload.providerConfig ?? {
-        stt: { provider: "deepgram", model: "nova-3" },
-        tts: { provider: "deepgram", model: "aura-asteria-en" },
-      },
+      // Do not hard-force STT/TTS providers here. If caller does not pass providerConfig,
+      // agent runtime defaults (.env / worker defaults) should apply (e.g. Murf).
+      providerConfig: payload.providerConfig ?? {},
       vision: {
         enabled: payload.vision?.enabled ?? false,
         sampleEverySeconds: payload.vision?.sampleEverySeconds ?? 10,
