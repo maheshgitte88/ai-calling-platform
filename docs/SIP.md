@@ -17,6 +17,82 @@ The trunk ID (e.g. `ST_MgmsF2eJdisa`) identifies the SIP trunk LiveKit uses to p
 
 ### Creating an outbound trunk
 
+For **self-hosted LiveKit**, do the same checks via **CLI/API** (not Cloud UI).
+
+## Self-hosted trunk check
+
+Use `lk` CLI against your server:
+
+```bash
+lk sip outbound list \
+  --url ws://yourlivekithostInstanceIp:7880 \
+  --api-key myapikey \
+  --api-secret 'YOUR_SECRET'
+```
+
+If your trunk ID (`ST_MgmsF2eJdisa`) is not listed, it does not exist on that server.
+
+## Get one trunk by ID
+
+```bash
+lk sip outbound get ST_MgmsF2eJdisa \
+  --url ws://yourlivekithostInstanceIp:7880 \
+  --api-key myapikey \
+  --api-secret 'YOUR_SECRET'
+```
+
+If this returns not found, trunk is deleted/wrong server.
+
+## Create new outbound trunk (self-hosted)
+
+```bash
+lk sip outbound create \
+  --url ws://yourlivekithostInstanceIp:7880 \
+  --api-key myapikey \
+  --api-secret 'YOUR_SECRET' \
+  --name "primary-outbound" \
+  --address "<your-sip-provider-host>" \
+  --numbers "SIP Phone Number With +91" \
+  --auth-username "<provider-user -SIP UserName>" \
+  --auth-password "<provider-pass- SIP Password>"
+```
+
+Then it will return a new `ST_...` trunk ID.
+
+Correct command (self-hosted LiveKit)
+Use these exact flag names (LiveKit CLI uses auth-user / auth-pass, not auth-username):
+
+
+lk sip outbound create \
+  --url ws://yourlivekithostInstanceIp:7880 \
+  --api-key myapikey \
+  --api-secret '217x9oGhYOYKYwklA5yl93YYK+D1LhzC5Aixs=' \
+  --name "vobiz-outbound" \
+  --address "dca6a.sip.vobiz.ai" \
+  --transport "udp" \
+  --numbers "+91171938" \
+  --auth-user "voiceai" \
+  --auth-pass "PUT_VOBIZ_PASSWORD_HERE"
+
+## Update your app with new trunk ID
+
+Set same ID in both places (or at least active one):
+- `dashboard-react` client config → `SIP -> trunkId`
+- `agent-python/.env` → `OUTBOUND_TRUNK_ID=ST_new...`
+
+Then restart:
+- backend
+- agent worker
+
+## Important for your case
+
+Your error confirms this exactly:
+- `requested sip trunk does not exist` = wrong/missing trunk ID on current server.
+- Also keep an eye on `486 flood` after fix (rate-limit), so test with single-call concurrency first.
+
+If you want, I can give you exact `lk` commands filled for your current server and number format step-by-step.
+
+
 1. **LiveKit Cloud**: SIP → Create Outbound Trunk → configure your carrier (Twilio, Vonage, Vobiz, etc.) → copy the trunk ID.
 2. **Self-hosted LiveKit**: Configure SIP in your LiveKit config (see [LiveKit SIP docs](https://docs.livekit.io/sip/)) → the trunk ID is assigned when the trunk is created.
 

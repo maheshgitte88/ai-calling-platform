@@ -70,7 +70,7 @@ def get_tts(provider: str, api_key: str, voice: str, model: str = None, target_l
             base_url = "https://api.murf.ai" if resolved_model == "GEN2" else "https://global.api.murf.ai"
         return murf.TTS(
             api_key=key,
-            voice=voice or "en-IN-Aarav",
+            voice=voice or "en-IN-Isha",
             model=resolved_model,
             base_url=base_url,
         )

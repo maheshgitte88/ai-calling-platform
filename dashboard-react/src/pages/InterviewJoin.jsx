@@ -27,6 +27,7 @@ import {
 } from "lucide-react";
 import { api } from "../services/api";
 import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
+import AIVoiceBoatIndicator from "../components/AIVoiceBoatIndicator";
 
 const SESSION_POLL_INTERVAL_MS = 60000;
 
@@ -392,6 +393,15 @@ function InterviewTwoUpStage({ candidateIdentity, onLeave, leaving }) {
   }, [cameraRefs, candidateIdentity, agent]);
 
   const aiRef = videoTrack || fallbackAgentRef;
+  const hasAvatarVideo = Boolean(videoTrack);
+
+  const agentIdentity = useMemo(() => {
+    if (agent?.identity) return agent.identity;
+    if (fallbackAgentRef?.participant?.identity) return fallbackAgentRef.participant.identity;
+    const all = room?.remoteParticipants?.values ? Array.from(room.remoteParticipants.values()) : [];
+    const p = all.find((rp) => rp?.kind === ParticipantKind.AGENT);
+    return p?.identity || "";
+  }, [agent, fallbackAgentRef, room]);
 
   const micEnabled = Boolean(room?.localParticipant?.isMicrophoneEnabled);
   const camEnabled = Boolean(room?.localParticipant?.isCameraEnabled);
@@ -414,7 +424,11 @@ function InterviewTwoUpStage({ candidateIdentity, onLeave, leaving }) {
           {candidateRef ? <ParticipantTile trackRef={candidateRef} style={styles.tile} /> : <EmptyTile label="Candidate" />}
         </div>
         <div style={styles.tileCard}>
-          {aiRef ? <ParticipantTile trackRef={aiRef} style={styles.tile} /> : <EmptyTile label="AI interviewer" />}
+          {hasAvatarVideo && aiRef ? (
+            <ParticipantTile trackRef={aiRef} style={styles.tile} />
+          ) : (
+            <AIVoiceBoatIndicator room={room} agentIdentity={agentIdentity} />
+          )}
         </div>
       </div>
 
@@ -741,6 +755,7 @@ const styles = {
     overflow: "hidden",
     border: "1px solid rgba(148,163,184,0.25)",
     background: "#0b1220",
+    position: "relative",
   },
   tile: {
     width: "100%",
