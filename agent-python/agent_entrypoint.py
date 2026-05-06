@@ -11,6 +11,7 @@ import os
 import re
 import uuid
 from datetime import datetime, timedelta
+from pathlib import Path
 
 # Reduce log noise - keep only important messages
 logging.getLogger("pymongo").setLevel(logging.WARNING)
@@ -20,7 +21,7 @@ logging.getLogger("livekit.agents").setLevel(logging.INFO)
 logging.getLogger("livekit").setLevel(logging.INFO)
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 from livekit.agents import AgentSession, JobContext, WorkerOptions, cli, room_io
 from livekit.agents.voice import Agent

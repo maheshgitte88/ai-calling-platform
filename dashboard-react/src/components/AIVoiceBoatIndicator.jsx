@@ -12,7 +12,9 @@ function findAgentParticipant(room, agentIdentity) {
     const p = room.remoteParticipants.get(agentIdentity);
     if (p) return p;
   }
-  const all = room.remoteParticipants?.values ? Array.from(room.remoteParticipants.values()) : [];
+  const all = room.remoteParticipants?.values
+    ? Array.from(room.remoteParticipants.values())
+    : [];
   return all.find((p) => p?.kind === ParticipantKind.AGENT);
 }
 
@@ -27,14 +29,19 @@ export default function AIVoiceBoatIndicator({
   const targetRef = useRef(0);
   const speakingRef = useRef(false);
 
-  const agentParticipant = useMemo(() => findAgentParticipant(room, agentIdentity), [room, agentIdentity]);
+  const agentParticipant = useMemo(
+    () => findAgentParticipant(room, agentIdentity),
+    [room, agentIdentity],
+  );
 
   useEffect(() => {
     if (!room || !active) return undefined;
 
     const updateFromParticipant = () => {
       const p = findAgentParticipant(room, agentIdentity);
-      const level = clamp01(typeof p?.audioLevel === "number" ? p.audioLevel : 0);
+      const level = clamp01(
+        typeof p?.audioLevel === "number" ? p.audioLevel : 0,
+      );
       const speaking = Boolean(p?.isSpeaking) || level > 0.14;
       targetRef.current = level;
       speakingRef.current = speaking;
@@ -79,7 +86,11 @@ export default function AIVoiceBoatIndicator({
   return (
     <div
       aria-label={speaking ? `${label}: speaking` : `${label}: idle`}
-      title={agentParticipant?.identity ? `AI: ${agentParticipant.identity}` : "AI voice"}
+      title={
+        agentParticipant?.identity
+          ? `AI: ${agentParticipant.identity}`
+          : "AI voice"
+      }
       style={{
         userSelect: "none",
         display: "flex",
@@ -169,11 +180,14 @@ export default function AIVoiceBoatIndicator({
               position: "relative",
             }}
           >
-            <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+            <div
+              style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+            >
               {ringDots.map(({ idx, angle }) => {
                 const strength = speaking ? i : i * 0.35;
                 const pulse = Math.sin(Date.now() / 220 + idx * 0.55);
-                const compress = 1 - strength * 0.18 + ((pulse + 1) / 2) * strength * 0.22;
+                const compress =
+                  1 - strength * 0.18 + ((pulse + 1) / 2) * strength * 0.22;
                 const radius = 136 + (speaking ? pulse * 16 : pulse * 8);
                 const x = Math.cos(angle) * radius;
                 const y = Math.sin(angle) * radius * compress;
@@ -258,8 +272,16 @@ function AnimatedAgentFace({ intensity, speaking }) {
   const browRaise = speaking ? 2.4 + intensity * 3 : 1.2 + intensity * 1.8;
 
   return (
-    <svg viewBox="0 0 200 200" width="84%" height="84%" role="img" aria-label="Animated AI face">
-      <g transform={`translate(100 90) rotate(${headTilt}) translate(-100 -90)`}>
+    <svg
+      viewBox="0 0 200 200"
+      width="84%"
+      height="84%"
+      role="img"
+      aria-label="Animated AI face"
+    >
+      <g
+        transform={`translate(100 90) rotate(${headTilt}) translate(-100 -90)`}
+      >
         <circle cx="100" cy="75" r="34" fill="#F1F5F9" />
         <path
           d={`M80 ${64 - browRaise} Q88 ${60 - browRaise} 96 ${64 - browRaise}`}
@@ -277,8 +299,20 @@ function AnimatedAgentFace({ intensity, speaking }) {
           strokeLinecap="round"
           fill="none"
         />
-        <ellipse cx="88" cy={72 - eyeLift} rx="4.4" ry={eyeOpen} fill="#0F172A" />
-        <ellipse cx="112" cy={72 + eyeLift / 2} rx="4.4" ry={eyeOpen} fill="#0F172A" />
+        <ellipse
+          cx="88"
+          cy={72 - eyeLift}
+          rx="4.4"
+          ry={eyeOpen}
+          fill="#0F172A"
+        />
+        <ellipse
+          cx="112"
+          cy={72 + eyeLift / 2}
+          rx="4.4"
+          ry={eyeOpen}
+          fill="#0F172A"
+        />
         <rect
           x={100 - mouthWidth / 2}
           y="90"
@@ -296,4 +330,3 @@ function AnimatedAgentFace({ intensity, speaking }) {
     </svg>
   );
 }
-

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from uuid import uuid4
 
 from dotenv import load_dotenv
@@ -20,7 +21,7 @@ from providers.llm import get_llm
 from providers.stt import get_stt
 from providers.tts import get_tts
 
-load_dotenv()
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
 logging.getLogger("pymongo").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
@@ -417,26 +418,59 @@ async def run_interview(ctx: JobContext, meta: dict):
 
     im = meta.get("interviewMeta") or {}
     has_prepared = bool(im.get("questions"))
-    await session.generate_reply(
-        instructions=(
-            "Start the interview now: give a brief greeting, then ask the first substantive question. "
-            + (
-                "Use prepared question 1 exactly as the core ask (you may add one short clarification if needed)."
-                if has_prepared
-                else "Base the first question on the JD, must-ask topics, and candidate profile."
-            )
-        )
-    )
 
     done = asyncio.Event()
+    candidate_joined = asyncio.Event()
+    candidate_identity = f"candidate_{candidate_id}" if candidate_id else ""
 
     def on_disconnected(participant):
         identity = getattr(participant, "identity", "") or ""
         if identity.startswith("candidate_"):
             done.set()
 
+    def on_connected(participant):
+        identity = getattr(participant, "identity", "") or ""
+        if candidate_identity:
+            if identity == candidate_identity:
+                candidate_joined.set()
+        elif identity.startswith("candidate_"):
+            candidate_joined.set()
+
+    ctx.room.on("participant_connected", on_connected)
     ctx.room.on("participant_disconnected", on_disconnected)
     try:
+        # Do not burn interview duration before the candidate actually appears in the room.
+        already_present = False
+        for rp in list(getattr(ctx.room, "remote_participants", {}).values()):
+            rid = getattr(rp, "identity", "") or ""
+            if (candidate_identity and rid == candidate_identity) or (not candidate_identity and rid.startswith("candidate_")):
+                already_present = True
+                break
+        if already_present:
+            candidate_joined.set()
+
+        try:
+            await asyncio.wait_for(candidate_joined.wait(), timeout=10 * 60)
+        except asyncio.TimeoutError:
+            logging.info("[Interview] Candidate did not join in prestart window; ending session workflow.")
+            return
+
+        db.interview_sessions.update_one(
+            {"session_id": session_id, "started_at": {"$exists": False}},
+            {"$set": {"started_at": now_iso(), "updated_at": now_iso()}},
+        )
+
+        await session.generate_reply(
+            instructions=(
+                "Start the interview now: give a brief greeting, then ask the first substantive question. "
+                + (
+                    "Use prepared question 1 exactly as the core ask (you may add one short clarification if needed)."
+                    if has_prepared
+                    else "Base the first question on the JD, must-ask topics, and candidate profile."
+                )
+            )
+        )
+
         await asyncio.wait_for(done.wait(), timeout=interview_drive_seconds)
     except asyncio.TimeoutError:
         await session.generate_reply(
@@ -450,6 +484,9 @@ async def run_interview(ctx: JobContext, meta: dict):
             await asyncio.wait_for(done.wait(), timeout=conclude_buffer_seconds)
         except asyncio.TimeoutError:
             logging.info("[Interview] Wrap-up timeout reached; ending session workflow.")
+    finally:
+        ctx.room.off("participant_connected", on_connected)
+        ctx.room.off("participant_disconnected", on_disconnected)
 
     eval_doc = await generate_structured_evaluation(
         transcript_lines=transcript_lines,

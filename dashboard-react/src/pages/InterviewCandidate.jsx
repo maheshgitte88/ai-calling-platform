@@ -21,6 +21,7 @@ const initialState = {
     language: "en",
     languagePolicy: "",
     durationMinutes: 35,
+    linkExpiryHours: 24,
     yearsExperience: "",
     skills: "",
     mustAskTopics: "",
@@ -165,6 +166,10 @@ export default function InterviewCandidate() {
       const resp = await api.startInterviewSession({
         candidateId: state.interviewForm.candidateId.trim(),
         interviewId: state.interviewForm.interviewId.trim(),
+        linkExpiryHours:
+          Number(state.interviewForm.linkExpiryHours) > 0
+            ? Number(state.interviewForm.linkExpiryHours)
+            : undefined,
         candidate: {
           name: state.interviewForm.candidateName || undefined,
           yearsExperience: Number.isFinite(yearsExp) ? yearsExp : undefined,
@@ -305,6 +310,15 @@ export default function InterviewCandidate() {
             placeholder="duration (minutes)"
             value={state.interviewForm.durationMinutes}
             onChange={(e) => dispatch({ type: "update_form", payload: { durationMinutes: e.target.value } })}
+          />
+          <input
+            style={styles.input}
+            type="number"
+            min={1}
+            max={720}
+            placeholder="Link expiry (hours)"
+            value={state.interviewForm.linkExpiryHours}
+            onChange={(e) => dispatch({ type: "update_form", payload: { linkExpiryHours: e.target.value } })}
           />
         </div>
         <div style={styles.gridFull}>

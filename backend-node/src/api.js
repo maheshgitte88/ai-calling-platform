@@ -186,6 +186,9 @@ const InterviewSkillSpecSchema = z.object({
 const StartInterviewSessionSchema = z.object({
   candidateId: z.string().min(1),
   interviewId: z.string().min(1),
+  /** Link validity window (optional). Use either hours or days. */
+  linkExpiryHours: z.number().positive().max(24 * 30).optional(),
+  linkExpiryDays: z.number().positive().max(30).optional(),
   candidate: z.object({
     name: z.string().optional(),
     email: z.string().optional(),
@@ -748,6 +751,28 @@ function candidateIdentity(candidateId) {
   return `candidate_${candidateId}`;
 }
 
+function interviewDurationMinutesFromSession(session) {
+  const raw = session?.metadata?.interviewMeta?.durationMinutes;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.max(5, Math.min(180, Math.round(n))) : 35;
+}
+
+function linkExpiryMsFromPayload(payload) {
+  const hours = Number(payload?.linkExpiryHours);
+  if (Number.isFinite(hours) && hours > 0) return Math.round(hours * 60 * 60 * 1000);
+  const days = Number(payload?.linkExpiryDays);
+  if (Number.isFinite(days) && days > 0) return Math.round(days * 24 * 60 * 60 * 1000);
+  // Default join-link validity: 24h (separate from interview duration).
+  return 24 * 60 * 60 * 1000;
+}
+
+function ttlMinutesFromDuration(durationMinutes) {
+  const n = Number(durationMinutes);
+  if (!Number.isFinite(n)) return 45;
+  // Keep room token alive slightly beyond interview length.
+  return Math.max(15, Math.min(240, Math.round(n + 15)));
+}
+
 app.post("/api/interviews/session/start", async (req, res) => {
   try {
     const payload = StartInterviewSessionSchema.parse(req.body);
@@ -759,12 +784,13 @@ app.post("/api/interviews/session/start", async (req, res) => {
     const participantIdentity = candidateIdentity(payload.candidateId);
     const participantName = payload.candidate?.name || "Candidate";
     const durationMinutes = payload.interviewMeta?.durationMinutes ?? 35;
-    const expiresAt = new Date(Date.now() + Math.max(5, durationMinutes + 10) * 60 * 1000);
+    const tokenTtlMinutes = ttlMinutesFromDuration(durationMinutes);
+    const expiresAt = new Date(Date.now() + tokenTtlMinutes * 60 * 1000);
 
     const token = new AccessToken(env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET, {
       identity: participantIdentity,
       name: participantName,
-      ttl: `${Math.max(5, durationMinutes + 10)}m`,
+      ttl: `${tokenTtlMinutes}m`,
     });
     token.addGrant({ roomJoin: true, room: roomName, canPublish: true, canSubscribe: true, canPublishData: true });
 
@@ -825,13 +851,15 @@ app.post("/api/interviews/session/start", async (req, res) => {
       updated_at: nowIso(),
     });
 
+    const linkExpiryMs = linkExpiryMsFromPayload(payload);
     const joinToken = signInterviewJoinToken({
       sid: sessionId,
       cid: payload.candidateId,
       iid: payload.interviewId,
-      exp: Date.now() + 45 * 60 * 1000,
+      exp: Date.now() + linkExpiryMs,
       n: crypto.randomBytes(8).toString("hex"),
     });
+    const linkExpiresAt = new Date(Date.now() + linkExpiryMs);
     const candidateJoinUrl = `${env.APP_BASE_URL.replace(/\/$/, "")}/interview/join?token=${encodeURIComponent(joinToken)}`;
 
     res.status(201).json({
@@ -842,6 +870,7 @@ app.post("/api/interviews/session/start", async (req, res) => {
       token: await token.toJwt(),
       wsUrl: env.LIVEKIT_URL,
       expiresAt: expiresAt.toISOString(),
+      linkExpiresAt: linkExpiresAt.toISOString(),
       candidateJoinUrl,
       joinToken,
     });
@@ -905,7 +934,7 @@ app.post("/api/interviews/session/resolve", async (req, res) => {
     const token = new AccessToken(env.LIVEKIT_API_KEY, env.LIVEKIT_API_SECRET, {
       identity: activeSession.participant_identity,
       name: activeSession.participant_name || "Candidate",
-      ttl: "45m",
+      ttl: `${ttlMinutesFromDuration(interviewDurationMinutesFromSession(activeSession))}m`,
     });
     token.addGrant({
       roomJoin: true,
@@ -1031,6 +1060,13 @@ app.post("/api/interviews/session/:sessionId/event", async (req, res) => {
       payload: body.payload,
       created_at: nowIso(),
     });
+
+    if (body.type === "candidate_connected") {
+      await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+        { session_id: req.params.sessionId, started_at: { $exists: false } },
+        { $set: { started_at: nowIso(), updated_at: nowIso() } }
+      );
+    }
 
     res.status(201).json({ ok: true });
   } catch (err) {

@@ -157,7 +157,17 @@ export default function InterviewJoin() {
 
   const handleRoomConnected = useCallback(() => {
     setPhase("live");
-  }, []);
+    if (resolved?.sessionId) {
+      api
+        .addInterviewSessionEvent(resolved.sessionId, {
+          type: "candidate_connected",
+          payload: { at: new Date().toISOString(), source: "interview_join" },
+        })
+        .catch(() => {
+          /* best effort only */
+        });
+    }
+  }, [resolved?.sessionId]);
 
   const handleRoomError = useCallback((err) => {
     setErrorInfo(
