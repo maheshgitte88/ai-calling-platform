@@ -1,50 +1,26 @@
-version: "3.8"
-
 services:
-  mongodb:
-    image: mongo:7
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongodb_data:/data/db
-    environment:
-      MONGO_INITDB_DATABASE: ai_calling
-
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-
   backend:
     build:
       context: ./backend-node
       dockerfile: Dockerfile
     ports:
       - "4040:4040"
-    environment:
-      MONGODB_URI: mongodb://mongodb:27017/ai_calling
-      REDIS_URL: redis://redis:6379
-      LIVEKIT_URL: ${LIVEKIT_URL}
-      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
-      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
-      AGENT_NAME: ${AGENT_NAME:-ai-calling-agent}
-    depends_on:
-      - mongodb
-      - redis
+    env_file:
+      - ./backend-node/.env
+    networks:
+      - default
+      - livekit-net
 
-  agent:
+  interview-agent:
     build:
       context: ./agent-python
       dockerfile: Dockerfile
-    environment:
-      MONGODB_URI: mongodb://mongodb:27017/ai_calling
-      LIVEKIT_URL: ${LIVEKIT_URL}
-      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
-      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
-      AGENT_NAME: ${AGENT_NAME:-ai-calling-agent}
-      GOOGLE_API_KEY: ${GOOGLE_API_KEY}
-    depends_on:
-      - mongodb
+    command: ["python", "interview_agent_entrypoint.py", "dev"]
+    env_file:
+      - ./agent-python/.env
+    networks:
+      - default
+      - livekit-net
 
   dashboard:
     build:
@@ -55,5 +31,7 @@ services:
     depends_on:
       - backend
 
-volumes:
-  mongodb_data:
+networks:
+  livekit-net:
+    external: true
+    name: livekit-stack_livekit-net

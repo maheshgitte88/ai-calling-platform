@@ -1,0 +1,22 @@
+api_key: myapikey
+api_secret: "217x9oGhYOCLYKYwklA5yl93YYKTX/I+D1LhzC5Aixs="
+
+# In docker-compose, the SIP container reaches LiveKit by service DNS name.
+# If you run with raw `docker run` and a user-defined network named `livekit-net`,
+# this still resolves because both containers share that network.
+ws_url: ws://livekit:7880
+
+redis:
+  address: redis-19322.c212.ap-south-1-1.ec2.cloud.redislabs.com:19322
+  username: default
+  password: S1cs17cwLLcXsHXioLKNL3WPTSdAyi1H
+
+# SIP signaling
+sip_port: 5060
+
+# RTP media range for SIP side. Narrow range for local dev so port publishing
+# is fast on Docker Desktop. Widen on production to e.g. 10000-20000.
+rtp_port: 10000-10100
+
+logging:
+  level: info

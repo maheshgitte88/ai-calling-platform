@@ -5,10 +5,11 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 3000,
-    allowedHosts: ["hardship-wasting-passport.ngrok-free.dev"],
+    // Quick tunnels (Cloudflare *.trycloudflare.com, ngrok, etc.) use a new hostname each time — listing each one is brittle.
+    allowedHosts: true,
     proxy: {
       "/api": {
-        target: "http://13.234.90.206:4040",
+        target: "http://localhost:4040",
         changeOrigin: true,
       },
     },

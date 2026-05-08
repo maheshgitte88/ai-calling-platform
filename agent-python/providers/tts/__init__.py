@@ -56,8 +56,8 @@ def get_tts(provider: str, api_key: str, voice: str, model: str = None, target_l
         key = (api_key or "").strip() or os.getenv("XAI_API_KEY")
         return xai.TTS(
             api_key=key,
-            voice=voice or "ara",
-            language=target_language_code or "auto",
+            voice=voice or "a00ce99a",
+            language=target_language_code or "hi",
         )
     if provider == "murf":
         key = (api_key or "").strip() or os.getenv("MURF_API_KEY")

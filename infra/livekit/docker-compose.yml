@@ -1,0 +1,42 @@
+name: livekit-stack
+
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: livekit
+    restart: unless-stopped
+    networks:
+      - livekit-net
+    ports:
+      - "7880:7880"            # HTTP / WebSocket signaling
+      - "7881:7881/tcp"        # ICE/TCP fallback
+      - "50000-50100:50000-50100/udp"  # WebRTC media (UDP)
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    command: ["--config", "/etc/livekit.yaml"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://127.0.0.1:7880"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  sip:
+    image: livekit/sip:latest
+    container_name: livekit-sip
+    restart: unless-stopped
+    networks:
+      - livekit-net
+    depends_on:
+      livekit:
+        condition: service_started
+    ports:
+      - "5060:5060/udp"          # SIP signaling
+      - "10000-10100:10000-10100/udp"  # RTP media for SIP
+    volumes:
+      - ./sip.yaml:/etc/sip.yaml:ro
+    environment:
+      SIP_CONFIG_FILE: /etc/sip.yaml
+
+networks:
+  livekit-net:
+    driver: bridge

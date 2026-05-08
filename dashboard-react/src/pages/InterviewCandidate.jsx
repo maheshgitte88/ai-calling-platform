@@ -1,290 +1,300 @@
-import { useEffect, useMemo, useReducer } from "react";
-import {
-  LiveKitRoom,
-  RoomAudioRenderer,
-  VideoConference,
-  useRoomContext,
-} from "@livekit/components-react";
-import { RoomEvent } from "livekit-client";
+import { useMemo, useState } from "react";
 import { api } from "../services/api";
-import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
-import RecommendationPill from "../components/RecommendationPill";
 
-const initialState = {
-  phase: "idle",
-  session: null,
-  interviewForm: {
-    candidateId: "",
-    interviewId: "",
-    candidateName: "",
-    title: "",
-    language: "en",
-    languagePolicy: "",
-    durationMinutes: 35,
-    linkExpiryHours: 24,
-    yearsExperience: "",
-    skills: "",
-    mustAskTopics: "",
-    skillPlanText: "",
-    jdTitle: "",
-    jdText: "",
-    questionsText: "",
-    extraInstructions: "",
-    visionEnabled: false,
-  },
-  connection: { state: "disconnected", reconnectAttempts: 0, lastError: "" },
-  agent: {
-    present: false,
-    identity: "",
-    state: "connecting",
-    canListen: false,
-    isFinished: false,
-  },
-  interview: {
-    startedAt: null,
-    transcript: [],
-    evaluation: null,
-  },
+// ---------------------------------------------------------------------------
+// Form shape
+// ---------------------------------------------------------------------------
+
+const DIFFICULTY_OPTIONS = ["", "easy", "medium", "hard"];
+const DIFFICULTY_LABELS = {
+  "": "—",
+  easy: "Easy",
+  medium: "Medium",
+  hard: "Hard",
 };
 
-function reducer(state, action) {
-  switch (action.type) {
-    case "update_form":
-      return { ...state, interviewForm: { ...state.interviewForm, ...action.payload } };
-    case "phase":
-      return { ...state, phase: action.value };
-    case "session_created":
-      return { ...state, session: action.payload, phase: "connecting_room", connection: { ...state.connection, lastError: "" } };
-    case "connection":
-      return { ...state, connection: { ...state.connection, ...action.payload } };
-    case "agent_presence":
-      return {
-        ...state,
-        agent: {
-          ...state.agent,
-          present: action.present,
-          identity: action.identity || "",
-        },
-      };
-    case "agent_state":
-      return {
-        ...state,
-        agent: {
-          ...state.agent,
-          state: action.stateValue,
-          canListen: action.canListen,
-          isFinished: action.isFinished,
-        },
-      };
-    case "interview_started":
-      return { ...state, interview: { ...state.interview, startedAt: new Date().toISOString() } };
-    case "append_transcript":
-      return { ...state, interview: { ...state.interview, transcript: [...state.interview.transcript, action.payload] } };
-    case "evaluation":
-      return { ...state, interview: { ...state.interview, evaluation: action.payload } };
-    case "reset":
-      return initialState;
-    default:
-      return state;
-  }
+function makeSkillPlanRow() {
+  return {
+    skill: "",
+    topics: "",
+    weightage: "",
+    difficulty: "",
+    instructions: "",
+  };
 }
 
-function safeJson(raw) {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
+function makeQuestionGroupRow() {
+  return {
+    skill: "",
+    questionsText: "",
+    askFollowUps: true,
+    allowAdditional: false,
+  };
 }
 
-function deriveAgentState(rawState, connected) {
-  const stateValue = rawState || (connected ? "initializing" : "connecting");
-  const canListen = ["pre-connect-buffering", "listening", "thinking", "speaking"].includes(stateValue);
-  const isFinished = ["disconnected", "failed"].includes(stateValue);
-  return { stateValue, canListen, isFinished };
+function makeMustAskTopicRow() {
+  return {
+    topic: "",
+    askNow: false,
+  };
 }
 
-function parseSkillPlan(text) {
-  if (!text?.trim()) return [];
-  const lines = text
-    .split("\n")
-    .map((line) => line.trim())
+const defaultForm = {
+  candidateId: "",
+  interviewId: "",
+  candidateName: "",
+  title: "",
+  language: "en",
+  languagePolicy: "",
+  durationMinutes: 35,
+  linkExpiryHours: 24,
+  recordingEnabled: false,
+  yearsExperience: "",
+  skills: "",
+  resumeSummary: "",
+  jdTitle: "",
+  jdText: "",
+  extraInstructions: "",
+  visionEnabled: false,
+  skillPlan: [makeSkillPlanRow()],
+  questionGroups: [makeQuestionGroupRow()],
+  mustAskTopics: [makeMustAskTopicRow()],
+};
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
+
+function splitList(value, separator = /[,;]/) {
+  return String(value || "")
+    .split(separator)
+    .map((item) => item.trim())
     .filter(Boolean);
-  const skills = [];
-  for (const line of lines) {
-    const [skillRaw, topicsRaw = "", weightRaw = ""] = line.split("|").map((p) => p.trim());
-    if (!skillRaw) continue;
-    const topics = topicsRaw
-      ? topicsRaw.split(",").map((t) => t.trim()).filter(Boolean)
-      : [];
-    let weightage;
-    if (weightRaw) {
-      const parsed = Number(weightRaw.replace("%", "").trim());
-      if (Number.isFinite(parsed)) weightage = parsed;
-    }
-    skills.push({
-      skill: skillRaw,
-      topics,
+}
+
+function parseWeightage(raw) {
+  if (raw == null || String(raw).trim() === "") return undefined;
+  const parsed = Number(String(raw).replace("%", "").trim());
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function buildSkillPlanPayload(rows) {
+  const out = [];
+  for (const row of rows) {
+    const skill = row.skill.trim();
+    if (!skill) continue;
+    const topics = splitList(row.topics);
+    const weightage = parseWeightage(row.weightage);
+    const difficulty = row.difficulty || undefined;
+    const instructions = row.instructions.trim() || undefined;
+    out.push({
+      skill,
+      topics: topics.length ? topics : undefined,
       weightage,
+      difficulty,
+      instructions,
     });
   }
-  return skills;
+  return out;
 }
 
+function buildQuestionGroupsPayload(rows) {
+  const out = [];
+  for (const row of rows) {
+    const skill = row.skill.trim();
+    if (!skill) continue;
+    const questions = splitList(row.questionsText, "\n");
+    if (!questions.length) continue;
+    out.push({
+      skill,
+      questions,
+      askFollowUps: Boolean(row.askFollowUps),
+      allowAdditional: Boolean(row.allowAdditional),
+    });
+  }
+  return out;
+}
+
+function buildMustAskTopicsPayload(rows) {
+  const out = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const topic = row.topic.trim();
+    if (!topic) continue;
+    const key = topic.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ topic, askNow: Boolean(row.askNow) });
+  }
+  return out;
+}
+
+function buildStartSessionPayload(form) {
+  const yearsExperience = form.yearsExperience === "" ? undefined : Number(form.yearsExperience);
+  const languagePolicy = splitList(form.languagePolicy).map((item) => item.toLowerCase());
+  const candidateSkills = splitList(form.skills);
+  const skillPlan = buildSkillPlanPayload(form.skillPlan);
+  const questionGroups = buildQuestionGroupsPayload(form.questionGroups);
+  const mustAskTopics = buildMustAskTopicsPayload(form.mustAskTopics);
+  const linkExpiryHours = Number(form.linkExpiryHours);
+
+  return {
+    candidateId: form.candidateId.trim(),
+    interviewId: form.interviewId.trim(),
+    linkExpiryHours: Number.isFinite(linkExpiryHours) && linkExpiryHours > 0 ? linkExpiryHours : undefined,
+    recordingEnabled: Boolean(form.recordingEnabled),
+    candidate: {
+      name: form.candidateName.trim() || undefined,
+      yearsExperience: Number.isFinite(yearsExperience) ? yearsExperience : undefined,
+      skills: candidateSkills.length ? candidateSkills : undefined,
+      resumeSummary: form.resumeSummary.trim() || undefined,
+    },
+    interviewMeta: {
+      title: form.title.trim() || undefined,
+      language: form.language.trim() || "en",
+      languagePolicy: languagePolicy.length ? languagePolicy : undefined,
+      durationMinutes: Number(form.durationMinutes) || 35,
+      mustAskTopics: mustAskTopics.length ? mustAskTopics : undefined,
+      questions: questionGroups.length ? questionGroups : undefined,
+      skills: skillPlan.length ? skillPlan : undefined,
+      instructions: form.extraInstructions.trim() || undefined,
+    },
+    jd:
+      form.jdTitle.trim() || form.jdText.trim()
+        ? {
+            title: form.jdTitle.trim() || undefined,
+            text: form.jdText.trim() || undefined,
+          }
+        : undefined,
+    vision: {
+      enabled: Boolean(form.visionEnabled),
+      sampleEverySeconds: 10,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Page
+// ---------------------------------------------------------------------------
+
 export default function InterviewCandidate() {
-  const [state, dispatch] = useReducer(reducer, initialState);
+  const [form, setForm] = useState(defaultForm);
+  const [status, setStatus] = useState("idle");
+  const [generated, setGenerated] = useState(null);
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState("");
 
-  const canStart = useMemo(() => {
-    return state.interviewForm.candidateId.trim() && state.interviewForm.interviewId.trim();
-  }, [state.interviewForm.candidateId, state.interviewForm.interviewId]);
+  const canGenerate = useMemo(() => {
+    return form.candidateId.trim() && form.interviewId.trim() && status !== "creating";
+  }, [form.candidateId, form.interviewId, status]);
 
-  const startSession = async () => {
-    if (!canStart || state.phase !== "idle") return;
-    dispatch({ type: "phase", value: "creating_session" });
+  const updateForm = (patch) => {
+    setForm((current) => ({ ...current, ...patch }));
+    setError("");
+  };
+
+  const updateRow = (key, index, patch) => {
+    setForm((current) => {
+      const next = current[key].map((row, i) => (i === index ? { ...row, ...patch } : row));
+      return { ...current, [key]: next };
+    });
+    setError("");
+  };
+
+  const addRow = (key, factory) => {
+    setForm((current) => ({ ...current, [key]: [...current[key], factory()] }));
+  };
+
+  const removeRow = (key, index, factory) => {
+    setForm((current) => {
+      const next = current[key].filter((_, i) => i !== index);
+      return { ...current, [key]: next.length ? next : [factory()] };
+    });
+  };
+
+  const generateLink = async () => {
+    if (!canGenerate) return;
+    setStatus("creating");
+    setError("");
+    setCopied("");
     try {
-      const langPol = state.interviewForm.languagePolicy
-        .split(/[,;]/)
-        .map((s) => s.trim().toLowerCase())
-        .filter(Boolean);
-      const preparedQs = state.interviewForm.questionsText
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const mustAskTopics = state.interviewForm.mustAskTopics
-        .split(/[\n,;]/)
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const skillList = state.interviewForm.skills
-        .split(/[,;]/)
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const skillPlan = parseSkillPlan(state.interviewForm.skillPlanText);
-      const yeRaw = state.interviewForm.yearsExperience;
-      const yearsExp =
-        yeRaw === "" || yeRaw == null ? undefined : Number(yeRaw);
-
-      const resp = await api.startInterviewSession({
-        candidateId: state.interviewForm.candidateId.trim(),
-        interviewId: state.interviewForm.interviewId.trim(),
-        linkExpiryHours:
-          Number(state.interviewForm.linkExpiryHours) > 0
-            ? Number(state.interviewForm.linkExpiryHours)
-            : undefined,
-        candidate: {
-          name: state.interviewForm.candidateName || undefined,
-          yearsExperience: Number.isFinite(yearsExp) ? yearsExp : undefined,
-          skills: skillList.length ? skillList : undefined,
-        },
-        interviewMeta: {
-          title: state.interviewForm.title || undefined,
-          language: state.interviewForm.language || "en",
-          languagePolicy: langPol.length ? langPol : undefined,
-          durationMinutes: Number(state.interviewForm.durationMinutes) || 35,
-          mustAskTopics: mustAskTopics.length ? mustAskTopics : undefined,
-          questions: preparedQs.length ? preparedQs : undefined,
-          skills: skillPlan.length ? skillPlan : undefined,
-          instructions: state.interviewForm.extraInstructions?.trim() || undefined,
-        },
-        jd:
-          state.interviewForm.jdTitle?.trim() || state.interviewForm.jdText?.trim()
-            ? {
-                title: state.interviewForm.jdTitle?.trim() || undefined,
-                text: state.interviewForm.jdText?.trim() || undefined,
-              }
-            : undefined,
-        vision: {
-          enabled: state.interviewForm.visionEnabled,
-          sampleEverySeconds: 10,
-        },
-      });
-      dispatch({ type: "session_created", payload: resp });
-      dispatch({ type: "phase", value: "waiting_for_agent" });
-    } catch (e) {
-      dispatch({ type: "connection", payload: { lastError: e.message || "Failed to start session" } });
-      dispatch({ type: "phase", value: "failed" });
+      const response = await api.startInterviewSession(buildStartSessionPayload(form));
+      setGenerated(response);
+      setStatus("created");
+    } catch (err) {
+      setError(err?.message || "Failed to generate interview link");
+      setStatus("failed");
     }
   };
 
-  const endSession = async () => {
-    if (!state.session) return;
-    dispatch({ type: "phase", value: "ending" });
-    try {
-      await api.endInterviewSession(state.session.sessionId, { reason: "candidate_ended" });
-      dispatch({ type: "phase", value: "completed" });
-    } catch (e) {
-      dispatch({ type: "connection", payload: { lastError: e.message || "Failed to end session" } });
-      dispatch({ type: "phase", value: "failed" });
-    }
+  const resetForm = () => {
+    setForm(defaultForm);
+    setGenerated(null);
+    setError("");
+    setCopied("");
+    setStatus("idle");
   };
 
-  useEffect(() => {
-    if (!state.session?.sessionId) return undefined;
-    if (state.phase === "idle") return undefined;
-    let cancelled = false;
-    const timer = setInterval(async () => {
-      try {
-        const data = await api.getInterviewSession(state.session.sessionId);
-        if (cancelled) return;
-
-        if (data?.evaluation) {
-          dispatch({ type: "evaluation", payload: data.evaluation });
-          if (state.phase !== "completed") dispatch({ type: "phase", value: "completed" });
-          clearInterval(timer);
-        }
-      } catch {
-        // ignore intermittent polling errors
-      }
-    }, 4000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [state.session?.sessionId, state.phase]);
+  const copyValue = async (label, value) => {
+    if (!value) return;
+    await navigator.clipboard.writeText(value);
+    setCopied(label);
+    window.setTimeout(() => setCopied(""), 1500);
+  };
 
   return (
     <div>
-      <h1 style={{ marginBottom: "1rem" }}>Candidate Interview</h1>
-      <p style={{ color: "#64748b", marginBottom: "1.2rem" }}>
-        Candidate joins LiveKit room, backend dispatches AI interviewer, and reducer-managed session state drives UI.
+      <h1 style={{ marginBottom: "0.65rem" }}>Schedule Interview</h1>
+      <p style={styles.pageIntro}>
+        Fill interview details and generate a secure candidate link. The candidate joins from that
+        link; this page does not open the interview room.
       </p>
 
       <div style={styles.card}>
+        <div style={styles.sectionHeader}>
+          <div>
+            <h2 style={styles.sectionTitle}>Candidate and interview</h2>
+            <p style={styles.sectionSubtext}>Only candidateId and interviewId are required.</p>
+          </div>
+          <span style={styles.badge}>Link generator</span>
+        </div>
+
         <div style={styles.grid}>
           <input
             style={styles.input}
             placeholder="candidateId"
-            value={state.interviewForm.candidateId}
-            onChange={(e) => dispatch({ type: "update_form", payload: { candidateId: e.target.value } })}
+            value={form.candidateId}
+            onChange={(e) => updateForm({ candidateId: e.target.value })}
           />
           <input
             style={styles.input}
             placeholder="interviewId"
-            value={state.interviewForm.interviewId}
-            onChange={(e) => dispatch({ type: "update_form", payload: { interviewId: e.target.value } })}
+            value={form.interviewId}
+            onChange={(e) => updateForm({ interviewId: e.target.value })}
           />
           <input
             style={styles.input}
             placeholder="Candidate name (optional)"
-            value={state.interviewForm.candidateName}
-            onChange={(e) => dispatch({ type: "update_form", payload: { candidateName: e.target.value } })}
+            value={form.candidateName}
+            onChange={(e) => updateForm({ candidateName: e.target.value })}
           />
           <input
             style={styles.input}
             placeholder="Interview title (optional)"
-            value={state.interviewForm.title}
-            onChange={(e) => dispatch({ type: "update_form", payload: { title: e.target.value } })}
+            value={form.title}
+            onChange={(e) => updateForm({ title: e.target.value })}
           />
           <input
             style={styles.input}
             placeholder="Primary language (e.g. en)"
-            value={state.interviewForm.language}
-            onChange={(e) => dispatch({ type: "update_form", payload: { language: e.target.value } })}
+            value={form.language}
+            onChange={(e) => updateForm({ language: e.target.value })}
           />
           <input
             style={styles.input}
             placeholder="Language policy: en, hi, ta (optional)"
-            value={state.interviewForm.languagePolicy}
-            onChange={(e) => dispatch({ type: "update_form", payload: { languagePolicy: e.target.value } })}
+            value={form.languagePolicy}
+            onChange={(e) => updateForm({ languagePolicy: e.target.value })}
           />
           <input
             style={styles.input}
@@ -293,14 +303,14 @@ export default function InterviewCandidate() {
             max={80}
             step="0.5"
             placeholder="Years experience (optional)"
-            value={state.interviewForm.yearsExperience}
-            onChange={(e) => dispatch({ type: "update_form", payload: { yearsExperience: e.target.value } })}
+            value={form.yearsExperience}
+            onChange={(e) => updateForm({ yearsExperience: e.target.value })}
           />
           <input
             style={styles.input}
-            placeholder="Skills: React, Node, … (comma-separated)"
-            value={state.interviewForm.skills}
-            onChange={(e) => dispatch({ type: "update_form", payload: { skills: e.target.value } })}
+            placeholder="Candidate skills: React, Node (comma-separated)"
+            value={form.skills}
+            onChange={(e) => updateForm({ skills: e.target.value })}
           />
           <input
             style={styles.input}
@@ -308,8 +318,8 @@ export default function InterviewCandidate() {
             min={5}
             max={180}
             placeholder="duration (minutes)"
-            value={state.interviewForm.durationMinutes}
-            onChange={(e) => dispatch({ type: "update_form", payload: { durationMinutes: e.target.value } })}
+            value={form.durationMinutes}
+            onChange={(e) => updateForm({ durationMinutes: e.target.value })}
           />
           <input
             style={styles.input}
@@ -317,294 +327,414 @@ export default function InterviewCandidate() {
             min={1}
             max={720}
             placeholder="Link expiry (hours)"
-            value={state.interviewForm.linkExpiryHours}
-            onChange={(e) => dispatch({ type: "update_form", payload: { linkExpiryHours: e.target.value } })}
+            value={form.linkExpiryHours}
+            onChange={(e) => updateForm({ linkExpiryHours: e.target.value })}
           />
         </div>
+
+        <label style={styles.labelMuted}>
+          Candidate resume summary (optional, but highly recommended — the AI uses it to tailor questions and follow-ups)
+        </label>
+        <textarea
+          style={styles.textarea}
+          rows={5}
+          placeholder="Paste a short narrative or the candidate's resume summary. Mention current role, key projects, tech stack, achievements."
+          value={form.resumeSummary}
+          onChange={(e) => updateForm({ resumeSummary: e.target.value })}
+        />
+
         <div style={styles.gridFull}>
           <input
             style={styles.input}
             placeholder="JD title (optional)"
-            value={state.interviewForm.jdTitle}
-            onChange={(e) => dispatch({ type: "update_form", payload: { jdTitle: e.target.value } })}
+            value={form.jdTitle}
+            onChange={(e) => updateForm({ jdTitle: e.target.value })}
           />
         </div>
+
         <label style={styles.labelMuted}>Job description (optional)</label>
         <textarea
           style={styles.textarea}
           rows={3}
-          placeholder="Paste JD text for the AI to use as context…"
-          value={state.interviewForm.jdText}
-          onChange={(e) => dispatch({ type: "update_form", payload: { jdText: e.target.value } })}
+          placeholder="Paste JD text for the AI to use as context"
+          value={form.jdText}
+          onChange={(e) => updateForm({ jdText: e.target.value })}
         />
-        <label style={styles.labelMuted}>Prepared questions (one per line, optional)</label>
-        <textarea
-          style={styles.textarea}
-          rows={5}
-          placeholder="What is your experience with…&#10;Describe a time when…"
-          value={state.interviewForm.questionsText}
-          onChange={(e) => dispatch({ type: "update_form", payload: { questionsText: e.target.value } })}
-        />
-        <label style={styles.labelMuted}>Must-ask topics (comma or newline separated, optional)</label>
-        <textarea
-          style={styles.textarea}
-          rows={2}
-          placeholder="System design, API security, debugging"
-          value={state.interviewForm.mustAskTopics}
-          onChange={(e) => dispatch({ type: "update_form", payload: { mustAskTopics: e.target.value } })}
-        />
-        <label style={styles.labelMuted}>
-          Skills plan (one per line: Skill | topic1, topic2 | weightage%)
-        </label>
-        <textarea
-          style={styles.textarea}
-          rows={4}
-          placeholder={"JavaScript | closures, async, event loop | 40%\nNode.js | streams, scaling, API design | 35%\nCommunication | collaboration, ownership | 25%"}
-          value={state.interviewForm.skillPlanText}
-          onChange={(e) => dispatch({ type: "update_form", payload: { skillPlanText: e.target.value } })}
-        />
+
         <label style={styles.labelMuted}>Extra instructions for the AI (optional, added on top of defaults)</label>
         <textarea
           style={styles.textarea}
           rows={2}
-          placeholder="e.g. Emphasize system design; allow code discussion in English only."
-          value={state.interviewForm.extraInstructions}
-          onChange={(e) => dispatch({ type: "update_form", payload: { extraInstructions: e.target.value } })}
+          placeholder="Example: emphasize system design; keep questions practical."
+          value={form.extraInstructions}
+          onChange={(e) => updateForm({ extraInstructions: e.target.value })}
         />
-        <label style={{ display: "block", marginTop: 8 }}>
-          <input
-            type="checkbox"
-            checked={state.interviewForm.visionEnabled}
-            onChange={(e) => dispatch({ type: "update_form", payload: { visionEnabled: e.target.checked } })}
-          />{" "}
-          Enable vision sampling
-        </label>
-        <div style={styles.row}>
-          <button disabled={!canStart || state.phase !== "idle"} style={styles.btnPrimary} onClick={startSession}>
-            Start interview
-          </button>
-          <button disabled={!state.session || ["ending", "completed"].includes(state.phase)} style={styles.btnSecondary} onClick={endSession}>
-            End interview
-          </button>
+
+        <div style={styles.optionsRow}>
+          <label style={styles.checkboxLabel}>
+            <input
+              type="checkbox"
+              checked={form.visionEnabled}
+              onChange={(e) => updateForm({ visionEnabled: e.target.checked })}
+            />{" "}
+            Enable vision sampling
+          </label>
+          <label style={styles.checkboxLabel}>
+            <input
+              type="checkbox"
+              checked={form.recordingEnabled}
+              onChange={(e) => updateForm({ recordingEnabled: e.target.checked })}
+            />{" "}
+            Record interview (Azure storage)
+          </label>
         </div>
       </div>
 
-      {state.session ? (
-        <LiveKitRoom
-          token={state.session.token}
-          serverUrl={state.session.wsUrl}
-          connect={state.phase !== "completed" && state.phase !== "ending"}
-          audio
-          video
-          onConnected={() => {
-            dispatch({ type: "connection", payload: { state: "connected", lastError: "" } });
-            dispatch({ type: "phase", value: "preflight" });
-          }}
-          onDisconnected={() => {
-            if (state.phase !== "completed") {
-              dispatch({ type: "connection", payload: { state: "disconnected" } });
-            }
-          }}
-          onError={(error) => {
-            dispatch({ type: "connection", payload: { lastError: error?.message || "Room error" } });
-            dispatch({ type: "phase", value: "failed" });
-          }}
-          data-lk-theme="default"
-          style={styles.lkRoom}
-        >
-          <InterviewRoomBridge
-            session={state.session}
-            phase={state.phase}
-            onAgentPresence={(present, identity) => dispatch({ type: "agent_presence", present, identity })}
-            onAgentState={(nextState) => dispatch({ type: "agent_state", ...nextState })}
-            onPhase={(value) => dispatch({ type: "phase", value })}
-            onInterviewStarted={() => dispatch({ type: "interview_started" })}
-            onTranscript={(line) => dispatch({ type: "append_transcript", payload: line })}
-          />
-          <VideoConference />
-          <RoomAudioRenderer />
-        </LiveKitRoom>
+      <MustAskTopicsSection
+        rows={form.mustAskTopics}
+        onChange={(index, patch) => updateRow("mustAskTopics", index, patch)}
+        onAdd={() => addRow("mustAskTopics", makeMustAskTopicRow)}
+        onRemove={(index) => removeRow("mustAskTopics", index, makeMustAskTopicRow)}
+      />
+
+      <SkillPlanSection
+        rows={form.skillPlan}
+        onChange={(index, patch) => updateRow("skillPlan", index, patch)}
+        onAdd={() => addRow("skillPlan", makeSkillPlanRow)}
+        onRemove={(index) => removeRow("skillPlan", index, makeSkillPlanRow)}
+      />
+
+      <QuestionGroupsSection
+        rows={form.questionGroups}
+        onChange={(index, patch) => updateRow("questionGroups", index, patch)}
+        onAdd={() => addRow("questionGroups", makeQuestionGroupRow)}
+        onRemove={(index) => removeRow("questionGroups", index, makeQuestionGroupRow)}
+      />
+
+      {error ? (
+        <div style={styles.errorBox}>
+          <strong>Error:</strong> {error}
+        </div>
       ) : null}
 
-      <div style={styles.statusCard}>
-        <p><strong>Phase:</strong> {state.phase}</p>
-        <p><strong>Connection:</strong> {state.connection.state}</p>
-        <p><strong>Agent:</strong> {state.agent.present ? `Connected (${state.agent.identity})` : "Waiting"}</p>
-        <p><strong>Agent state:</strong> {state.agent.state}</p>
-        <p><strong>Agent canListen:</strong> {String(state.agent.canListen)}</p>
-        {state.session?.roomName ? <p><strong>Room:</strong> {state.session.roomName}</p> : null}
-        {state.connection.lastError ? <p style={{ color: "#b91c1c" }}><strong>Error:</strong> {state.connection.lastError}</p> : null}
+      <div style={styles.row}>
+        <button disabled={!canGenerate} style={styles.btnPrimary} onClick={generateLink}>
+          {status === "creating" ? "Generating..." : "Generate interview link"}
+        </button>
+        <button disabled={status === "creating"} style={styles.btnSecondary} onClick={resetForm}>
+          Clear
+        </button>
       </div>
 
-      <div style={styles.card}>
-        <h3>Transcript (data channel)</h3>
-        {state.interview.transcript.length === 0 ? (
-          <p style={{ color: "#64748b" }}>No transcript messages yet.</p>
-        ) : (
-          <div style={styles.transcript}>
-            {state.interview.transcript.map((line, idx) => (
-              <div key={`${line.createdAt}-${idx}`} style={styles.transcriptLine}>
-                <strong>{line.role}:</strong> {line.text}
-              </div>
-            ))}
+      {generated ? (
+        <div style={styles.resultCard}>
+          <div style={styles.sectionHeader}>
+            <div>
+              <h2 style={styles.sectionTitle}>Interview link generated</h2>
+              <p style={styles.sectionSubtext}>
+                Share this link with the candidate. Do not use this page to join the room.
+              </p>
+            </div>
+            <span style={styles.successBadge}>Ready</span>
           </div>
-        )}
-      </div>
 
-      {state.interview.evaluation ? (
-        <div style={styles.card}>
-          <h3>Interview Summary</h3>
-          <p><strong>Summary:</strong> {state.interview.evaluation.summary || "-"}</p>
-          {state.interview.evaluation.overallPercent != null ? (
-            <p>
-              <strong>Overall score:</strong> {state.interview.evaluation.overallPercent}%
-              {state.interview.evaluation.questionStats ? (
-                <span style={{ color: "#64748b", marginLeft: 8 }}>
-                  ({state.interview.evaluation.questionStats.correct ?? 0} correct,{" "}
-                  {state.interview.evaluation.questionStats.partially_correct ?? 0} partial,{" "}
-                  {state.interview.evaluation.questionStats.incorrect ?? 0} incorrect,{" "}
-                  {state.interview.evaluation.questionStats.could_not_answer ?? 0} unanswered of{" "}
-                  {state.interview.evaluation.questionStats.total ?? 0} questions)
-                </span>
-              ) : null}
-            </p>
-          ) : null}
-          {state.interview.evaluation.scores ? (
-            <p>
-              <strong>Ratings (0–100):</strong> communication {state.interview.evaluation.scores.communication ?? "—"},{" "}
-              technical depth {state.interview.evaluation.scores.technicalDepth ?? "—"},{" "}
-              problem solving {state.interview.evaluation.scores.problemSolving ?? "—"}
-            </p>
-          ) : null}
-          {state.interview.evaluation.recommendation ? (
-            <div style={styles.evalRecommendationRow}>
-              <span style={styles.evalRecommendationKey}>Recommendation</span>
-              <RecommendationPill value={state.interview.evaluation.recommendation} />
+          <div style={styles.resultGrid}>
+            <div style={styles.resultItem}>
+              <span style={styles.resultLabel}>Candidate link</span>
+              <div style={styles.copyRow}>
+                <input style={styles.readonlyInput} readOnly value={generated.candidateJoinUrl || ""} />
+                <button
+                  style={styles.btnSecondary}
+                  onClick={() => copyValue("link", generated.candidateJoinUrl)}
+                >
+                  {copied === "link" ? "Copied" : "Copy"}
+                </button>
+              </div>
             </div>
-          ) : null}
-          {Array.isArray(state.interview.evaluation.questions) && state.interview.evaluation.questions.length > 0 ? (
-            <div style={{ marginTop: 12 }}>
-              <h4 style={{ margin: "0 0 8px" }}>Questions &amp; answers</h4>
-              <table style={styles.qTable}>
-                <thead>
-                  <tr>
-                    <th style={styles.qTh}>#</th>
-                    <th style={styles.qTh}>Question</th>
-                    <th style={styles.qTh}>Answer</th>
-                    <th style={styles.qTh}>Verdict</th>
-                    <th style={styles.qTh}>Pts</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {state.interview.evaluation.questions.map((q, idx) => (
-                    <tr key={`${idx}-eval-q`}>
-                      <td style={styles.qTd}>{idx + 1}</td>
-                      <td style={styles.qTd}>{q.question || "—"}</td>
-                      <td style={styles.qTd}>{q.answer || "—"}</td>
-                      <td style={styles.qTd}>{evalVerdictLabel(q.verdict)}</td>
-                      <td style={styles.qTd}>
-                        {q.pointsEarned != null && q.pointsMax != null
-                          ? `${q.pointsEarned} / ${q.pointsMax}`
-                          : "—"}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+
+            <div style={styles.resultItem}>
+              <span style={styles.resultLabel}>Session ID</span>
+              <code style={styles.codeBlock}>{generated.sessionId || "-"}</code>
             </div>
-          ) : null}
+            <div style={styles.resultItem}>
+              <span style={styles.resultLabel}>Room</span>
+              <code style={styles.codeBlock}>{generated.roomName || "-"}</code>
+            </div>
+            <div style={styles.resultItem}>
+              <span style={styles.resultLabel}>Link expires</span>
+              <span>{generated.linkExpiresAt ? new Date(generated.linkExpiresAt).toLocaleString() : "-"}</span>
+            </div>
+          </div>
         </div>
       ) : null}
+    </div>
+  );
+}
 
-      <div style={{ marginTop: 32, paddingTop: 20, borderTop: "1px solid #e2e8f0" }}>
-        <PoweredByHirecorrecto />
+// ---------------------------------------------------------------------------
+// Sections (one component per concern → easier to tweak independently)
+// ---------------------------------------------------------------------------
+
+function MustAskTopicsSection({ rows, onChange, onAdd, onRemove }) {
+  return (
+    <div style={styles.card}>
+      <div style={styles.sectionHeader}>
+        <div>
+          <h2 style={styles.sectionTitle}>Must-ask topics</h2>
+          <p style={styles.sectionSubtext}>
+            Topics the AI must cover before wrap-up. Toggle <em>Ask now</em> to make a topic
+            high priority (covered early); leave it off for normal flow.
+          </p>
+        </div>
+        <button style={styles.btnSecondary} type="button" onClick={onAdd}>
+          + Add topic
+        </button>
+      </div>
+
+      <div style={styles.rowsList}>
+        {rows.map((row, index) => (
+          <div key={`topic-${index}`} style={styles.subRow}>
+            <input
+              style={{ ...styles.input, flex: 1, minWidth: 220 }}
+              placeholder="Topic (e.g. System design)"
+              value={row.topic}
+              onChange={(e) => onChange(index, { topic: e.target.value })}
+            />
+            <label style={styles.checkboxLabel}>
+              <input
+                type="checkbox"
+                checked={row.askNow}
+                onChange={(e) => onChange(index, { askNow: e.target.checked })}
+              />{" "}
+              Ask now (high priority)
+            </label>
+            <button
+              type="button"
+              style={styles.btnDanger}
+              onClick={() => onRemove(index)}
+              aria-label="Remove topic"
+            >
+              Remove
+            </button>
+          </div>
+        ))}
       </div>
     </div>
   );
 }
 
-function evalVerdictLabel(v) {
-  const m = {
-    correct: "Correct",
-    partially_correct: "Partially correct",
-    incorrect: "Incorrect",
-    could_not_answer: "Could not answer",
-  };
-  return m[v] || v || "—";
+function SkillPlanSection({ rows, onChange, onAdd, onRemove }) {
+  return (
+    <div style={styles.card}>
+      <div style={styles.sectionHeader}>
+        <div>
+          <h2 style={styles.sectionTitle}>Skill plan</h2>
+          <p style={styles.sectionSubtext}>
+            For each skill, set topics, weightage, difficulty (easy / medium / hard) and optional
+            per-skill instructions for the AI (e.g. depth, focus areas, style).
+          </p>
+        </div>
+        <button style={styles.btnSecondary} type="button" onClick={onAdd}>
+          + Add skill
+        </button>
+      </div>
+
+      <div style={styles.rowsList}>
+        {rows.map((row, index) => (
+          <div key={`skill-${index}`} style={styles.subCard}>
+            <div style={styles.skillRowGrid}>
+              <input
+                style={styles.input}
+                placeholder="Skill (e.g. JavaScript)"
+                value={row.skill}
+                onChange={(e) => onChange(index, { skill: e.target.value })}
+              />
+              <input
+                style={styles.input}
+                placeholder="Topics: closures, async, event loop"
+                value={row.topics}
+                onChange={(e) => onChange(index, { topics: e.target.value })}
+              />
+              <input
+                style={styles.input}
+                type="number"
+                min={0}
+                max={100}
+                placeholder="Weightage %"
+                value={row.weightage}
+                onChange={(e) => onChange(index, { weightage: e.target.value })}
+              />
+              <select
+                style={styles.input}
+                value={row.difficulty}
+                onChange={(e) => onChange(index, { difficulty: e.target.value })}
+              >
+                {DIFFICULTY_OPTIONS.map((value) => (
+                  <option key={value || "none"} value={value}>
+                    {value ? `Difficulty: ${DIFFICULTY_LABELS[value]}` : "Difficulty: —"}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <textarea
+              style={styles.textarea}
+              rows={2}
+              placeholder='Skill-specific instructions, e.g. "Ask beginner-level questions focusing on conceptual fundamentals and high-impact practical implementations."'
+              value={row.instructions}
+              onChange={(e) => onChange(index, { instructions: e.target.value })}
+            />
+            <div style={styles.subRowActions}>
+              <button
+                type="button"
+                style={styles.btnDanger}
+                onClick={() => onRemove(index)}
+                aria-label="Remove skill"
+              >
+                Remove skill
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
-function InterviewRoomBridge({
-  session,
-  phase,
-  onAgentPresence,
-  onAgentState,
-  onPhase,
-  onInterviewStarted,
-  onTranscript,
-}) {
-  const room = useRoomContext();
+function QuestionGroupsSection({ rows, onChange, onAdd, onRemove }) {
+  return (
+    <div style={styles.card}>
+      <div style={styles.sectionHeader}>
+        <div>
+          <h2 style={styles.sectionTitle}>Prepared questions per skill</h2>
+          <p style={styles.sectionSubtext}>
+            Group the questions by skill. Use the per-group toggles to control whether the AI may
+            probe with follow-ups, and whether it may add extra questions on the same skill after
+            finishing the prepared list.
+          </p>
+        </div>
+        <button style={styles.btnSecondary} type="button" onClick={onAdd}>
+          + Add skill questions
+        </button>
+      </div>
 
-  useEffect(() => {
-    if (!room) return undefined;
-    const onParticipantConnected = (participant) => {
-      if (participant.identity !== session.participantIdentity) {
-        onAgentPresence(true, participant.identity);
-        onAgentState(deriveAgentState(participant.attributes?.["lk.agent.state"], true));
-        onPhase("interview_active");
-        onInterviewStarted();
-      }
-    };
-    const onParticipantAttributesChanged = (changedAttributes, participant) => {
-      if (!participant || participant.identity === session.participantIdentity) return;
-      if (!Object.prototype.hasOwnProperty.call(changedAttributes, "lk.agent.state")) return;
-      onAgentState(deriveAgentState(changedAttributes["lk.agent.state"], true));
-    };
-    const onParticipantDisconnected = (participant) => {
-      if (participant.identity === session.participantIdentity) return;
-      onAgentPresence(false, "");
-      onAgentState({ stateValue: "disconnected", canListen: false, isFinished: true });
-      if (phase !== "completed") onPhase("ending");
-    };
-    const onDataReceived = (payload, participant) => {
-      const msg = safeJson(new TextDecoder().decode(payload));
-      if (!msg || msg.type !== "transcript") return;
-      onTranscript({
-        role: msg.role || (participant?.identity || "agent"),
-        text: msg.text || "",
-        createdAt: new Date().toISOString(),
-      });
-    };
-
-    room.on(RoomEvent.ParticipantConnected, onParticipantConnected);
-    room.on(RoomEvent.ParticipantAttributesChanged, onParticipantAttributesChanged);
-    room.on(RoomEvent.ParticipantDisconnected, onParticipantDisconnected);
-    room.on(RoomEvent.DataReceived, onDataReceived);
-
-    return () => {
-      room.off(RoomEvent.ParticipantConnected, onParticipantConnected);
-      room.off(RoomEvent.ParticipantAttributesChanged, onParticipantAttributesChanged);
-      room.off(RoomEvent.ParticipantDisconnected, onParticipantDisconnected);
-      room.off(RoomEvent.DataReceived, onDataReceived);
-    };
-  }, [room, session.participantIdentity, phase, onAgentPresence, onAgentState, onPhase, onInterviewStarted, onTranscript]);
-
-  return null;
+      <div style={styles.rowsList}>
+        {rows.map((row, index) => (
+          <div key={`qgroup-${index}`} style={styles.subCard}>
+            <input
+              style={{ ...styles.input, marginBottom: 8 }}
+              placeholder="Skill (e.g. JavaScript)"
+              value={row.skill}
+              onChange={(e) => onChange(index, { skill: e.target.value })}
+            />
+            <textarea
+              style={styles.textarea}
+              rows={4}
+              placeholder={
+                "One question per line:\nWhat is the JavaScript event loop?\nDescribe a closure with a real example."
+              }
+              value={row.questionsText}
+              onChange={(e) => onChange(index, { questionsText: e.target.value })}
+            />
+            <div style={styles.optionsRow}>
+              <label style={styles.checkboxLabel}>
+                <input
+                  type="checkbox"
+                  checked={row.askFollowUps}
+                  onChange={(e) => onChange(index, { askFollowUps: e.target.checked })}
+                />{" "}
+                AI may ask follow-up questions
+              </label>
+              <label style={styles.checkboxLabel}>
+                <input
+                  type="checkbox"
+                  checked={row.allowAdditional}
+                  onChange={(e) => onChange(index, { allowAdditional: e.target.checked })}
+                />{" "}
+                Allow extra questions after the list
+              </label>
+            </div>
+            <div style={styles.subRowActions}>
+              <button
+                type="button"
+                style={styles.btnDanger}
+                onClick={() => onRemove(index)}
+                aria-label="Remove skill questions"
+              >
+                Remove
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
+
+// ---------------------------------------------------------------------------
+// Styles
+// ---------------------------------------------------------------------------
 
 const styles = {
+  pageIntro: {
+    color: "#64748b",
+    marginBottom: "1.2rem",
+    maxWidth: 760,
+    lineHeight: 1.5,
+  },
   card: {
     background: "#fff",
     border: "1px solid #e2e8f0",
-    borderRadius: 10,
-    padding: 16,
+    borderRadius: 14,
+    padding: 18,
+    marginBottom: 16,
+    boxShadow: "0 1px 2px rgba(15, 23, 42, 0.04)",
+  },
+  resultCard: {
+    background: "#f8fafc",
+    border: "1px solid #dbeafe",
+    borderRadius: 14,
+    padding: 18,
     marginBottom: 16,
   },
-  statusCard: {
+  sectionHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 12,
+    alignItems: "flex-start",
+    marginBottom: 14,
+    flexWrap: "wrap",
+  },
+  sectionTitle: {
+    margin: 0,
+    fontSize: "1rem",
+    color: "#0f172a",
+  },
+  sectionSubtext: {
+    margin: "4px 0 0",
+    color: "#64748b",
+    fontSize: "0.9rem",
+    maxWidth: 720,
+    lineHeight: 1.45,
+  },
+  badge: {
+    border: "1px solid #cbd5e1",
+    color: "#475569",
     background: "#f8fafc",
-    border: "1px solid #e2e8f0",
-    borderRadius: 10,
-    padding: 16,
-    marginBottom: 16,
+    borderRadius: 999,
+    padding: "0.25rem 0.65rem",
+    fontSize: "0.78rem",
+    fontWeight: 700,
+    whiteSpace: "nowrap",
+  },
+  successBadge: {
+    border: "1px solid #bbf7d0",
+    color: "#166534",
+    background: "#f0fdf4",
+    borderRadius: 999,
+    padding: "0.25rem 0.65rem",
+    fontSize: "0.78rem",
+    fontWeight: 700,
+    whiteSpace: "nowrap",
   },
   grid: {
     display: "grid",
@@ -640,68 +770,125 @@ const styles = {
     borderRadius: 8,
     padding: "0.55rem 0.7rem",
     fontSize: "0.92rem",
+    background: "#fff",
+  },
+  readonlyInput: {
+    flex: 1,
+    minWidth: 0,
+    border: "1px solid #cbd5e1",
+    borderRadius: 8,
+    padding: "0.55rem 0.7rem",
+    fontSize: "0.9rem",
+    background: "#fff",
+  },
+  optionsRow: {
+    display: "flex",
+    gap: 16,
+    flexWrap: "wrap",
+    marginTop: 12,
+  },
+  checkboxLabel: {
+    color: "#334155",
+    fontSize: "0.9rem",
   },
   row: {
     display: "flex",
     gap: 8,
     flexWrap: "wrap",
-    marginTop: 12,
+    marginTop: 14,
+    marginBottom: 16,
   },
   btnPrimary: {
     border: "none",
     background: "#0f172a",
     color: "#fff",
     borderRadius: 8,
-    padding: "0.55rem 0.85rem",
+    padding: "0.6rem 0.9rem",
     cursor: "pointer",
+    fontWeight: 700,
   },
   btnSecondary: {
     border: "1px solid #cbd5e1",
     background: "#fff",
     color: "#0f172a",
     borderRadius: 8,
-    padding: "0.55rem 0.85rem",
+    padding: "0.45rem 0.75rem",
     cursor: "pointer",
+    fontSize: "0.88rem",
   },
-  transcript: {
+  btnDanger: {
+    border: "1px solid #fecaca",
+    background: "#fff",
+    color: "#b91c1c",
+    borderRadius: 8,
+    padding: "0.4rem 0.7rem",
+    cursor: "pointer",
+    fontSize: "0.85rem",
+  },
+  errorBox: {
+    marginTop: 12,
+    color: "#991b1b",
+    background: "#fef2f2",
+    border: "1px solid #fecaca",
+    borderRadius: 8,
+    padding: "0.65rem 0.8rem",
+  },
+  resultGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))",
+    gap: 12,
+  },
+  resultItem: {
     display: "flex",
     flexDirection: "column",
+    gap: 6,
+    minWidth: 0,
+  },
+  resultLabel: {
+    color: "#64748b",
+    fontSize: "0.78rem",
+    fontWeight: 700,
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+  },
+  copyRow: {
+    display: "flex",
     gap: 8,
-    maxHeight: 260,
-    overflowY: "auto",
-    borderTop: "1px solid #e2e8f0",
-    marginTop: 8,
-    paddingTop: 8,
+    minWidth: 0,
   },
-  transcriptLine: {
-    fontSize: "0.92rem",
-    lineHeight: 1.4,
+  codeBlock: {
+    border: "1px solid #e2e8f0",
+    borderRadius: 8,
+    padding: "0.55rem 0.7rem",
+    background: "#fff",
+    overflowWrap: "anywhere",
   },
-  lkRoom: {
-    background: "#0b1220",
-    borderRadius: 12,
-    overflow: "hidden",
-    marginBottom: 16,
-    minHeight: 520,
+  rowsList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
   },
-  qTable: { width: "100%", borderCollapse: "collapse", fontSize: "0.88rem", marginTop: 8 },
-  qTh: { textAlign: "left", padding: "0.5rem", borderBottom: "1px solid #e2e8f0", fontWeight: 600 },
-  qTd: { padding: "0.5rem", borderBottom: "1px solid #f1f5f9", verticalAlign: "top" },
-  evalRecommendationRow: {
+  subRow: {
     display: "flex",
     alignItems: "center",
     gap: 10,
     flexWrap: "wrap",
-    marginTop: 12,
-    paddingTop: 12,
-    borderTop: "1px solid #e2e8f0",
   },
-  evalRecommendationKey: {
-    fontSize: "0.72rem",
-    fontWeight: 700,
-    color: "#64748b",
-    textTransform: "uppercase",
-    letterSpacing: "0.06em",
+  subRowActions: {
+    display: "flex",
+    justifyContent: "flex-end",
+    marginTop: 8,
+  },
+  subCard: {
+    border: "1px solid #e2e8f0",
+    borderRadius: 10,
+    padding: 12,
+    background: "#fafbfd",
+  },
+  skillRowGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+    gap: 10,
+    marginBottom: 8,
   },
 };
-

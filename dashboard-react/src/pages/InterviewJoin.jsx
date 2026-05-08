@@ -30,6 +30,10 @@ import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
 import AIVoiceBoatIndicator from "../components/AIVoiceBoatIndicator";
 
 const SESSION_POLL_INTERVAL_MS = 60000;
+const PROCTOR_INTERVAL_MS = 30_000;
+const PROCTOR_JPEG_WIDTH = 640;
+const PROCTOR_JPEG_QUALITY = 0.7;
+const PROCTOR_UPLOAD_TIMEOUT_MS = 10_000;
 
 function useJoinToken() {
   return useMemo(() => {
@@ -288,6 +292,7 @@ export default function InterviewJoin() {
                 <div style={styles.stageStretch}>
                   <InterviewTwoUpStage
                     candidateIdentity={resolved.participantIdentity}
+                    sessionId={resolved.sessionId}
                     onLeave={handleLeaveInterview}
                     leaving={leaving}
                   />
@@ -374,8 +379,9 @@ function InterviewJoinToolbar({ participantName, onLeave, leaving }) {
   );
 }
 
-function InterviewTwoUpStage({ candidateIdentity, onLeave, leaving }) {
+function InterviewTwoUpStage({ candidateIdentity, sessionId, onLeave, leaving }) {
   const room = useRoomContext();
+  const connectionState = useConnectionState();
   const [busy, setBusy] = useState("");
   const cameraRefs = useTracks([{ source: Track.Source.Camera, withPlaceholder: true }], {
     onlySubscribed: false,
@@ -481,6 +487,191 @@ function InterviewTwoUpStage({ candidateIdentity, onLeave, leaving }) {
           {leaving ? "Leaving…" : "Leave"}
         </button>
       </div>
+      <ProctorFrameCapture
+        room={room}
+        sessionId={sessionId}
+        candidateIdentity={candidateIdentity}
+        connectionState={connectionState}
+      />
+    </div>
+  );
+}
+
+function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionState }) {
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const inflightRef = useRef(false);
+  const abortRef = useRef(null);
+  const [active, setActive] = useState(false);
+
+  useEffect(() => {
+    if (!room || !sessionId || !candidateIdentity) {
+      setActive(false);
+      return undefined;
+    }
+    if (connectionState !== ConnectionState.Connected) {
+      setActive(false);
+      return undefined;
+    }
+
+    const localParticipant = room.localParticipant;
+    if (!localParticipant) {
+      setActive(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+
+    const findCameraTrack = () => {
+      try {
+        const pub = localParticipant.getTrackPublication?.(Track.Source.Camera);
+        const t = pub?.track || pub?.videoTrack;
+        const mst = t?.mediaStreamTrack;
+        if (mst && mst.readyState === "live" && !pub?.isMuted) return mst;
+      } catch {
+        /* ignore */
+      }
+      return null;
+    };
+
+    const attachStream = async (mst) => {
+      const videoEl = videoRef.current;
+      if (!videoEl) return false;
+      try {
+        const stream = new MediaStream([mst]);
+        videoEl.srcObject = stream;
+        videoEl.muted = true;
+        videoEl.playsInline = true;
+        await videoEl.play().catch(() => {});
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const detachStream = () => {
+      const videoEl = videoRef.current;
+      if (videoEl) videoEl.srcObject = null;
+    };
+
+    const refresh = async () => {
+      if (cancelled) return;
+      const mst = findCameraTrack();
+      if (!mst) {
+        detachStream();
+        setActive(false);
+        return;
+      }
+      const ok = await attachStream(mst);
+      if (!cancelled) setActive(Boolean(ok));
+    };
+
+    refresh();
+    const trackChange = () => refresh();
+    localParticipant.on?.("trackPublished", trackChange);
+    localParticipant.on?.("trackUnpublished", trackChange);
+    localParticipant.on?.("trackMuted", trackChange);
+    localParticipant.on?.("trackUnmuted", trackChange);
+
+    return () => {
+      cancelled = true;
+      localParticipant.off?.("trackPublished", trackChange);
+      localParticipant.off?.("trackUnpublished", trackChange);
+      localParticipant.off?.("trackMuted", trackChange);
+      localParticipant.off?.("trackUnmuted", trackChange);
+      detachStream();
+      setActive(false);
+    };
+  }, [room, sessionId, candidateIdentity, connectionState]);
+
+  useEffect(() => {
+    if (!active || !sessionId) return undefined;
+
+    const captureOnce = async () => {
+      if (inflightRef.current) return;
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      const videoEl = videoRef.current;
+      const canvasEl = canvasRef.current;
+      if (!videoEl || !canvasEl) return;
+      const vw = videoEl.videoWidth;
+      const vh = videoEl.videoHeight;
+      if (!vw || !vh) return;
+
+      const targetW = Math.min(PROCTOR_JPEG_WIDTH, vw);
+      const targetH = Math.round((vh / vw) * targetW);
+      canvasEl.width = targetW;
+      canvasEl.height = targetH;
+      const ctx = canvasEl.getContext("2d");
+      if (!ctx) return;
+      try {
+        ctx.drawImage(videoEl, 0, 0, targetW, targetH);
+      } catch {
+        return;
+      }
+
+      const blob = await new Promise((resolve) => {
+        canvasEl.toBlob((b) => resolve(b), "image/jpeg", PROCTOR_JPEG_QUALITY);
+      });
+      if (!blob) return;
+
+      const local = room?.localParticipant;
+      const meta = {
+        capturedAt: new Date().toISOString(),
+        cameraEnabled: Boolean(local?.isCameraEnabled),
+        micEnabled: Boolean(local?.isMicrophoneEnabled),
+        screenShareEnabled: Boolean(local?.isScreenShareEnabled),
+        connectionState,
+        documentVisibility: typeof document !== "undefined" ? document.visibilityState : null,
+        windowFocused: typeof document !== "undefined" ? document.hasFocus?.() ?? null : null,
+        width: targetW,
+        height: targetH,
+        userAgent: typeof navigator !== "undefined" ? navigator.userAgent : null,
+      };
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+      const timeout = setTimeout(() => controller.abort(), PROCTOR_UPLOAD_TIMEOUT_MS);
+      inflightRef.current = true;
+      try {
+        await api.uploadInterviewProctorFrame(sessionId, blob, meta, { signal: controller.signal });
+      } catch {
+        /* best effort - skip this tick */
+      } finally {
+        clearTimeout(timeout);
+        inflightRef.current = false;
+        if (abortRef.current === controller) abortRef.current = null;
+      }
+    };
+
+    const initialDelay = Math.floor(Math.random() * PROCTOR_INTERVAL_MS);
+    const startTimer = setTimeout(() => {
+      captureOnce();
+    }, initialDelay);
+    const interval = setInterval(captureOnce, PROCTOR_INTERVAL_MS);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") captureOnce();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+
+    return () => {
+      clearTimeout(startTimer);
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisible);
+      if (abortRef.current) {
+        try {
+          abortRef.current.abort();
+        } catch {
+          /* ignore */
+        }
+        abortRef.current = null;
+      }
+    };
+  }, [active, sessionId, room, connectionState]);
+
+  return (
+    <div aria-hidden style={styles.proctorHidden}>
+      <video ref={videoRef} muted playsInline />
+      <canvas ref={canvasRef} />
     </div>
   );
 }
@@ -977,5 +1168,15 @@ const styles = {
     borderRadius: 12,
     background: "rgba(15,23,42,0.75)",
     border: "1px solid rgba(148,163,184,0.15)",
+  },
+  proctorHidden: {
+    position: "absolute",
+    width: 1,
+    height: 1,
+    opacity: 0,
+    overflow: "hidden",
+    pointerEvents: "none",
+    left: -10000,
+    top: -10000,
   },
 };

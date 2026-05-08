@@ -1,13 +1,9 @@
 import { Link, useLocation } from "react-router-dom";
-import { Phone, Users, PhoneCall, FileSpreadsheet, Play, Video, ClipboardList } from "lucide-react";
+import { Video, ClipboardList } from "lucide-react";
 import PoweredByHirecorrecto from "./PoweredByHirecorrecto";
 
 const nav = [
-  { path: "/clients", label: "Clients", icon: Users },
-  { path: "/calls", label: "Calls", icon: PhoneCall },
-  { path: "/campaigns", label: "Campaigns", icon: FileSpreadsheet },
   { path: "/interviews", label: "Interviews", icon: ClipboardList },
-  { path: "/playground", label: "Playground", icon: Play },
   { path: "/interview-candidate", label: "Interview Candidate", icon: Video },
 ];
 
@@ -18,8 +14,8 @@ export default function Layout({ children }) {
     <div style={styles.container}>
       <aside style={styles.sidebar}>
         <div style={styles.logo}>
-          <Phone size={24} />
-          <span>AI Calling</span>
+          <Video size={24} />
+          <span>AI Interviews</span>
         </div>
         <nav style={styles.nav}>
           {nav.map(({ path, label, icon: Icon }) => (

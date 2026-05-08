@@ -1,4 +1,10 @@
-"""Post-interview structured evaluation: Q&A verdicts, dimension scores, deterministic overall %."""
+"""Post-interview structured evaluation.
+
+Produces Q&A verdicts, dimension scores, deterministic overall %, and a
+shortlist/hold/reject recommendation. The LLM is prompted to return strict
+JSON which is then validated and clamped before the deterministic scoring
+pass runs.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,10 @@ import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Verdict scoring
+# ---------------------------------------------------------------------------
 
 VERDICT_MULTIPLIER: dict[str, float] = {
     "correct": 1.0,
@@ -33,8 +43,13 @@ VERDICT_ALIASES: dict[str, str] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Pure helpers
+# ---------------------------------------------------------------------------
+
+
 def format_transcript_chronological(transcript_lines: list[dict]) -> str:
-    """Build readable transcript: final user lines + all assistant lines, in order."""
+    """Render readable transcript: final user lines + all assistant lines, in order."""
     lines_out: list[str] = []
     for line in transcript_lines:
         role = line.get("role") or ""
@@ -70,6 +85,7 @@ def clamp_words(text: str, max_words: int = 60) -> str:
 
 
 def score_questions(questions: list[dict]) -> tuple[list[dict], float, dict[str, int]]:
+    """Run the deterministic scoring pass over LLM-provided Q&A entries."""
     n = len(questions)
     stats = {"total": n, "correct": 0, "partially_correct": 0, "incorrect": 0, "could_not_answer": 0}
     if n == 0:
@@ -100,6 +116,11 @@ def recommendation_from_overall(overall: float) -> str:
     if overall >= 50:
         return "hold"
     return "reject"
+
+
+# ---------------------------------------------------------------------------
+# LLM JSON callers (one per provider family)
+# ---------------------------------------------------------------------------
 
 
 def _parse_json_object(raw: str) -> dict[str, Any]:
@@ -158,53 +179,56 @@ async def _gemini_json_eval(*, api_key: str, model: str, system: str, user: str)
     return _parse_json_object(text)
 
 
-async def generate_structured_evaluation(
-    *,
-    transcript_lines: list[dict],
-    meta: dict,
-    provider_cfg: dict,
-) -> dict[str, Any]:
-    """
-    Returns evaluation dict for MongoDB: summary, questions, overallPercent, questionStats, scores, recommendation.
-    """
-    transcript_text = format_transcript_chronological(transcript_lines)
+# ---------------------------------------------------------------------------
+# Prompt assembly + entrypoint
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = (
+    "You evaluate interview transcripts. Reply with ONLY valid JSON matching this shape:\n"
+    "{\n"
+    '  "executiveSummary": string,\n'
+    '  "questions": [\n'
+    "    {\n"
+    '      "question": string,\n'
+    '      "answer": string,\n'
+    '      "verdict": "correct" | "partially_correct" | "incorrect" | "could_not_answer"\n'
+    "    }\n"
+    "  ],\n"
+    '  "dimensionScores": {\n'
+    '    "communication": number,\n'
+    '    "technicalDepth": number,\n'
+    '    "problemSolving": number\n'
+    "  }\n"
+    "}\n"
+    "Rules:\n"
+    "- executiveSummary: 50–60 words max. Qualitative narrative only. "
+    "Do NOT include counts of messages, responses, or words.\n"
+    "- questions: ONLY substantive interview questions (exclude greetings, small talk, and pure introduction). "
+    "Chronological order. Pair each question with the candidate answer that directly responds.\n"
+    "- verdict: correct = answer is satisfactory and largely accurate; partially_correct = some gaps; "
+    "incorrect = materially wrong; could_not_answer = no real answer, refusal, or off-topic non-answer.\n"
+    "- dimensionScores: integers 0–100, independent of each other. "
+    "communication = fluency, grammar, clarity; technicalDepth = technical accuracy vs role; "
+    "problemSolving = practical / real-work problem handling.\n"
+)
+
+_FALLBACK_RESULT: dict[str, Any] = {
+    "executiveSummary": "Evaluation could not be generated automatically. See transcript for details.",
+    "questions": [],
+    "dimensionScores": {"communication": 0, "technicalDepth": 0, "problemSolving": 0},
+}
+
+
+def _build_user_prompt(meta: dict, transcript_text: str) -> str:
     jd = meta.get("jd") or {}
     interview_meta = meta.get("interviewMeta") or {}
+    cand = meta.get("candidateProfile") or {}
+
     title = interview_meta.get("title") or "Interview"
     must_ask = interview_meta.get("mustAskTopics") or []
     planned_questions = interview_meta.get("questions") or []
-    cand = meta.get("candidateProfile") or {}
     cand_skills = ", ".join(str(s) for s in (cand.get("skills") or [])) if cand.get("skills") else ""
     cand_exp = cand.get("yearsExperience")
-
-    system = (
-        "You evaluate interview transcripts. Reply with ONLY valid JSON matching this shape:\n"
-        "{\n"
-        '  "executiveSummary": string,\n'
-        '  "questions": [\n'
-        "    {\n"
-        '      "question": string,\n'
-        '      "answer": string,\n'
-        '      "verdict": "correct" | "partially_correct" | "incorrect" | "could_not_answer"\n'
-        "    }\n"
-        "  ],\n"
-        '  "dimensionScores": {\n'
-        '    "communication": number,\n'
-        '    "technicalDepth": number,\n'
-        '    "problemSolving": number\n'
-        "  }\n"
-        "}\n"
-        "Rules:\n"
-        "- executiveSummary: 50–60 words max. Qualitative narrative only. "
-        "Do NOT include counts of messages, responses, or words.\n"
-        "- questions: ONLY substantive interview questions (exclude greetings, small talk, and pure introduction). "
-        "Chronological order. Pair each question with the candidate answer that directly responds.\n"
-        "- verdict: correct = answer is satisfactory and largely accurate; partially_correct = some gaps; "
-        "incorrect = materially wrong; could_not_answer = no real answer, refusal, or off-topic non-answer.\n"
-        "- dimensionScores: integers 0–100, independent of each other. "
-        "communication = fluency, grammar, clarity; technicalDepth = technical accuracy vs role; "
-        "problemSolving = practical / real-work problem handling.\n"
-    )
 
     jd_hint = (jd.get("title") or "") + (
         f" | {(jd.get('text') or jd.get('summary') or '')[:1200]}"
@@ -218,7 +242,7 @@ async def generate_structured_evaluation(
         f"skills={cand_skills or 'N/A'}"
     )
 
-    user = (
+    return (
         f"Interview title: {title}\n"
         f"Role / JD: {jd_hint or 'N/A'}\n"
         f"Must-ask topics: {', '.join(must_ask) if must_ask else 'N/A'}\n"
@@ -227,60 +251,77 @@ async def generate_structured_evaluation(
         f"Transcript:\n{transcript_text}\n"
     )
 
+
+async def _call_eval_llm(provider: str, api_key: str, model: str, user: str) -> dict[str, Any]:
+    if provider == "gemini":
+        if not api_key:
+            raise ValueError("Missing Gemini API key")
+        return await _gemini_json_eval(api_key=api_key, model=model, system=_SYSTEM_PROMPT, user=user)
+    if provider == "openai":
+        if not api_key:
+            raise ValueError("Missing OpenAI API key")
+        return await _openai_json_eval(
+            api_key=api_key, model=model, base_url=None, system=_SYSTEM_PROMPT, user=user
+        )
+    if provider == "deepseek":
+        if not api_key:
+            raise ValueError("Missing DeepSeek API key")
+        return await _openai_json_eval(
+            api_key=api_key,
+            model=model,
+            base_url="https://api.deepseek.com/v1",
+            system=_SYSTEM_PROMPT,
+            user=user,
+        )
+    if provider in ("grok", "xai"):
+        if not api_key:
+            raise ValueError("Missing xAI API key")
+        return await _openai_json_eval(
+            api_key=api_key,
+            model=model,
+            base_url="https://api.x.ai/v1",
+            system=_SYSTEM_PROMPT,
+            user=user,
+        )
+    raise ValueError(f"Evaluation not implemented for LLM provider: {provider}")
+
+
+def _clip_dim(v: Any) -> int:
+    try:
+        return max(0, min(100, int(round(float(v)))))
+    except (TypeError, ValueError):
+        return 0
+
+
+async def generate_structured_evaluation(
+    *,
+    transcript_lines: list[dict],
+    meta: dict,
+    provider_cfg: dict,
+) -> dict[str, Any]:
+    """Generate the final evaluation document persisted into MongoDB.
+
+    Shape: ``{summary, questions, overallPercent, questionStats, scores, recommendation}``.
+    """
+    transcript_text = format_transcript_chronological(transcript_lines)
+    user = _build_user_prompt(meta, transcript_text)
+
     llm = provider_cfg.get("llm") or {}
     provider = (llm.get("provider") or "openai").lower()
     api_key = (llm.get("api_key") or "").strip()
     model = llm.get("model") or "gpt-4o-mini"
 
-    parsed: dict[str, Any] = {}
     try:
-        if provider == "gemini":
-            if not api_key:
-                raise ValueError("Missing Gemini API key")
-            parsed = await _gemini_json_eval(api_key=api_key, model=model, system=system, user=user)
-        elif provider in ("openai",):
-            if not api_key:
-                raise ValueError("Missing OpenAI API key")
-            parsed = await _openai_json_eval(api_key=api_key, model=model, base_url=None, system=system, user=user)
-        elif provider == "deepseek":
-            if not api_key:
-                raise ValueError("Missing DeepSeek API key")
-            parsed = await _openai_json_eval(
-                api_key=api_key,
-                model=model,
-                base_url="https://api.deepseek.com/v1",
-                system=system,
-                user=user,
-            )
-        elif provider in ("grok", "xai"):
-            if not api_key:
-                raise ValueError("Missing xAI API key")
-            parsed = await _openai_json_eval(
-                api_key=api_key,
-                model=model,
-                base_url="https://api.x.ai/v1",
-                system=system,
-                user=user,
-            )
-        else:
-            raise ValueError(f"Evaluation not implemented for LLM provider: {provider}")
+        parsed = await _call_eval_llm(provider, api_key, model, user)
     except Exception as e:
         logger.exception("Structured evaluation LLM failed: %s", e)
-        parsed = {
-            "executiveSummary": "Evaluation could not be generated automatically. See transcript for details.",
-            "questions": [],
-            "dimensionScores": {"communication": 0, "technicalDepth": 0, "problemSolving": 0},
-        }
+        parsed = _FALLBACK_RESULT.copy()
 
-    summary = clamp_words(str(parsed.get("executiveSummary") or "").strip() or "No summary available.", 60)
+    summary = clamp_words(
+        str(parsed.get("executiveSummary") or "").strip() or "No summary available.", 60
+    )
     raw_questions = parsed.get("questions") if isinstance(parsed.get("questions"), list) else []
     dim = parsed.get("dimensionScores") if isinstance(parsed.get("dimensionScores"), dict) else {}
-
-    def _clip_dim(v: Any) -> int:
-        try:
-            return max(0, min(100, int(round(float(v)))))
-        except (TypeError, ValueError):
-            return 0
 
     scores = {
         "communication": _clip_dim(dim.get("communication")),
@@ -288,7 +329,9 @@ async def generate_structured_evaluation(
         "problemSolving": _clip_dim(dim.get("problemSolving")),
     }
 
-    enriched_q, overall_pct, stats = score_questions([dict(x) for x in raw_questions if isinstance(x, dict)])
+    enriched_q, overall_pct, stats = score_questions(
+        [dict(x) for x in raw_questions if isinstance(x, dict)]
+    )
     rec = recommendation_from_overall(overall_pct)
 
     return {
@@ -299,3 +342,15 @@ async def generate_structured_evaluation(
         "scores": scores,
         "recommendation": rec,
     }
+
+
+__all__ = [
+    "VERDICT_MULTIPLIER",
+    "VERDICT_ALIASES",
+    "format_transcript_chronological",
+    "normalize_verdict",
+    "clamp_words",
+    "score_questions",
+    "recommendation_from_overall",
+    "generate_structured_evaluation",
+]

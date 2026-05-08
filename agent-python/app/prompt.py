@@ -1,0 +1,507 @@
+"""System-prompt builder for the AI interviewer.
+
+Design goal: keep the system prompt **focused** for the LLM. Only the
+universally-applicable behaviour rules live in
+:data:`INTERVIEW_AGENT_DEFAULT_INSTRUCTIONS`. Section-specific policies
+(must-ask topics, skill plan, difficulty, prepared questions) are only
+appended to the prompt **when the corresponding data is present in the
+dispatch metadata**.
+
+Section ordering inside :func:`build_prompt`:
+
+1. Always-on default instructions
+2. Optional employer-supplied extra instructions
+3. Interview header: title / language policy / duration
+4. Candidate facts
+5. JD / role context
+6. (Optional) Must-ask topics — policy + data
+7. (Optional) Skill plan — weightage policy [+ difficulty policy] + data
+8. (Optional) Prepared questions per skill — policy + data
+
+If a section's payload is empty we skip *both* its policy and its data so
+the LLM never reads rules about something it does not have.
+"""
+
+from __future__ import annotations
+
+from .skills import normalize_skill_specs
+
+# ---------------------------------------------------------------------------
+# Always-on instructions (no section-specific rules here)
+# ---------------------------------------------------------------------------
+
+INTERVIEW_AGENT_DEFAULT_INSTRUCTIONS = """
+You are a professional AI interviewer conducting a structured live interview.
+
+Core behavior (always follow):
+- Keep tone professional, fair, and encouraging.
+- Ask one clear question at a time; listen to the full answer before the next question.
+- Use brief follow-ups to clarify, probe depth, or when the answer is incomplete (only when allowed for that skill).
+- If the candidate asks for clarification, restate the same question in simpler words.
+- Keep your spoken lines concise for real-time voice.
+- Behave like a real human interviewer: adaptive, attentive, and conversational without being verbose.
+- Close politely when the session ends, the candidate leaves, or time is nearly over.
+
+Opening protocol:
+- First turn: short greeting + a single readiness check (e.g. "Are you ready to begin?").
+- Only after the candidate confirms (yes / ready), start the interview questions. If they aren't ready, acknowledge briefly and give them time.
+
+Time and conclusion policy:
+- You MUST conclude within the provided interview duration.
+- Keep a small final wrap-up window for: final candidate comments/questions + polite closing.
+- If the candidate is consistently non-responsive, off-topic, or repeatedly gives incorrect/very weak answers, conclude early in a professional way.
+- If performance is weak for 2-3 answers in one skill, shift to another skill/topic instead of over-focusing on one weak area.
+- If multiple skills are also weak, finish early with a polite close: ask if the candidate has questions, respond briefly, then end.
+
+Language: conduct the interview primarily in the Primary language. If the candidate switches language, respond within Supported languages when reasonable.
+""".strip()
+
+
+# ---------------------------------------------------------------------------
+# Section-specific policies (appended only when data exists)
+# ---------------------------------------------------------------------------
+
+MUST_ASK_TOPICS_POLICY = """
+Must-ask topics policy:
+- Topics flagged "ask now" are high priority — cover them early in the interview, before low-priority skills run too long.
+- Topics flagged "normal flow" should be covered naturally whenever they fit the conversation.
+- Either way, all must-ask topics MUST be touched before wrap-up.
+""".strip()
+
+SKILLS_WEIGHTAGE_POLICY = """
+Skills/topic/weightage/difficulty policy:
+- Skill weightage is treated as percentage of interview focus/time (total ≈ 100%).
+- Allocate questioning time proportionally to weightage.
+- Cover each skill's topics whenever possible (not only at start or end).
+- If the difficulty level is set, follow the difficulty policy.
+""".strip()
+
+# Years-of-experience → default difficulty mapping. Used both as a fallback for
+# skills without an explicit difficulty AND as the line we inject into the
+# Difficulty policy block so the LLM understands *why* the default was picked.
+#
+#   < 2 years   → easy
+#   2 - 5 years → medium
+#   > 5 years   → hard
+EXPERIENCE_DIFFICULTY_MAPPING_TEXT = (
+    "<2 yrs → easy, 2-5 yrs → medium, >5 yrs → hard"
+)
+
+
+def default_difficulty_for_experience(years_experience) -> str | None:
+    """Map candidate years of experience to a default difficulty.
+
+    Returns ``None`` when years of experience is missing or unparseable, so
+    callers can fall back to "infer from role seniority/JD" wording.
+    """
+    if years_experience is None or years_experience == "":
+        return None
+    try:
+        ye = float(years_experience)
+    except (TypeError, ValueError):
+        return None
+    if ye < 2:
+        return "easy"
+    if ye <= 5:
+        return "medium"
+    return "hard"
+
+
+def build_difficulty_policy(years_experience) -> str:
+    """Compose the Difficulty policy block with a dynamic fallback line.
+
+    The fallback line is computed from ``years_experience`` so the LLM gets a
+    concrete default instead of a vague "infer from experience" instruction.
+    """
+    inferred = default_difficulty_for_experience(years_experience)
+    if inferred is not None:
+        fallback_line = (
+            f"- If a skill has no difficulty set, DEFAULT to '{inferred}' "
+            f"(candidate's years of experience = {years_experience}; "
+            f"mapping: {EXPERIENCE_DIFFICULTY_MAPPING_TEXT})."
+        )
+    else:
+        fallback_line = (
+            "- If a skill has no difficulty set, infer from the candidate's "
+            "role seniority and JD (no years-of-experience supplied). "
+            f"Default mapping when applicable: {EXPERIENCE_DIFFICULTY_MAPPING_TEXT}."
+        )
+    return "\n".join([
+        "Difficulty policy (per-skill difficulty):",
+        "- Each skill in the plan may carry a difficulty hint: easy | medium | hard.",
+        "- easy   → focus on conceptual fundamentals + simple practical examples.",
+        "- medium → mix of concepts, applied scenarios, and reasoning trade-offs.",
+        "- hard   → deep reasoning, design trade-offs, edge cases, real-world architecture/debugging.",
+        fallback_line,
+        '- Per-skill "Skill instructions" lines override the generic difficulty hint when present.',
+    ])
+
+QUESTION_SOURCE_POLICY = """
+Question-source policy (per-skill prepared questions):
+- The "Prepared questions per skill" section is the backbone — ask its questions in the listed order, grouped by skill.
+- For each skill group, honour its flags:
+    * ask_follow_ups=true  → you MAY ask 1-2 brief follow-ups per prepared question to probe depth.
+    * ask_follow_ups=false → ask the prepared question as written and move on (no follow-ups).
+    * allow_additional=true  → after finishing the prepared list for that skill you MAY ask extra questions on the same skill if time permits.
+    * allow_additional=false → do NOT add new questions on that skill once the prepared list is finished; move on.
+- If a skill in the plan has no prepared questions here, generate technical/scenario-based questions aligned to JD, role, and the skill's topics.
+""".strip()
+
+
+_JD_BODY_MAX_CHARS = 8000
+_RESUME_SUMMARY_MAX_CHARS = 6000
+
+
+# ---------------------------------------------------------------------------
+# Helpers (kept private — only :func:`build_prompt` is part of the public API)
+# ---------------------------------------------------------------------------
+
+
+def _language_policy(interview_meta: dict, primary_language: str) -> list[str]:
+    raw = interview_meta.get("languagePolicy")
+    if isinstance(raw, str) and raw.strip():
+        return [x.strip().lower() for x in raw.replace(";", ",").split(",") if x.strip()]
+    if isinstance(raw, list) and raw:
+        return [str(x).strip().lower() for x in raw if str(x).strip()]
+    return [str(primary_language).strip().lower() or "en"]
+
+
+def _format_weight(weight: float | None) -> str:
+    if not isinstance(weight, float):
+        return "unspecified"
+    return f"{weight:.0f}%" if weight.is_integer() else f"{weight:.2f}%"
+
+
+def _candidate_lines(candidate: dict) -> list[str]:
+    lines = [f"Candidate name: {candidate.get('name') or 'the candidate'}"]
+    if candidate.get("email"):
+        lines.append(f"Candidate email (reference): {candidate.get('email')}")
+    ye = candidate.get("yearsExperience")
+    if ye is not None and ye != "":
+        lines.append(f"Years of experience (reference): {ye}")
+    skills = candidate.get("skills") or []
+    if skills:
+        lines.append(f"Candidate skills (reference): {', '.join(str(s) for s in skills)}")
+    return lines
+
+
+def _resume_summary_lines(candidate: dict) -> list[str]:
+    """Render the candidate resume summary as its own block.
+
+    Skipped entirely when no summary is supplied. Long resumes are truncated
+    so the prompt stays bounded.
+    """
+    raw = candidate.get("resumeSummary") or candidate.get("resume_summary") or ""
+    body = str(raw).strip()
+    if not body:
+        return []
+    if len(body) > _RESUME_SUMMARY_MAX_CHARS:
+        body = body[:_RESUME_SUMMARY_MAX_CHARS] + "\n[truncated]"
+    return [
+        "Candidate resume summary (use this to tailor questions and follow-ups; "
+        "anchor probes to projects, tools, and experiences mentioned here):",
+        body,
+    ]
+
+
+def _jd_lines(jd: dict) -> list[str]:
+    lines = ["Job description / role context (use for questioning and context):"]
+    if jd.get("title"):
+        lines.append(f"Role title: {jd.get('title')}")
+    body = (jd.get("text") or jd.get("summary") or "").strip()
+    if body:
+        if len(body) > _JD_BODY_MAX_CHARS:
+            body = body[:_JD_BODY_MAX_CHARS] + "\n[truncated]"
+        lines.append(body)
+    else:
+        lines.append("(No JD body supplied — rely on title, topics, and prepared questions.)")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Skill plan rendering (only the fields that are actually set are printed)
+# ---------------------------------------------------------------------------
+
+
+def _skill_plan_lines(skill_specs: list[dict]) -> list[str]:
+    """Render the skill plan section. Caller guarantees ``skill_specs`` non-empty.
+
+    Each entry's optional fields (``topics``, ``weightage``, ``difficulty``,
+    ``instructions``) are only printed when present, so the LLM never sees
+    placeholder values like ``unspecified``.
+    """
+    lines = ["Skill plan (follow this if present):"]
+
+    for i, spec in enumerate(skill_specs, start=1):
+        parts = [f"Skill: {spec['skill']}"]
+        if spec.get("topics"):
+            parts.append(f"Topics: {', '.join(spec['topics'])}")
+        weight = spec.get("weightage")
+        if isinstance(weight, float):
+            parts.append(f"Weightage: {_format_weight(weight)}")
+        difficulty = spec.get("difficulty")
+        if difficulty:
+            parts.append(f"Difficulty: {difficulty}")
+        lines.append(f"  {i}. " + " | ".join(parts))
+
+        instructions = spec.get("instructions") or ""
+        if instructions:
+            lines.append(f"     Skill instructions: {instructions}")
+
+    total_weight = sum(s["weightage"] for s in skill_specs if isinstance(s.get("weightage"), float))
+    if total_weight > 0:
+        lines.append(f"Weightage total supplied: {total_weight:.0f}%")
+
+    lines.append(
+        "Rule: prioritize questions by skill weightage and topic importance; "
+        "respect each skill's difficulty + skill instructions; "
+        "if any skill shows 2-3 below-average answers, shift to next skill."
+    )
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Prepared questions (per-skill groups, with legacy fallback)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_question_groups(raw: list) -> list[dict]:
+    """Lift ``questions`` payloads into per-skill groups.
+
+    Accepts:
+    - ``list[str]`` — wrapped into a single ``"General"`` group.
+    - ``list[str | dict]`` — strings collected into ``"General"`` group;
+      dict entries kept (with field defaults applied).
+
+    Returns a list of ``{skill, questions, ask_follow_ups, allow_additional}``.
+    Empty groups (no questions after trimming) are dropped.
+    """
+    if not isinstance(raw, list) or not raw:
+        return []
+
+    groups: list[dict] = []
+    general: list[str] = []
+
+    for item in raw:
+        if isinstance(item, str):
+            txt = item.strip()
+            if txt:
+                general.append(txt)
+            continue
+        if not isinstance(item, dict):
+            continue
+
+        skill = str(item.get("skill") or item.get("name") or "").strip()
+        if not skill:
+            continue
+
+        qs_raw = item.get("questions") or []
+        questions = (
+            [str(q).strip() for q in qs_raw if str(q).strip()]
+            if isinstance(qs_raw, list)
+            else []
+        )
+        if not questions:
+            continue
+
+        ask_follow_ups = item.get("askFollowUps")
+        if not isinstance(ask_follow_ups, bool):
+            ask_follow_ups = True
+        allow_additional = item.get("allowAdditional")
+        if not isinstance(allow_additional, bool):
+            allow_additional = False
+
+        groups.append({
+            "skill": skill,
+            "questions": questions,
+            "ask_follow_ups": ask_follow_ups,
+            "allow_additional": allow_additional,
+        })
+
+    if general:
+        groups.append({
+            "skill": "General",
+            "questions": general,
+            "ask_follow_ups": True,
+            "allow_additional": False,
+        })
+
+    return groups
+
+
+def _question_lines(question_groups: list[dict]) -> list[str]:
+    """Render the prepared-question section. Caller guarantees non-empty."""
+    lines = ["Prepared questions per skill (ask in this order, one at a time):"]
+    for group in question_groups:
+        ask_follow_ups = group["ask_follow_ups"]
+        allow_additional = group["allow_additional"]
+        lines.append("")
+        lines.append(
+            f"Skill: {group['skill']} "
+            f"| ask_follow_ups={'true' if ask_follow_ups else 'false'} "
+            f"| allow_additional={'true' if allow_additional else 'false'}"
+        )
+        for i, q in enumerate(group["questions"], start=1):
+            lines.append(f"  {i}. {q}")
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Must-ask topics (with priority flag, legacy fallback)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_must_ask_topics(raw: list) -> list[dict]:
+    """Lift must-ask topics into ``[{topic, ask_now}, …]``.
+
+    Accepts plain strings (legacy → ``ask_now=False``) or
+    ``{topic, askNow}`` objects. Order is preserved; duplicates (case-insensitive
+    on the topic text) are dropped.
+    """
+    if not isinstance(raw, list):
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in raw:
+        topic: str = ""
+        ask_now = False
+        if isinstance(item, str):
+            topic = item.strip()
+        elif isinstance(item, dict):
+            topic = str(item.get("topic") or "").strip()
+            ask_now = bool(item.get("askNow"))
+        if not topic:
+            continue
+        key = topic.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"topic": topic, "ask_now": ask_now})
+    return out
+
+
+def _must_ask_topic_lines(topics: list[dict]) -> list[str]:
+    """Render the must-ask topics section. Caller guarantees non-empty."""
+    lines = ["Must-ask topic areas (cover all of these before wrap-up):"]
+    high_priority = [t for t in topics if t["ask_now"]]
+    normal = [t for t in topics if not t["ask_now"]]
+    if high_priority:
+        lines.append(
+            "  High priority (ask now / cover early): "
+            + ", ".join(t["topic"] for t in high_priority)
+        )
+    if normal:
+        lines.append(
+            "  Normal flow (cover whenever it fits naturally): "
+            + ", ".join(t["topic"] for t in normal)
+        )
+    lines.append(
+        "Instruction: schedule high-priority topics early, but ALL listed topics "
+        "must be touched before the interview ends."
+    )
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def _append_block(lines: list[str], block_lines: list[str]) -> None:
+    """Append a block of lines followed by a blank separator."""
+    if not block_lines:
+        return
+    lines.extend(block_lines)
+    lines.append("")
+
+
+def build_prompt(meta: dict) -> str:
+    """Compose the full system prompt from dispatch metadata.
+
+    Sections that depend on payload data (must-ask topics, skill plan,
+    prepared questions) are skipped — *along with their policy text* — when
+    no data is supplied. This keeps the prompt focused for the LLM.
+    """
+    candidate = meta.get("candidateProfile") or {}
+    interview_meta = meta.get("interviewMeta") or {}
+    jd = meta.get("jd") or {}
+
+    primary_language = interview_meta.get("language", "en")
+    title = interview_meta.get("title", "AI interview")
+    language_policy = _language_policy(interview_meta, primary_language)
+    extra_instructions = (
+        interview_meta.get("instructionsAdditional")
+        or interview_meta.get("instructions")
+        or ""
+    ).strip()
+    duration_minutes = int(interview_meta.get("durationMinutes") or 35)
+
+    must_ask_topics = _normalize_must_ask_topics(interview_meta.get("mustAskTopics") or [])
+
+    skill_specs_raw = interview_meta.get("skills") or interview_meta.get("skillWeights") or []
+    if not isinstance(skill_specs_raw, list):
+        skill_specs_raw = []
+    skill_specs = normalize_skill_specs(skill_specs_raw)
+
+    question_groups = _normalize_question_groups(interview_meta.get("questions") or [])
+
+    # 1. Always-on instructions ------------------------------------------------
+    lines: list[str] = [INTERVIEW_AGENT_DEFAULT_INSTRUCTIONS, ""]
+
+    # 2. Optional employer extras ---------------------------------------------
+    if extra_instructions:
+        lines.append(
+            "Additional instructions from the employer (apply together with the defaults above):"
+        )
+        lines.append(extra_instructions)
+        lines.append("")
+
+    # 3. Interview header ------------------------------------------------------
+    lines.append(f"Interview title: {title}")
+    lines.append(f"Primary language: {primary_language}")
+    lines.append(f"Supported languages (language policy): {', '.join(language_policy)}")
+    lines.append(f"Interview duration (minutes): {duration_minutes}")
+    lines.append("")
+
+    # 4. Candidate facts -------------------------------------------------------
+    _append_block(lines, _candidate_lines(candidate))
+
+    # 4b. Candidate resume summary (only when supplied) -----------------------
+    _append_block(lines, _resume_summary_lines(candidate))
+
+    # 5. JD / role -------------------------------------------------------------
+    _append_block(lines, _jd_lines(jd))
+
+    # 6. Must-ask topics (policy + data, only when topics exist) --------------
+    if must_ask_topics:
+        _append_block(lines, [MUST_ASK_TOPICS_POLICY])
+        _append_block(lines, _must_ask_topic_lines(must_ask_topics))
+
+    # 7. Skill plan (weightage policy + difficulty policy + data) -------------
+    # Difficulty policy is rendered whenever a skill plan exists so the LLM
+    # always knows (a) what easy/medium/hard mean for explicit-difficulty
+    # skills and (b) which default to use for skills without one.
+    if skill_specs:
+        _append_block(lines, [SKILLS_WEIGHTAGE_POLICY])
+        _append_block(lines, [build_difficulty_policy(candidate.get("yearsExperience"))])
+        _append_block(lines, _skill_plan_lines(skill_specs))
+
+    # 8. Prepared questions per skill (policy + data, only when present) ------
+    if question_groups:
+        _append_block(lines, [QUESTION_SOURCE_POLICY])
+        _append_block(lines, _question_lines(question_groups))
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+__all__ = [
+    "INTERVIEW_AGENT_DEFAULT_INSTRUCTIONS",
+    "MUST_ASK_TOPICS_POLICY",
+    "SKILLS_WEIGHTAGE_POLICY",
+    "QUESTION_SOURCE_POLICY",
+    "EXPERIENCE_DIFFICULTY_MAPPING_TEXT",
+    "build_difficulty_policy",
+    "default_difficulty_for_experience",
+    "build_prompt",
+]

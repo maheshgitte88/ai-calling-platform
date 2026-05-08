@@ -3,8 +3,6 @@
  *
  * Usage (from this directory, after `python3 -m venv .venv` + `pip install -r requirements.txt`):
  *   pm2 start ecosystem.config.cjs --only ai-interview-agent
- *   pm2 start ecosystem.config.cjs --only ai-calling-agent
- *   pm2 start ecosystem.config.cjs
  *
  * Logs: pm2 logs ai-interview-agent
  * Save: pm2 save
@@ -26,21 +24,6 @@ module.exports = {
       name: "ai-interview-agent",
       cwd,
       script: "interview_agent_entrypoint.py",
-      interpreter: venvPython,
-      args: ["dev"],
-      instances: 1,
-      exec_mode: "fork",
-      autorestart: true,
-      max_restarts: 80,
-      min_uptime: "10s",
-      exp_backoff_restart_delay: 500,
-      watch: false,
-      time: true,
-    },
-    {
-      name: "ai-calling-agent",
-      cwd,
-      script: "agent_entrypoint.py",
       interpreter: venvPython,
       args: ["dev"],
       instances: 1,

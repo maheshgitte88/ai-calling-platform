@@ -4,4 +4,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc && rm -rf /
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
-CMD ["python", "agent_entrypoint.py", "dev"]
+RUN python interview_agent_entrypoint.py download-files
+CMD ["python", "interview_agent_entrypoint.py", "dev"]

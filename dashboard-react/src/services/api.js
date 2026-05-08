@@ -12,40 +12,7 @@ async function request(path, options = {}) {
   return data;
 }
 
-async function requestForm(path, formData) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    method: "POST",
-    body: formData,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || res.statusText);
-  return data;
-}
-
 export const api = {
-  getProviders: () => request("/providers"),
-  getClients: () => request("/clients"),
-  getClient: (id) => request(`/clients/${id}`),
-  getClientStats: (id) => request(`/clients/${id}/stats`),
-  createClient: (body) => request("/clients", { method: "POST", body: JSON.stringify(body) }),
-  updateClient: (id, body) => request(`/clients/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
-  getClientConfig: (clientId) => request(`/clients/${clientId}/config`),
-  saveClientConfig: (clientId, body) =>
-    request(`/clients/${clientId}/config`, { method: "POST", body: JSON.stringify(body) }),
-  getCalls: (params) =>
-    request(`/calls${params?.clientId ? `?clientId=${params.clientId}` : ""}`),
-  getCall: (id) => request(`/calls/${id}`),
-  deleteCall: (id) => request(`/calls/${id}`, { method: "DELETE" }),
-  createCall: (body) => request("/calls", { method: "POST", body: JSON.stringify(body) }),
-  createBulkCalls: (body) => request("/calls/bulk", { method: "POST", body: JSON.stringify(body) }),
-  recoverCallSummary: (id) => request(`/calls/${id}/recover-summary`, { method: "POST" }),
-  getCampaigns: (params) =>
-    request(`/campaigns${params?.clientId ? `?clientId=${params.clientId}` : ""}`),
-  importCampaign: (formData) => requestForm("/campaigns/import", formData),
-  startCampaign: (campaignId) =>
-    request(`/campaigns/${campaignId}/start`, { method: "POST" }),
-  getPlaygroundToken: (body) =>
-    request("/playground/token", { method: "POST", body: JSON.stringify(body) }),
   startInterviewSession: (body) =>
     request("/interviews/session/start", { method: "POST", body: JSON.stringify(body) }),
   resolveInterviewSession: (body) =>
@@ -56,6 +23,21 @@ export const api = {
     request(`/interviews/session/${sessionId}`),
   addInterviewSessionEvent: (sessionId, body) =>
     request(`/interviews/session/${sessionId}/event`, { method: "POST", body: JSON.stringify(body) }),
+  uploadInterviewProctorFrame: (sessionId, blob, meta = {}, { signal } = {}) => {
+    const fd = new FormData();
+    const filename = `proctor-${meta.capturedAt || new Date().toISOString()}.jpg`.replace(/[:.]/g, "-");
+    fd.append("image", blob, filename);
+    fd.append("meta", JSON.stringify(meta || {}));
+    return fetch(`${API_BASE}/interviews/session/${sessionId}/proctor/frame`, {
+      method: "POST",
+      body: fd,
+      signal,
+    }).then(async (res) => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    });
+  },
   getInterviewSessions: (params) => {
     const sp = new URLSearchParams();
     if (params?.limit) sp.set("limit", String(params.limit));
