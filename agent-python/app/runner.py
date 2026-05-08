@@ -173,6 +173,10 @@ def _persist_evaluation(
             "overallPercent": eval_doc["overallPercent"],
             "questionStats": eval_doc["questionStats"],
             "scores": eval_doc["scores"],
+            # New fields from the multi-criterion + skill-weighted evaluation:
+            "perSkillScores": eval_doc.get("perSkillScores", {}),
+            "skillWeights": eval_doc.get("skillWeights", {}),
+            "evaluationFlags": eval_doc.get("evaluationFlags", []),
             "strengths": strengths,
             "gaps": gaps,
             "recommendation": eval_doc["recommendation"],

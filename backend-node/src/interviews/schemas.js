@@ -36,12 +36,16 @@ export const InterviewSkillSpecSchema = z.object({
  * - `askFollowUps`: when true, AI may ask 1-2 brief follow-ups per question.
  * - `allowAdditional`: when true, AI may ask extra questions on this skill
  *   *after* the prepared list is finished, if time permits.
+ * - `weightage`: percentage of the final score this skill contributes. Used
+ *   ONLY by the post-interview evaluation to compute the skill-weighted
+ *   overall %. Not surfaced to the AI interviewer in the live prompt.
  */
 export const InterviewQuestionGroupSchema = z.object({
   skill: z.string().min(1),
   questions: z.array(z.string().min(1).max(4000)).default([]),
   askFollowUps: z.boolean().optional(),
   allowAdditional: z.boolean().optional(),
+  weightage: z.union([z.number(), z.string()]).optional(),
 });
 
 /**

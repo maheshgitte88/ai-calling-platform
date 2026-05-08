@@ -154,6 +154,9 @@ export function normalizeInterviewQuestionGroups(raw) {
       questions,
       askFollowUps: typeof item.askFollowUps === "boolean" ? item.askFollowUps : true,
       allowAdditional: typeof item.allowAdditional === "boolean" ? item.allowAdditional : false,
+      // `weightage` is consumed only by the post-interview evaluation; we
+      // intentionally do not surface it to the live interviewer prompt.
+      weightage: parseWeightage(item.weightage),
     });
   }
 
@@ -163,6 +166,7 @@ export function normalizeInterviewQuestionGroups(raw) {
       questions: generalQuestions,
       askFollowUps: true,
       allowAdditional: false,
+      weightage: null,
     });
   }
 

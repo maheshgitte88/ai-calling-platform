@@ -29,6 +29,7 @@ function makeQuestionGroupRow() {
     questionsText: "",
     askFollowUps: true,
     allowAdditional: false,
+    weightage: "",
   };
 }
 
@@ -105,11 +106,13 @@ function buildQuestionGroupsPayload(rows) {
     if (!skill) continue;
     const questions = splitList(row.questionsText, "\n");
     if (!questions.length) continue;
+    const weightage = parseWeightage(row.weightage);
     out.push({
       skill,
       questions,
       askFollowUps: Boolean(row.askFollowUps),
       allowAdditional: Boolean(row.allowAdditional),
+      weightage,
     });
   }
   return out;
@@ -607,9 +610,10 @@ function QuestionGroupsSection({ rows, onChange, onAdd, onRemove }) {
         <div>
           <h2 style={styles.sectionTitle}>Prepared questions per skill</h2>
           <p style={styles.sectionSubtext}>
-            Group the questions by skill. Use the per-group toggles to control whether the AI may
-            probe with follow-ups, and whether it may add extra questions on the same skill after
-            finishing the prepared list.
+            Group the questions by skill. The per-group <em>weightage</em> is used by the
+            evaluation to compute the skill-weighted overall score (the AI interviewer is not
+            shown this number during the interview). Use the toggles to control whether the AI
+            may probe with follow-ups, and whether it may add extra questions after the list.
           </p>
         </div>
         <button style={styles.btnSecondary} type="button" onClick={onAdd}>
@@ -620,12 +624,23 @@ function QuestionGroupsSection({ rows, onChange, onAdd, onRemove }) {
       <div style={styles.rowsList}>
         {rows.map((row, index) => (
           <div key={`qgroup-${index}`} style={styles.subCard}>
-            <input
-              style={{ ...styles.input, marginBottom: 8 }}
-              placeholder="Skill (e.g. JavaScript)"
-              value={row.skill}
-              onChange={(e) => onChange(index, { skill: e.target.value })}
-            />
+            <div style={{ ...styles.skillRowGrid, marginBottom: 8 }}>
+              <input
+                style={styles.input}
+                placeholder="Skill (e.g. JavaScript)"
+                value={row.skill}
+                onChange={(e) => onChange(index, { skill: e.target.value })}
+              />
+              <input
+                style={styles.input}
+                type="number"
+                min={0}
+                max={100}
+                placeholder="Weightage % (used in evaluation)"
+                value={row.weightage}
+                onChange={(e) => onChange(index, { weightage: e.target.value })}
+              />
+            </div>
             <textarea
               style={styles.textarea}
               rows={4}
