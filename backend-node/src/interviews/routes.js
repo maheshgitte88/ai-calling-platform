@@ -31,6 +31,7 @@ import {
   ttlMinutesFromDuration,
 } from "./duration.js";
 import { ensureInterviewRecordingStarted, markRecordingFailed } from "./recording.js";
+import { triggerSessionEvaluation } from "./evaluator-client.js";
 
 const router = express.Router();
 
@@ -372,7 +373,18 @@ router.post(
       .findOne({ session_id: req.params.sessionId });
     if (!session) throw new HttpError(404, "Interview session not found");
 
-    if (session.dispatch_id && isCancellableDispatchStatus(session.status)) {
+    // Only cancel the agent dispatch when the candidate never actually joined
+    // the room (no `started_at`). Once the interview has started, the
+    // candidate's room disconnect is what naturally ends `_drive_interview()`
+    // in the agent — and the agent then runs and persists the evaluation.
+    // Cancelling the dispatch here would race the agent and risk killing it
+    // mid-evaluation, leaving a transcript without a summary in MongoDB.
+    const candidateNeverJoined = !session.started_at;
+    if (
+      candidateNeverJoined
+      && session.dispatch_id
+      && isCancellableDispatchStatus(session.status)
+    ) {
       try {
         await cancelDispatch(session.dispatch_id);
       } catch {
@@ -402,6 +414,43 @@ router.post(
     );
 
     res.json({ ok: true, sessionId: req.params.sessionId });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/interviews/session/:sessionId/evaluate
+// Manual / fallback summary generation. Reads the persisted transcript from
+// MongoDB and runs the same evaluation pipeline as the live agent. Useful
+// when the agent died before persisting the evaluation, or when a recruiter
+// wants to regenerate a summary.
+// ---------------------------------------------------------------------------
+
+router.post(
+  "/session/:sessionId/evaluate",
+  asyncHandler(async (req, res) => {
+    const sessionId = req.params.sessionId;
+    const db = getDb();
+
+    const session = await db
+      .collection(COLLECTIONS.INTERVIEW_SESSIONS)
+      .findOne({ session_id: sessionId });
+    if (!session) throw new HttpError(404, "Interview session not found");
+
+    const transcriptCount = await db
+      .collection(COLLECTIONS.INTERVIEW_EVENTS)
+      .countDocuments({ session_id: sessionId, type: "transcript" });
+    if (transcriptCount === 0) {
+      throw new HttpError(409, "No transcript available for this session");
+    }
+
+    console.info(
+      "[evaluator] manual evaluation requested",
+      JSON.stringify({ sessionId, transcriptCount }),
+    );
+
+    const result = await triggerSessionEvaluation(sessionId);
+
+    res.json({ ok: true, sessionId, ...result });
   }),
 );
 

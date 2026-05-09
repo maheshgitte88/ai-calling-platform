@@ -9,6 +9,9 @@ import {
   FileJson,
   Printer,
   MessageSquare,
+  Sparkles,
+  RefreshCcw,
+  Loader2,
 } from "lucide-react";
 import { api } from "../services/api";
 import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
@@ -33,6 +36,15 @@ export default function Interviews() {
     setSelectedId(sessionId);
     const d = await api.getInterviewSession(sessionId);
     setDetail(d);
+  };
+
+  const refreshDetail = async () => {
+    if (!selectedId) return;
+    const d = await api.getInterviewSession(selectedId);
+    setDetail(d);
+    // Refresh the list too so the Score column reflects the new evaluation
+    // without forcing a full page reload.
+    load().catch(() => {});
   };
 
   const closeDetail = () => {
@@ -75,19 +87,50 @@ export default function Interviews() {
       </div>
 
       {detail && selectedId && (
-        <InterviewDetailModal detail={detail} onClose={closeDetail} />
+        <InterviewDetailModal
+          detail={detail}
+          onClose={closeDetail}
+          onRefresh={refreshDetail}
+        />
       )}
     </div>
   );
 }
 
-function InterviewDetailModal({ detail, onClose }) {
+function InterviewDetailModal({ detail, onClose, onRefresh }) {
   const session = detail?.session;
   const ev = detail?.evaluation;
   const title = session?.metadata?.interviewMeta?.title || session?.interview_id || "Interview";
   const status = session?.status || "—";
   const created = session?.created_at ? new Date(session.created_at).toLocaleString() : "—";
   const finalTranscript = useMemo(() => getFinalTranscriptLines(detail), [detail]);
+  const transcriptCount = (detail?.events || []).filter((e) => e?.type === "transcript").length;
+  const sessionId = session?.session_id || "";
+
+  const [evaluating, setEvaluating] = useState(false);
+  const [evalError, setEvalError] = useState("");
+  const hasSummary = Boolean(ev?.summary);
+  const canEvaluate = Boolean(sessionId) && transcriptCount > 0;
+
+  const handleEvaluate = async () => {
+    if (!sessionId || evaluating) return;
+    if (hasSummary) {
+      const ok = window.confirm(
+        "Regenerate summary from the transcript? This will overwrite the existing evaluation.",
+      );
+      if (!ok) return;
+    }
+    setEvalError("");
+    setEvaluating(true);
+    try {
+      await api.evaluateInterviewSession(sessionId);
+      if (onRefresh) await onRefresh();
+    } catch (e) {
+      setEvalError(e?.message || "Could not generate summary.");
+    } finally {
+      setEvaluating(false);
+    }
+  };
 
   const handlePrintPdf = () => {
     const candidateName = session?.participant_name || session?.candidate_id || "Candidate";
@@ -243,6 +286,7 @@ function InterviewDetailModal({ detail, onClose }) {
         aria-modal="true"
         onClick={(e) => e.stopPropagation()}
       >
+        <style>{`@keyframes interviewsSpin { to { transform: rotate(360deg); } }`}</style>
         <header style={styles.modalHeader}>
           <div style={styles.modalHeaderMain}>
             <div style={styles.modalTitleRow}>
@@ -273,6 +317,32 @@ function InterviewDetailModal({ detail, onClose }) {
               <Hash size={14} />
               {session?.session_id?.slice(0, 8)}…
             </span>
+            {canEvaluate ? (
+              <button
+                type="button"
+                style={hasSummary ? styles.regenerateBtnSecondary : styles.generateBtnPrimary}
+                onClick={handleEvaluate}
+                disabled={evaluating}
+                title={hasSummary ? "Regenerate summary from transcript" : "Generate summary from transcript"}
+              >
+                {evaluating ? (
+                  <>
+                    <Loader2 size={14} style={styles.spin} />
+                    {hasSummary ? "Regenerating…" : "Generating…"}
+                  </>
+                ) : hasSummary ? (
+                  <>
+                    <RefreshCcw size={14} />
+                    Regenerate summary
+                  </>
+                ) : (
+                  <>
+                    <Sparkles size={14} />
+                    Generate summary
+                  </>
+                )}
+              </button>
+            ) : null}
           </div>
         </header>
 
@@ -308,6 +378,50 @@ function InterviewDetailModal({ detail, onClose }) {
               <h3 style={styles.sectionTitle}>Summary</h3>
               <p style={styles.summaryText}>{ev.summary}</p>
             </section>
+          ) : (
+            <section style={styles.section}>
+              <h3 style={styles.sectionTitle}>Summary</h3>
+              <div style={styles.evalEmptyCard}>
+                <div style={styles.evalEmptyHeader}>
+                  <Sparkles size={16} />
+                  <strong>No summary yet for this interview.</strong>
+                </div>
+                <p style={styles.evalEmptyHint}>
+                  {transcriptCount > 0
+                    ? `We have ${transcriptCount} transcript line${
+                        transcriptCount === 1 ? "" : "s"
+                      } stored for this session. Click below to generate a fresh evaluation from the transcript using the same scoring pipeline as the live interview.`
+                    : "No transcript was captured for this session, so a summary cannot be generated."}
+                </p>
+                {canEvaluate ? (
+                  <button
+                    type="button"
+                    style={styles.generateBtnPrimary}
+                    onClick={handleEvaluate}
+                    disabled={evaluating}
+                  >
+                    {evaluating ? (
+                      <>
+                        <Loader2 size={14} style={styles.spin} />
+                        Generating summary…
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles size={14} />
+                        Generate summary now
+                      </>
+                    )}
+                  </button>
+                ) : null}
+              </div>
+            </section>
+          )}
+
+          {evalError ? (
+            <div style={styles.evalErrorBanner} role="alert">
+              <strong>Could not generate summary.</strong>
+              <span>{evalError}</span>
+            </div>
           ) : null}
 
           {(ev?.overallPercent != null || ev?.scores) ? (
@@ -736,6 +850,70 @@ const styles = {
     fontSize: "0.78rem",
     color: "#64748b",
     fontFamily: "ui-monospace, monospace",
+  },
+  generateBtnPrimary: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "5px 12px",
+    fontSize: "0.78rem",
+    fontWeight: 600,
+    color: "#ffffff",
+    background: "linear-gradient(135deg,#6366f1,#8b5cf6)",
+    border: "none",
+    borderRadius: 999,
+    cursor: "pointer",
+    boxShadow: "0 1px 2px rgba(99,102,241,0.35)",
+  },
+  regenerateBtnSecondary: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    padding: "5px 10px",
+    fontSize: "0.75rem",
+    fontWeight: 600,
+    color: "#cbd5e1",
+    background: "rgba(148,163,184,0.18)",
+    border: "1px solid rgba(148,163,184,0.35)",
+    borderRadius: 999,
+    cursor: "pointer",
+  },
+  spin: {
+    animation: "interviewsSpin 0.9s linear infinite",
+  },
+  evalEmptyCard: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+    padding: "12px 14px",
+    background: "rgba(99,102,241,0.06)",
+    border: "1px dashed rgba(99,102,241,0.35)",
+    borderRadius: 10,
+  },
+  evalEmptyHeader: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 8,
+    color: "#4338ca",
+    fontSize: "0.92rem",
+  },
+  evalEmptyHint: {
+    margin: 0,
+    color: "#475569",
+    fontSize: "0.86rem",
+    lineHeight: 1.5,
+  },
+  evalErrorBanner: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+    margin: "0 0 12px",
+    padding: "10px 12px",
+    background: "rgba(220,38,38,0.08)",
+    border: "1px solid rgba(220,38,38,0.35)",
+    borderRadius: 8,
+    color: "#991b1b",
+    fontSize: "0.85rem",
   },
 
   modalBody: {

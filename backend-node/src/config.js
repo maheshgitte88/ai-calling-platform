@@ -28,6 +28,11 @@ const EnvSchema = z.object({
   AZURE_STORAGE_ACCOUNT_KEY: z.string().optional(),
   AZURE_STORAGE_CONTAINER_NAME: z.string().default("interview-recordings"),
 
+  // Python evaluator sidecar — used to (re)generate interview summaries on
+  // demand from a stored transcript. Defaults match the docker-compose
+  // service name; override to http://localhost:8090 for non-Docker dev.
+  INTERVIEW_EVALUATOR_URL: z.string().default("http://interview-evaluator:8090"),
+
 });
 
 const parsedEnv = EnvSchema.parse(process.env);

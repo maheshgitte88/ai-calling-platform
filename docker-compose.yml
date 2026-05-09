@@ -22,6 +22,19 @@ services:
       - default
       - livekit-net
 
+  interview-evaluator:
+    build:
+      context: ./agent-python
+      dockerfile: Dockerfile
+    command: ["python", "evaluator_app.py"]
+    env_file:
+      - ./agent-python/.env
+    expose:
+      - "8090"
+    networks:
+      - default
+      - livekit-net
+
   dashboard:
     build:
       context: ./dashboard-react

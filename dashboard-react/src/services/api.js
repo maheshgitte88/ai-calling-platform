@@ -49,4 +49,9 @@ export const api = {
   },
   getInterviewEvaluation: (sessionId) =>
     request(`/interviews/evaluations/${sessionId}`),
+  evaluateInterviewSession: (sessionId) =>
+    request(`/interviews/session/${sessionId}/evaluate`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    }),
 };
