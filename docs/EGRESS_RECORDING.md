@@ -9,8 +9,9 @@ For self-hosted LiveKit, recording is **not** handled by `livekit-server` itself
 To record interview rooms, you must run a separate `livekit/egress` service.
 
 In this project:
-- `recordingEnabled = true` starts a RoomComposite recording
-- `recordingEnabled = false` skips recording
+- `recordingEnabled` defaults to **true** (audio-only). The backend treats a missing flag as "record".
+- Pass `recordingEnabled: false` in the payload to opt out.
+- Pass `recordingAudioOnly: false` to record video as well (default is audio-only).
 
 ## Current Application Behavior
 

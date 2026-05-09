@@ -93,10 +93,11 @@ function buildDispatchMetadata(payload, sessionId) {
       sampleEverySeconds: payload.vision?.sampleEverySeconds ?? 10,
     },
     recording: {
-      enabled: Boolean(payload.recordingEnabled),
+      // Default ON: recording is enabled unless the caller explicitly sends
+      // `recordingEnabled: false`. Audio-only is also the default — caller
+      // opts into video with `recordingAudioOnly: false`.
+      enabled: payload.recordingEnabled !== false,
       layout: payload.recordingLayout || "grid",
-      // Default to audio-only recording. Caller can opt into video by
-      // explicitly sending `recordingAudioOnly: false` in the payload.
       audioOnly: payload.recordingAudioOnly !== false,
     },
   };

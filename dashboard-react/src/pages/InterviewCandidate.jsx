@@ -49,7 +49,7 @@ const defaultForm = {
   languagePolicy: "",
   durationMinutes: 35,
   linkExpiryHours: 24,
-  recordingEnabled: false,
+  recordingEnabled: true,
   yearsExperience: "",
   skills: "",
   resumeSummary: "",
@@ -388,7 +388,7 @@ export default function InterviewCandidate() {
               checked={form.recordingEnabled}
               onChange={(e) => updateForm({ recordingEnabled: e.target.checked })}
             />{" "}
-            Record interview (Azure storage)
+            Record interview audio (Azure storage)
           </label>
         </div>
       </div>

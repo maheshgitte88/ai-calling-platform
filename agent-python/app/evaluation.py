@@ -50,12 +50,14 @@ AXIS_WEIGHTS: dict[str, float] = {
 }
 
 # Verdict mapping derived from the 0..100 score (kept for back-compat with the
-# old four-bucket model and the dashboard's question-stats block).
+# old dashboard's question-stats block, with "weak" added as a separate bucket).
 def _verdict_from_score(score: float) -> str:
     if score >= 80:
         return "correct"
     if score >= 40:
         return "partially_correct"
+    if score >= 20:
+        return "weak"
     if score > 0:
         return "incorrect"
     return "could_not_answer"
@@ -69,6 +71,9 @@ VERDICT_ALIASES: dict[str, str] = {
     "partially correct": "partially_correct",
     "wrong": "incorrect",
     "incorrect": "incorrect",
+    "weak": "weak",
+    "weak_answer": "weak",
+    "weak answer": "weak",
     "correct": "correct",
     "right": "correct",
     "could_not_answer": "could_not_answer",
@@ -101,7 +106,7 @@ def format_transcript_chronological(transcript_lines: list[dict]) -> str:
 
 
 def normalize_verdict(raw: str | None) -> str:
-    """Normalize legacy verdict strings to the canonical four-bucket form."""
+    """Normalize verdict strings to the canonical verdict buckets."""
     if not raw:
         return "could_not_answer"
     key = re.sub(r"[\s-]+", "_", str(raw).strip().lower())
@@ -580,7 +585,14 @@ def _compute_overall_percent(
 
 def _question_stats(questions: list[dict]) -> dict[str, int]:
     """Legacy verdict counts — kept for the dashboard's question-stats card."""
-    stats = {"total": len(questions), "correct": 0, "partially_correct": 0, "incorrect": 0, "could_not_answer": 0}
+    stats = {
+        "total": len(questions),
+        "correct": 0,
+        "partially_correct": 0,
+        "weak": 0,
+        "incorrect": 0,
+        "could_not_answer": 0,
+    }
     for q in questions:
         verdict = q.get("verdict") or "could_not_answer"
         if verdict in stats:

@@ -102,7 +102,7 @@ function InterviewDetailModal({ detail, onClose }) {
                 <td>${escapeHtml(q?.question || "—")}</td>
                 <td>${escapeHtml(q?.answer || "—")}</td>
                 <td>${escapeHtml(verdictLabel(q?.verdict))}</td>
-                <td>${q?.pointsEarned != null && q?.pointsMax != null ? `${q.pointsEarned}/${q.pointsMax}` : "—"}</td>
+                <td>${escapeHtml(formatScore(q?.score))}</td>
               </tr>
             `,
           )
@@ -168,7 +168,7 @@ function InterviewDetailModal({ detail, onClose }) {
           <th>Question</th>
           <th>Answer</th>
           <th>Verdict</th>
-          <th>Points</th>
+          <th>Score</th>
         </tr>
       </thead>
       <tbody>
@@ -338,6 +338,10 @@ function InterviewDetailModal({ detail, onClose }) {
                       <span style={{ ...styles.statNum, color: "#a16207" }}>{ev.questionStats.partially_correct ?? 0}</span>
                     </div>
                     <div style={styles.statPair}>
+                      <span style={styles.statKey}>Weak</span>
+                      <span style={{ ...styles.statNum, color: "#b45309" }}>{ev.questionStats.weak ?? 0}</span>
+                    </div>
+                    <div style={styles.statPair}>
                       <span style={styles.statKey}>Incorrect</span>
                       <span style={{ ...styles.statNum, color: "#b91c1c" }}>{ev.questionStats.incorrect ?? 0}</span>
                     </div>
@@ -388,7 +392,8 @@ function InterviewDetailModal({ detail, onClose }) {
                       <th style={styles.qTh}>Question</th>
                       <th style={styles.qTh}>Answer</th>
                       <th style={styles.qTh}>Verdict</th>
-                      <th style={styles.qTh}>Pts</th>
+                      <th style={styles.qTh}>Score</th>
+                      <th style={styles.qTh}>Breakdown</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -396,14 +401,16 @@ function InterviewDetailModal({ detail, onClose }) {
                       <tr key={`${idx}-${q.question?.slice(0, 12)}`}>
                         <td style={styles.qTd}>{idx + 1}</td>
                         <td style={styles.qTd}>{q.question || "—"}</td>
-                        <td style={styles.qTd}>{q.answer || "—"}</td>
+                        <td style={styles.qTd}>
+                          <div>{q.answer || "—"}</div>
+                          {q.rationale ? <RationaleToggle text={q.rationale} /> : null}
+                        </td>
                         <td style={styles.qTd}>
                           <VerdictBadge verdict={q.verdict} />
                         </td>
+                        <td style={styles.qTd}>{formatScore(q?.score)}</td>
                         <td style={styles.qTd}>
-                          {q.pointsEarned != null && q.pointsMax != null
-                            ? `${q.pointsEarned} / ${q.pointsMax}`
-                            : "—"}
+                          <BreakdownCell question={q} />
                         </td>
                       </tr>
                     ))}
@@ -490,23 +497,76 @@ function VerdictBadge({ verdict }) {
   const v = (verdict || "").toLowerCase();
   let bg = "#f1f5f9";
   let color = "#334155";
+  let dot = "#94a3b8";
   if (v === "correct") {
     bg = "#dcfce7";
     color = "#166534";
+    dot = "#16a34a";
   } else if (v === "partially_correct") {
     bg = "#fef9c3";
     color = "#854d0e";
+    dot = "#ca8a04";
+  } else if (v === "weak") {
+    bg = "#ffedd5";
+    color = "#9a3412";
+    dot = "#f59e0b";
   } else if (v === "incorrect") {
     bg = "#fee2e2";
     color = "#991b1b";
+    dot = "#dc2626";
   } else if (v === "could_not_answer") {
     bg = "#f1f5f9";
     color = "#64748b";
+    dot = "#94a3b8";
   }
   return (
     <span style={{ ...styles.verdictBadge, background: bg, color }}>
+      <span style={{ ...styles.verdictDot, background: dot }} />
       {label}
     </span>
+  );
+}
+
+function formatScore(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return "—";
+  return Number.isInteger(n) ? String(n) : n.toFixed(1);
+}
+
+function hasAxisScores(q) {
+  return (
+    q != null
+    && Number.isFinite(Number(q.accuracy))
+    && Number.isFinite(Number(q.depth))
+    && Number.isFinite(Number(q.practical))
+  );
+}
+
+function BreakdownCell({ question }) {
+  if (!hasAxisScores(question)) return "—";
+  return (
+    <span style={styles.breakdown}>
+      <span>A:{question.accuracy}</span>
+      <span>D:{question.depth}</span>
+      <span>P:{question.practical}</span>
+    </span>
+  );
+}
+
+function RationaleToggle({ text }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={styles.rationaleWrap}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        style={styles.rationaleToggle}
+        aria-expanded={open}
+      >
+        {open ? "▾" : "▸"} Rationale
+      </button>
+      {open ? <div style={styles.rationaleText}>{text}</div> : null}
+    </div>
   );
 }
 
@@ -514,6 +574,7 @@ function verdictLabel(v) {
   const m = {
     correct: "Correct",
     partially_correct: "Partial",
+    weak: "Weak",
     incorrect: "Incorrect",
     could_not_answer: "No answer",
   };
@@ -892,7 +953,44 @@ const styles = {
     fontWeight: 600,
     padding: "3px 8px",
     borderRadius: 6,
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 5,
+    whiteSpace: "nowrap",
+  },
+  verdictDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 999,
     display: "inline-block",
+  },
+  breakdown: {
+    display: "inline-flex",
+    gap: 8,
+    fontFamily:
+      "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace",
+    fontSize: "0.78rem",
+    color: "#64748b",
+  },
+  rationaleWrap: {
+    marginTop: 6,
+  },
+  rationaleToggle: {
+    background: "transparent",
+    border: "none",
+    padding: 0,
+    color: "#475569",
+    fontSize: "0.78rem",
+    fontWeight: 600,
+    cursor: "pointer",
+  },
+  rationaleText: {
+    marginTop: 4,
+    marginLeft: 14,
+    color: "#475569",
+    fontStyle: "italic",
+    fontSize: "0.82rem",
+    lineHeight: 1.45,
   },
   pre: {
     background: "#0f172a",

@@ -72,6 +72,7 @@ def _basic_signals_from_stats(stats: dict[str, Any]) -> tuple[list[str], list[st
 
     correct = int(stats.get("correct") or 0)
     partial = int(stats.get("partially_correct") or 0)
+    weak = int(stats.get("weak") or 0)
     incorrect = int(stats.get("incorrect") or 0)
     no_answer = int(stats.get("could_not_answer") or 0)
 
@@ -80,8 +81,10 @@ def _basic_signals_from_stats(stats: dict[str, Any]) -> tuple[list[str], list[st
         strengths.append("Solid accuracy on multiple interview questions.")
     elif (correct + partial) >= half:
         strengths.append("Showed partial understanding on several questions.")
-    if (incorrect + no_answer) > n // 2:
-        gaps.append("Several questions were missed, incorrect, or unanswered.")
+    if weak > 0:
+        gaps.append("Some answers showed awareness but were substantially incomplete.")
+    if (weak + incorrect + no_answer) > n // 2:
+        gaps.append("Several questions were weak, incorrect, or unanswered.")
 
     return strengths, gaps
 
