@@ -17,6 +17,7 @@ Section ordering inside :func:`build_prompt`:
 6. (Optional) Must-ask topics — policy + data
 7. (Optional) Skill plan — weightage policy [+ difficulty policy] + data
 8. (Optional) Prepared questions per skill — policy + data
+9. (Optional) Dynamic execution plan — merged timing + pacing rules
 
 If a section's payload is empty we skip *both* its policy and its data so
 the LLM never reads rules about something it does not have.
@@ -43,15 +44,16 @@ Core behavior (always follow):
 - Close politely when the session ends, the candidate leaves, or time is nearly over.
 
 Opening protocol:
-- First turn: short greeting + a single readiness check (e.g. "Are you ready to begin?").
-- Only after the candidate confirms (yes / ready), start the interview questions. If they aren't ready, acknowledge briefly and give them time.
+- First turn: short greeting + a single readiness check (e.g. "Are you ready to begin interview?").
+- Only after the candidate confirms (yes / ready), start the interview with a brief candidate introduction. If they aren't ready, acknowledge briefly and give them time.
 
 Time and conclusion policy:
+- Use the provided interview duration carefully and stay on schedule.
+- Do not conclude before the interview plan is completed, unless the candidate explicitly asks to stop/leave or the interview must end for repeated non-response.
 - You MUST conclude within the provided interview duration.
 - Keep a small final wrap-up window for: final candidate comments/questions + polite closing.
-- If the candidate is consistently non-responsive, off-topic, or repeatedly gives incorrect/very weak answers, conclude early in a professional way.
-- If performance is weak for 2-3 answers in one skill, shift to another skill/topic instead of over-focusing on one weak area.
-- If multiple skills are also weak, finish early with a polite close: ask if the candidate has questions, respond briefly, then end.
+- If the candidate is repeatedly weak or non-responsive on one skill, do not over-focus there; move forward through the remaining skills first.
+- Accuracy alone should not make you skip the planned interview flow; keep progressing unless an early-stop condition applies.
 
 Language: conduct the interview primarily in the Primary language. If the candidate switches language, respond within Supported languages when reasonable.
 """.strip()
@@ -139,6 +141,7 @@ def build_difficulty_policy(years_experience) -> str:
 QUESTION_SOURCE_POLICY = """
 Question-source policy (per-skill prepared questions):
 - The "Prepared questions per skill" section is the backbone — ask its questions in the listed order, grouped by skill.
+- Every prepared question in every listed skill must be asked before wrap-up, regardless of whether the candidate answers correctly, incorrectly, or only partially.
 - For each skill group, honour its flags:
     * ask_follow_ups=true  → you MAY ask 1-2 brief follow-ups per prepared question to probe depth.
     * ask_follow_ups=false → ask the prepared question as written and move on (no follow-ups).
@@ -170,6 +173,38 @@ def _format_weight(weight: float | None) -> str:
     if not isinstance(weight, float):
         return "unspecified"
     return f"{weight:.0f}%" if weight.is_integer() else f"{weight:.2f}%"
+
+
+def _format_minutes(minutes: float) -> str:
+    if abs(minutes - round(minutes)) < 1e-9:
+        return f"{int(round(minutes))} min"
+    return f"{minutes:.1f} min"
+
+
+def _parse_weight(raw) -> float | None:
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            return float(raw.strip().replace("%", ""))
+        except ValueError:
+            return None
+    return None
+
+
+def _default_wrap_up_minutes(duration_minutes: int) -> float:
+    if duration_minutes <= 10:
+        return 1.0
+    if duration_minutes <= 20:
+        return 2.0
+    return min(5.0, max(3.0, round(duration_minutes * 0.1)))
+
+
+def _effective_skill_difficulty(spec: dict, years_experience) -> str | None:
+    difficulty = spec.get("difficulty")
+    if difficulty:
+        return difficulty
+    return default_difficulty_for_experience(years_experience)
 
 
 def _candidate_lines(candidate: dict) -> list[str]:
@@ -255,8 +290,177 @@ def _skill_plan_lines(skill_specs: list[dict]) -> list[str]:
     lines.append(
         "Rule: prioritize questions by skill weightage and topic importance; "
         "respect each skill's difficulty + skill instructions; "
-        "if any skill shows 2-3 below-average answers, shift to next skill."
+        "if any skill shows 3-4 below-average answers, shift to next skill."
     )
+    return lines
+
+
+def _build_execution_plan(
+    skill_specs: list[dict],
+    question_groups: list[dict],
+    duration_minutes: int,
+    years_experience,
+) -> list[dict]:
+    """Merge skills + prepared-question groups into one execution plan."""
+    spec_by_skill = {spec["skill"].lower(): spec for spec in skill_specs}
+    plan: list[dict] = []
+    seen: set[str] = set()
+
+    for group in question_groups:
+        key = group["skill"].lower()
+        seen.add(key)
+        spec = spec_by_skill.get(key) or {}
+        weight = group.get("weightage")
+        if not isinstance(weight, float):
+            weight = spec.get("weightage")
+        plan.append({
+            "skill": group["skill"],
+            "topics": list(spec.get("topics") or []),
+            "weightage": weight if isinstance(weight, float) else None,
+            "difficulty": _effective_skill_difficulty(spec, years_experience),
+            "instructions": spec.get("instructions") or "",
+            "prepared_questions": list(group.get("questions") or []),
+            "ask_follow_ups": bool(group.get("ask_follow_ups")),
+            "allow_additional": bool(group.get("allow_additional")),
+        })
+
+    for spec in skill_specs:
+        key = spec["skill"].lower()
+        if key in seen:
+            continue
+        plan.append({
+            "skill": spec["skill"],
+            "topics": list(spec.get("topics") or []),
+            "weightage": spec.get("weightage") if isinstance(spec.get("weightage"), float) else None,
+            "difficulty": _effective_skill_difficulty(spec, years_experience),
+            "instructions": spec.get("instructions") or "",
+            "prepared_questions": [],
+            "ask_follow_ups": None,
+            "allow_additional": None,
+        })
+
+    if not plan:
+        return []
+
+    weighted_items = [
+        item for item in plan if isinstance(item.get("weightage"), float) and item["weightage"] > 0
+    ]
+    unweighted_items = [item for item in plan if item not in weighted_items]
+    if weighted_items:
+        total = sum(item["weightage"] for item in weighted_items)
+        if total > 0:
+            if unweighted_items and total < 100:
+                remaining_share = max(0.0, 100.0 - total) / 100.0
+                per_unweighted_share = remaining_share / len(unweighted_items)
+                for item in plan:
+                    if item in weighted_items:
+                        item["_share"] = item["weightage"] / 100.0
+                    else:
+                        item["_share"] = per_unweighted_share
+            else:
+                for item in plan:
+                    if item in weighted_items:
+                        item["_share"] = item["weightage"] / total
+                    else:
+                        item["_share"] = 0.0
+    else:
+        equal_share = 1.0 / len(plan)
+        for item in plan:
+            item["_share"] = equal_share
+
+    wrap_up_minutes = _default_wrap_up_minutes(duration_minutes)
+    questioning_minutes = max(1.0, float(duration_minutes) - wrap_up_minutes)
+    for item in plan:
+        item["allocated_minutes"] = questioning_minutes * item["_share"]
+    return plan
+
+
+def _execution_plan_lines(
+    skill_specs: list[dict],
+    question_groups: list[dict],
+    duration_minutes: int,
+    years_experience,
+) -> list[str]:
+    """Render dynamic skill execution rules + per-skill time allocation."""
+    plan = _build_execution_plan(
+        skill_specs,
+        question_groups,
+        duration_minutes,
+        years_experience,
+    )
+    if not plan:
+        return []
+
+    wrap_up_minutes = _default_wrap_up_minutes(duration_minutes)
+    lines = ["Dynamic interview execution plan:"]
+    lines.append(
+        f"- Reserve about {_format_minutes(wrap_up_minutes)} at the end for candidate questions and a polite closing."
+    )
+    lines.append(
+        "- Keep the greeting/readiness check brief; the main interview flow starts only after the candidate confirms they are ready."
+    )
+
+    if question_groups:
+        lines.extend([
+            "- Prepared questions are mandatory: finish every listed prepared question across all skills before final wrap-up.",
+            "- Do not skip or finalize early just because an answer is correct, incorrect, weak, or partial.",
+            "- If both prepared questions and topic-based skills are supplied, finish the prepared question flow first; then use any remaining time for uncovered skill topics before wrap-up.",
+            "- For one skill, if the candidate is non-responsive for 4-5 consecutive questions, stop spending more time on that skill and move to the next skill.",
+            "- End the interview early only if the candidate explicitly wants to stop/leave, disconnects, or shows the same repeated non-response pattern across the remaining skills as well.",
+        ])
+    else:
+        lines.extend([
+            "- No prepared question list is supplied, so generate questions from the skill plan, topics, role, JD, and candidate experience.",
+            "- Cover all listed skills before wrap-up and try to use the full interview duration when the candidate keeps responding.",
+            "- If a skill has no topics, infer suitable subtopics from the role, JD, candidate background, and the skill itself.",
+        ])
+
+    lines.append("- Skill-by-skill pacing and execution:")
+    for i, item in enumerate(plan, start=1):
+        details = [f"Skill: {item['skill']}"]
+        weight = item.get("weightage")
+        if isinstance(weight, float) and weight > 0:
+            details.append(f"weightage={_format_weight(weight)}")
+        else:
+            details.append("weightage=balanced share")
+        details.append(f"time={_format_minutes(item['allocated_minutes'])}")
+        if item.get("difficulty"):
+            details.append(f"difficulty={item['difficulty']}")
+        if item["prepared_questions"]:
+            details.append(f"prepared_questions={len(item['prepared_questions'])}")
+        lines.append(f"  {i}. " + " | ".join(details))
+
+        if item["topics"]:
+            lines.append("     Topics: " + ", ".join(item["topics"]))
+        elif not item["prepared_questions"]:
+            lines.append(
+                "     Topics: not provided; infer relevant subtopics from experience/JD for this skill."
+            )
+
+        instructions = item.get("instructions") or ""
+        if instructions:
+            lines.append(f"     Skill instructions: {instructions}")
+
+        if item["prepared_questions"]:
+            ask_follow_ups = item["ask_follow_ups"]
+            allow_additional = item["allow_additional"]
+            lines.append(
+                "     Prepared-question rule: "
+                + ("ask brief follow-ups when useful." if ask_follow_ups else "do not ask follow-ups; move to the next prepared question.")
+            )
+            if allow_additional:
+                lines.append(
+                    "     Additional-question rule: after the prepared list is complete, you may use leftover time in this skill for extra questions on the same skill."
+                )
+            else:
+                lines.append(
+                    "     Additional-question rule: once the prepared list is complete, move directly to the next skill."
+                )
+        else:
+            lines.append(
+                "     Question-generation rule: create questions that match this skill's weightage, difficulty, topics, and skill instructions."
+            )
+
     return lines
 
 
@@ -273,7 +477,8 @@ def _normalize_question_groups(raw: list) -> list[dict]:
     - ``list[str | dict]`` — strings collected into ``"General"`` group;
       dict entries kept (with field defaults applied).
 
-    Returns a list of ``{skill, questions, ask_follow_ups, allow_additional}``.
+    Returns a list of
+    ``{skill, questions, ask_follow_ups, allow_additional, weightage}``.
     Empty groups (no questions after trimming) are dropped.
     """
     if not isinstance(raw, list) or not raw:
@@ -310,12 +515,16 @@ def _normalize_question_groups(raw: list) -> list[dict]:
         allow_additional = item.get("allowAdditional")
         if not isinstance(allow_additional, bool):
             allow_additional = False
+        weightage = _parse_weight(item.get("weightage"))
+        if weightage is not None:
+            weightage = max(0.0, min(100.0, weightage))
 
         groups.append({
             "skill": skill,
             "questions": questions,
             "ask_follow_ups": ask_follow_ups,
             "allow_additional": allow_additional,
+            "weightage": weightage,
         })
 
     if general:
@@ -324,6 +533,7 @@ def _normalize_question_groups(raw: list) -> list[dict]:
             "questions": general,
             "ask_follow_ups": True,
             "allow_additional": False,
+            "weightage": None,
         })
 
     return groups
@@ -340,6 +550,11 @@ def _question_lines(question_groups: list[dict]) -> list[str]:
             f"Skill: {group['skill']} "
             f"| ask_follow_ups={'true' if ask_follow_ups else 'false'} "
             f"| allow_additional={'true' if allow_additional else 'false'}"
+            + (
+                f" | weightage={_format_weight(group['weightage'])}"
+                if isinstance(group.get("weightage"), float)
+                else ""
+            )
         )
         for i, q in enumerate(group["questions"], start=1):
             lines.append(f"  {i}. {q}")
@@ -491,6 +706,16 @@ def build_prompt(meta: dict) -> str:
     if question_groups:
         _append_block(lines, [QUESTION_SOURCE_POLICY])
         _append_block(lines, _question_lines(question_groups))
+
+    # 9. Dynamic execution plan (merged across skills and/or prepared questions)
+    execution_lines = _execution_plan_lines(
+        skill_specs,
+        question_groups,
+        duration_minutes,
+        candidate.get("yearsExperience"),
+    )
+    if execution_lines:
+        _append_block(lines, execution_lines)
 
     return "\n".join(lines).rstrip() + "\n"
 
