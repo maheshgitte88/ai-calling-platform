@@ -13,7 +13,9 @@ from typing import Any
 from uuid import uuid4
 
 from livekit.agents import AgentSession, JobContext, room_io
-from livekit.agents.voice import Agent
+from livekit.agents.llm import ToolError, function_tool
+from livekit.agents.llm.tool_context import ToolFlag
+from livekit.agents.voice import Agent, RunContext
 
 from providers.llm import get_llm
 from providers.stt import get_stt
@@ -23,6 +25,7 @@ from .avatar import maybe_attach_avatar
 from .config import Settings, settings as default_settings
 from .db import get_db
 from .evaluation import generate_structured_evaluation
+from .interview_progress import InterviewProgressTracker
 from .metadata import InterviewDurations, compute_durations, parse_metadata
 from .prompt import build_prompt
 from .provider_resolver import resolve_provider_cfg
@@ -87,6 +90,101 @@ def _basic_signals_from_stats(stats: dict[str, Any]) -> tuple[list[str], list[st
         gaps.append("Several questions were weak, incorrect, or unanswered.")
 
     return strengths, gaps
+
+
+class InterviewAgent(Agent):
+    """Interview agent with structured progress-reporting tools."""
+
+    def __init__(
+        self,
+        *,
+        instructions: str,
+        stt: Any,
+        llm: Any,
+        tts: Any,
+        progress_tracker: InterviewProgressTracker,
+    ) -> None:
+        super().__init__(instructions=instructions, stt=stt, llm=llm, tts=tts)
+        self._progress_tracker = progress_tracker
+
+    @function_tool(flags=ToolFlag.IGNORE_ON_ENTER)
+    async def mark_question_asked(
+        self,
+        context: RunContext,
+        skill: str,
+        question_number: int,
+    ) -> str:
+        """Record that you have just asked one required prepared question.
+
+        Args:
+            skill: Exact skill name from the prepared-question section.
+            question_number: 1-based question number inside that skill's prepared list.
+        """
+        del context
+        update = self._progress_tracker.mark_question_asked(skill, question_number)
+        if not update.accepted:
+            raise ToolError(update.message)
+        return update.message
+
+    @function_tool(flags=ToolFlag.IGNORE_ON_ENTER)
+    async def mark_skill_completed(self, context: RunContext, skill: str) -> str:
+        """Record that you have finished covering one required skill with no prepared question list.
+
+        Args:
+            skill: Exact skill name from the skill plan.
+        """
+        del context
+        update = self._progress_tracker.mark_skill_completed(skill)
+        if not update.accepted:
+            raise ToolError(update.message)
+        return update.message
+
+    @function_tool(flags=ToolFlag.IGNORE_ON_ENTER)
+    async def mark_interview_plan_completed(self, context: RunContext) -> str:
+        """Validate whether all required interview items are complete and wrap-up should begin now."""
+        del context
+        update = self._progress_tracker.confirm_plan_completed()
+        if not update.accepted:
+            raise ToolError(update.message)
+        return update.message
+
+
+async def _wait_for_drive_outcome(
+    *,
+    tracker: "CandidateRoomTracker",
+    plan_completed: asyncio.Event,
+    drive_seconds: int,
+) -> str:
+    """Wait for the first interview-ending condition.
+
+    Returns one of: ``candidate_disconnected``, ``plan_completed``, ``timeout``.
+    """
+    disconnect_task = asyncio.create_task(tracker.disconnected.wait())
+    plan_completed_task = asyncio.create_task(plan_completed.wait())
+    timeout_task = asyncio.create_task(asyncio.sleep(drive_seconds))
+
+    try:
+        done, pending = await asyncio.wait(
+            {disconnect_task, plan_completed_task, timeout_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for task in (disconnect_task, plan_completed_task, timeout_task):
+            if task.done():
+                continue
+            task.cancel()
+        await asyncio.gather(
+            disconnect_task,
+            plan_completed_task,
+            timeout_task,
+            return_exceptions=True,
+        )
+
+    if tracker.disconnected.is_set():
+        return "candidate_disconnected"
+    if plan_completed.is_set() and plan_completed_task in done:
+        return "plan_completed"
+    return "timeout"
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +300,7 @@ async def _drive_interview(
     *,
     session: AgentSession,
     tracker: CandidateRoomTracker,
+    plan_completed: asyncio.Event,
     durations: InterviewDurations,
     has_prepared: bool,
     db: Any,
@@ -222,9 +321,14 @@ async def _drive_interview(
 
     await session.generate_reply(instructions=_initial_reply_instructions(has_prepared))
 
-    try:
-        await asyncio.wait_for(tracker.disconnected.wait(), timeout=durations.drive_seconds)
-    except asyncio.TimeoutError:
+    outcome = await _wait_for_drive_outcome(
+        tracker=tracker,
+        plan_completed=plan_completed,
+        drive_seconds=durations.drive_seconds,
+    )
+    if outcome in ("timeout", "plan_completed"):
+        if outcome == "plan_completed":
+            logger.info("[Interview] Interview plan completed early; starting wrap-up.")
         await session.generate_reply(instructions=WRAP_UP_INSTRUCTIONS)
         try:
             await asyncio.wait_for(
@@ -253,6 +357,7 @@ async def run_interview(
     interview_meta = meta.get("interviewMeta") or {}
     durations = compute_durations(interview_meta)
     has_prepared = bool(interview_meta.get("questions"))
+    progress_tracker = InterviewProgressTracker(interview_meta)
 
     prompt = build_prompt(meta)
     provider_cfg = resolve_provider_cfg(meta, cfg)
@@ -291,7 +396,16 @@ async def run_interview(
 
     await ctx.connect()
     session = AgentSession()
-    agent = Agent(instructions=prompt, stt=stt, llm=llm, tts=tts)
+    if progress_tracker.has_plan:
+        agent = InterviewAgent(
+            instructions=prompt,
+            stt=stt,
+            llm=llm,
+            tts=tts,
+            progress_tracker=progress_tracker,
+        )
+    else:
+        agent = Agent(instructions=prompt, stt=stt, llm=llm, tts=tts)
     transcript.attach(session)
 
     room_options = room_io.RoomOptions(video_input=True)
@@ -313,6 +427,7 @@ async def run_interview(
         await _drive_interview(
             session=session,
             tracker=tracker,
+            plan_completed=progress_tracker.plan_completed,
             durations=durations,
             has_prepared=has_prepared,
             db=db,

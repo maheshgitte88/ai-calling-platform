@@ -17,7 +17,8 @@ Section ordering inside :func:`build_prompt`:
 6. (Optional) Must-ask topics — policy + data
 7. (Optional) Skill plan — weightage policy [+ difficulty policy] + data
 8. (Optional) Prepared questions per skill — policy + data
-9. (Optional) Dynamic execution plan — merged timing + pacing rules
+9. (Optional) Progress tracking tools — runtime completion signaling
+10. (Optional) Dynamic execution plan — merged timing + pacing rules
 
 If a section's payload is empty we skip *both* its policy and its data so
 the LLM never reads rules about something it does not have.
@@ -148,6 +149,13 @@ Question-source policy (per-skill prepared questions):
     * allow_additional=true  → after finishing the prepared list for that skill you MAY ask extra questions on the same skill if time permits.
     * allow_additional=false → do NOT add new questions on that skill once the prepared list is finished; move on.
 - If a skill in the plan has no prepared questions here, generate technical/scenario-based questions aligned to JD, role, and the skill's topics.
+""".strip()
+
+PROGRESS_TRACKING_POLICY = """
+Progress tracking tools policy:
+- Use the progress tools only after the corresponding question or skill has actually been covered in the live interview.
+- These tools are for tracking completion of the required interview plan so the runtime can start wrap-up immediately once all required items are done.
+- Never call a progress tool pre-emptively or for optional extra questions.
 """.strip()
 
 
@@ -464,6 +472,29 @@ def _execution_plan_lines(
     return lines
 
 
+def _progress_tracking_lines(skill_specs: list[dict], question_groups: list[dict]) -> list[str]:
+    """Render runtime progress-tool instructions when a structured plan exists."""
+    if not skill_specs and not question_groups:
+        return []
+
+    lines = [PROGRESS_TRACKING_POLICY]
+
+    if question_groups:
+        lines.append(
+            "- Immediately after you ask each required prepared question, call `mark_question_asked` with the exact skill name and the 1-based question number shown in the prepared-question list."
+        )
+    if skill_specs:
+        lines.append(
+            "- For any required skill that does not have a prepared question list, call `mark_skill_completed` only after you have covered that skill and are ready to move on."
+        )
+
+    lines.extend([
+        "- When you believe all required interview items are finished, call `mark_interview_plan_completed` to verify completion.",
+        "- If `mark_interview_plan_completed` confirms success, immediately ask whether the candidate has any final questions, respond briefly, and conclude the interview.",
+    ])
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Prepared questions (per-skill groups, with legacy fallback)
 # ---------------------------------------------------------------------------
@@ -707,7 +738,12 @@ def build_prompt(meta: dict) -> str:
         _append_block(lines, [QUESTION_SOURCE_POLICY])
         _append_block(lines, _question_lines(question_groups))
 
-    # 9. Dynamic execution plan (merged across skills and/or prepared questions)
+    # 9. Progress tracking tools (only when a structured plan exists) ----------
+    progress_lines = _progress_tracking_lines(skill_specs, question_groups)
+    if progress_lines:
+        _append_block(lines, progress_lines)
+
+    # 10. Dynamic execution plan (merged across skills and/or prepared questions)
     execution_lines = _execution_plan_lines(
         skill_specs,
         question_groups,
