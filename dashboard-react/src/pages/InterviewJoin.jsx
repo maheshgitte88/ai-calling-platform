@@ -29,11 +29,25 @@ import { api } from "../services/api";
 import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
 import AIVoiceBoatIndicator from "../components/AIVoiceBoatIndicator";
 
-const SESSION_POLL_INTERVAL_MS = 60000;
+const SESSION_POLL_INTERVAL_MS = 5000;
+const WRAP_UP_POLL_INTERVAL_MS = 1000;
 const PROCTOR_INTERVAL_MS = 30_000;
 const PROCTOR_JPEG_WIDTH = 640;
 const PROCTOR_JPEG_QUALITY = 0.7;
 const PROCTOR_UPLOAD_TIMEOUT_MS = 10_000;
+
+function parseIsoMs(value) {
+  if (!value) return 0;
+  const ts = Date.parse(value);
+  return Number.isFinite(ts) ? ts : 0;
+}
+
+function formatCountdown(ms) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
 
 function useJoinToken() {
   return useMemo(() => {
@@ -88,12 +102,13 @@ function mapResolveError(err) {
 
 export default function InterviewJoin() {
   const joinToken = useJoinToken();
-  /** resolve_loading | error | room_connecting | live | completed */
+  /** resolve_loading | error | room_connecting | live | wrap_up | completed */
   const [phase, setPhase] = useState(() => (joinToken ? "resolve_loading" : "error"));
   const [resolved, setResolved] = useState(null);
   const [errorInfo, setErrorInfo] = useState(() =>
     joinToken ? null : mapResolveError(new Error("Missing interview link token."))
   );
+  const [sessionInfo, setSessionInfo] = useState(null);
   const [completion, setCompletion] = useState(null);
   const [leaving, setLeaving] = useState(false);
   const pollRef = useRef(null);
@@ -113,6 +128,8 @@ export default function InterviewJoin() {
     }
     setPhase("resolve_loading");
     setErrorInfo(null);
+    setSessionInfo(null);
+    setCompletion(null);
     try {
       const resp = await api.resolveInterviewSession({ joinToken });
       setResolved(resp);
@@ -128,27 +145,42 @@ export default function InterviewJoin() {
   }, [runResolve]);
 
   useEffect(() => {
-    if (phase !== "live" || !resolved?.sessionId) {
+    if (!resolved?.sessionId || !["room_connecting", "live", "wrap_up"].includes(phase)) {
       clearPoll();
       return undefined;
     }
     const tick = async () => {
       if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      let session = null;
       try {
         const data = await api.getInterviewSession(resolved.sessionId);
-        const st = data?.session?.status;
+        session = data?.session || null;
+        const st = session?.status;
         const hasEval = Boolean(data?.evaluation);
+        setSessionInfo(session);
         if (st === "completed" || st === "ended" || hasEval) {
           clearPoll();
           setCompletion(data);
           setPhase("completed");
+          return;
         }
+        if (st === "wrap_up") {
+          setPhase("wrap_up");
+          return;
+        }
+        setPhase((curr) => (curr === "room_connecting" ? curr : "live"));
       } catch {
         /* ignore transient poll errors */
+      } finally {
+        clearPoll();
+        const nextInterval =
+          session?.status === "wrap_up" || phase === "wrap_up"
+            ? WRAP_UP_POLL_INTERVAL_MS
+            : SESSION_POLL_INTERVAL_MS;
+        pollRef.current = setTimeout(tick, nextInterval);
       }
     };
     tick();
-    pollRef.current = setInterval(tick, SESSION_POLL_INTERVAL_MS);
     const onVisibilityChange = () => {
       if (document.visibilityState === "visible") tick();
     };
@@ -157,7 +189,7 @@ export default function InterviewJoin() {
       document.removeEventListener("visibilitychange", onVisibilityChange);
       clearPoll();
     };
-  }, [phase, resolved?.sessionId]);
+  }, [phase, resolved?.sessionId, sessionInfo?.status]);
 
   const handleRoomConnected = useCallback(() => {
     setPhase("live");
@@ -267,7 +299,7 @@ export default function InterviewJoin() {
         <CompletionScreen completion={completion} participantName={resolved?.participantName} />
       )}
 
-      {(phase === "room_connecting" || phase === "live") && resolved && (
+      {(phase === "room_connecting" || phase === "live" || phase === "wrap_up") && resolved && (
         <div style={styles.shell}>
           <div style={styles.roomWrap}>
             <LiveKitRoom
@@ -285,9 +317,14 @@ export default function InterviewJoin() {
               <div style={styles.roomColumn}>
                 <InterviewJoinToolbar
                   participantName={resolved.participantName}
+                  phase={phase}
                   onLeave={handleLeaveInterview}
                   leaving={leaving}
                 />
+                <CandidateConnectionReporter sessionId={resolved.sessionId} />
+                {phase === "wrap_up" && (
+                  <WrapUpBanner sessionInfo={sessionInfo} />
+                )}
                 {phase === "room_connecting" && <ConnectingOverlay />}
                 <div style={styles.stageStretch}>
                   <InterviewTwoUpStage
@@ -302,9 +339,11 @@ export default function InterviewJoin() {
             </LiveKitRoom>
           </div>
 
-          {phase === "live" && (
+          {(phase === "live" || phase === "wrap_up") && (
             <p style={styles.hint}>
-              When the AI interviewer finishes, this screen will switch to your summary automatically.
+              {phase === "wrap_up"
+                ? "Final wrap-up is active. The room will close automatically when the countdown ends."
+                : "When the AI interviewer finishes, this screen will switch to your summary automatically."}
             </p>
           )}
         </div>
@@ -344,7 +383,7 @@ function connectionStatusUi(state) {
   }
 }
 
-function InterviewJoinToolbar({ participantName, onLeave, leaving }) {
+function InterviewJoinToolbar({ participantName, phase, onLeave, leaving }) {
   const conn = useConnectionState();
   const ui = connectionStatusUi(conn);
   const displayName = (participantName && String(participantName).trim()) || "You";
@@ -352,8 +391,8 @@ function InterviewJoinToolbar({ participantName, onLeave, leaving }) {
     <header className="ij-interview-toolbar" style={styles.toolbar}>
       <span className="ij-toolbar-badge" style={styles.toolbarBadge}>
         <Video size={14} strokeWidth={2} aria-hidden />
-        <span className="ij-toolbar-live-long">Live interview</span>
-        <span className="ij-toolbar-live-short">Live</span>
+        <span className="ij-toolbar-live-long">{phase === "wrap_up" ? "Final wrap-up" : "Live interview"}</span>
+        <span className="ij-toolbar-live-short">{phase === "wrap_up" ? "Wrap-up" : "Live"}</span>
       </span>
       <div style={styles.toolbarCenter}>
         <span style={styles.toolbarName} title={displayName}>
@@ -376,6 +415,86 @@ function InterviewJoinToolbar({ participantName, onLeave, leaving }) {
         <span className="ij-toolbar-leave-text-short">{leaving ? "…" : "Leave"}</span>
       </button>
     </header>
+  );
+}
+
+function CandidateConnectionReporter({ sessionId }) {
+  const conn = useConnectionState();
+  const prevRef = useRef(null);
+  const hasInitialConnectRef = useRef(false);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    const prev = prevRef.current;
+    const isConnected = conn === ConnectionState.Connected;
+    const isDisconnectedLike =
+      conn === ConnectionState.Reconnecting
+      || conn === ConnectionState.SignalReconnecting
+      || conn === ConnectionState.Disconnected;
+
+    if (isConnected && !hasInitialConnectRef.current) {
+      hasInitialConnectRef.current = true;
+      prevRef.current = conn;
+      return;
+    }
+
+    let type = "";
+    if (prev === ConnectionState.Connected && isDisconnectedLike) {
+      type = "candidate_disconnected";
+    } else if (prev && prev !== ConnectionState.Connected && isConnected) {
+      type = "candidate_reconnected";
+    }
+    prevRef.current = conn;
+    if (!type) return;
+    api.addInterviewSessionEvent(sessionId, {
+      type,
+      payload: { at: new Date().toISOString(), source: "interview_join_connection_state" },
+    }).catch(() => {
+      /* best effort only */
+    });
+  }, [conn, sessionId]);
+
+  return null;
+}
+
+function WrapUpBanner({ sessionInfo }) {
+  const connectionState = useConnectionState();
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const wrapUpEndsMs = useMemo(() => parseIsoMs(sessionInfo?.wrap_up_ends_at), [sessionInfo?.wrap_up_ends_at]);
+  const reconnectGraceMs = useMemo(
+    () => parseIsoMs(sessionInfo?.reconnect_grace_ends_at),
+    [sessionInfo?.reconnect_grace_ends_at]
+  );
+
+  useEffect(() => {
+    setNowMs(Date.now());
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const remainingWrapMs = Math.max(0, wrapUpEndsMs - nowMs);
+  const remainingReconnectMs = Math.max(0, reconnectGraceMs - nowMs);
+  const showReconnect =
+    sessionInfo?.candidate_connection_status === "disconnected"
+    || connectionState === ConnectionState.Reconnecting
+    || connectionState === ConnectionState.SignalReconnecting
+    || connectionState === ConnectionState.Disconnected;
+
+  return (
+    <div style={styles.wrapUpBanner}>
+      <div style={styles.wrapUpBannerTop}>
+        <span style={styles.wrapUpTitle}>Interview wrap-up started</span>
+        <span style={styles.wrapUpCountdown}>{formatCountdown(remainingWrapMs)}</span>
+      </div>
+      <p style={styles.wrapUpText}>
+        The main interview is complete. Use this final countdown for last questions before the room closes automatically.
+      </p>
+      {showReconnect && remainingReconnectMs > 0 && (
+        <p style={{ ...styles.wrapUpText, color: "#fde68a", marginTop: 6 }}>
+          Reconnecting now. Return before {formatCountdown(remainingReconnectMs)} to continue this wrap-up.
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -849,6 +968,47 @@ const styles = {
     zIndex: 25,
     position: "relative",
     boxSizing: "border-box",
+  },
+  wrapUpBanner: {
+    margin: "10px 10px 0",
+    padding: "12px 14px",
+    borderRadius: 12,
+    background: "rgba(124,58,237,0.16)",
+    border: "1px solid rgba(196,181,253,0.32)",
+    color: "#ede9fe",
+    boxShadow: "0 12px 30px -20px rgba(76,29,149,0.85)",
+  },
+  wrapUpBannerTop: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    marginBottom: 6,
+  },
+  wrapUpTitle: {
+    fontSize: "0.9rem",
+    fontWeight: 700,
+    color: "#f5f3ff",
+  },
+  wrapUpCountdown: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    minWidth: 62,
+    padding: "5px 10px",
+    borderRadius: 999,
+    background: "rgba(15,23,42,0.7)",
+    border: "1px solid rgba(196,181,253,0.3)",
+    color: "#fef3c7",
+    fontSize: "0.9rem",
+    fontWeight: 700,
+    letterSpacing: "0.04em",
+  },
+  wrapUpText: {
+    margin: 0,
+    color: "#ddd6fe",
+    fontSize: "0.84rem",
+    lineHeight: 1.45,
   },
   toolbarBadge: {
     display: "inline-flex",

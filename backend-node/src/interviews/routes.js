@@ -523,6 +523,16 @@ router.post(
         { session_id: req.params.sessionId, started_at: { $exists: false } },
         { $set: { started_at: nowIso(), updated_at: nowIso() } },
       );
+      await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+        { session_id: req.params.sessionId },
+        { $set: {
+          candidate_connection_status: "connected",
+          last_candidate_connected_at: nowIso(),
+          reconnect_grace_started_at: null,
+          reconnect_grace_ends_at: null,
+          updated_at: nowIso(),
+        }},
+      );
       try {
         await ensureInterviewRecordingStarted(db, session);
       } catch (recErr) {
@@ -535,6 +545,30 @@ router.post(
         );
         await markRecordingFailed(db, req.params.sessionId, recErr);
       }
+    }
+
+    if (body.type === "candidate_reconnected") {
+      await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+        { session_id: req.params.sessionId },
+        { $set: {
+          candidate_connection_status: "connected",
+          last_candidate_connected_at: nowIso(),
+          reconnect_grace_started_at: null,
+          reconnect_grace_ends_at: null,
+          updated_at: nowIso(),
+        }},
+      );
+    }
+
+    if (body.type === "candidate_disconnected") {
+      await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+        { session_id: req.params.sessionId },
+        { $set: {
+          candidate_connection_status: "disconnected",
+          last_candidate_disconnected_at: nowIso(),
+          updated_at: nowIso(),
+        }},
+      );
     }
 
     res.status(201).json({ ok: true });

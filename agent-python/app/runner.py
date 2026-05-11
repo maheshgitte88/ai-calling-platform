@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -36,12 +37,29 @@ logger = logging.getLogger(__name__)
 
 EXPECTED_MODE = "video_interview"
 CANDIDATE_JOIN_TIMEOUT_SECONDS = 10 * 60
+RECONNECT_GRACE_SECONDS = 90
 
-WRAP_UP_INSTRUCTIONS = (
-    "Begin interview wrap-up now. Ask one concise final check question only if essential, "
-    "then ask whether the candidate has any final questions. Respond briefly and conclude "
-    "politely now so the interview ends within the allotted time."
-)
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _iso_after(seconds: int) -> str:
+    return (_utc_now() + timedelta(seconds=max(0, int(seconds)))).isoformat()
+
+
+def _wrap_up_instruction_text(seconds: int) -> str:
+    if seconds >= 120 and seconds % 60 == 0:
+        minutes = seconds // 60
+        unit = "minute" if minutes == 1 else "minutes"
+        countdown = f"the final {minutes} {unit}"
+    else:
+        countdown = f"the final {max(1, int(seconds))} seconds"
+    return (
+        f"Begin interview wrap-up now. Clearly tell the candidate that {countdown} have started. "
+        "Ask one concise final check question only if essential, then ask whether the candidate "
+        "has any final questions. Respond briefly and conclude politely before the countdown ends."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +167,80 @@ class InterviewAgent(Agent):
         return update.message
 
 
+def _persist_candidate_connected(
+    db: Any,
+    session_id: str,
+    *,
+    first_join: bool = False,
+) -> None:
+    updates = {
+        "candidate_connection_status": "connected",
+        "last_candidate_connected_at": now_iso(),
+        "reconnect_grace_started_at": None,
+        "reconnect_grace_ends_at": None,
+        "updated_at": now_iso(),
+    }
+    if first_join:
+        updates["started_at"] = now_iso()
+        updates["status"] = "in_progress"
+    db.interview_sessions.update_one({"session_id": session_id}, {"$set": updates})
+
+
+def _persist_candidate_disconnected(db: Any, session_id: str, *, grace_seconds: int) -> str:
+    grace_ends_at = _iso_after(grace_seconds)
+    db.interview_sessions.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "candidate_connection_status": "disconnected",
+            "last_candidate_disconnected_at": now_iso(),
+            "reconnect_grace_started_at": now_iso(),
+            "reconnect_grace_ends_at": grace_ends_at,
+            "updated_at": now_iso(),
+        }},
+    )
+    return grace_ends_at
+
+
+def _persist_wrap_up_started(
+    db: Any,
+    session_id: str,
+    *,
+    wrap_up_seconds: int,
+    reason: str,
+) -> str:
+    wrap_up_ends_at = _iso_after(wrap_up_seconds)
+    db.interview_sessions.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "status": "wrap_up",
+            "wrap_up_started_at": now_iso(),
+            "wrap_up_ends_at": wrap_up_ends_at,
+            "wrap_up_reason": reason,
+            "updated_at": now_iso(),
+        }},
+    )
+    return wrap_up_ends_at
+
+
+def _persist_session_completed(
+    db: Any,
+    session_id: str,
+    *,
+    ended_reason: str,
+) -> None:
+    db.interview_sessions.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "status": "completed",
+            "ended_reason": ended_reason,
+            "completed_at": now_iso(),
+            "reconnect_grace_started_at": None,
+            "reconnect_grace_ends_at": None,
+            "updated_at": now_iso(),
+        }},
+    )
+
+
 async def _wait_for_drive_outcome(
     *,
     tracker: "CandidateRoomTracker",
@@ -187,6 +279,31 @@ async def _wait_for_drive_outcome(
     return "timeout"
 
 
+async def _wait_for_reconnect(
+    *,
+    tracker: "CandidateRoomTracker",
+    timeout_seconds: float,
+) -> str:
+    """Wait for the candidate to reconnect within the grace window."""
+    reconnect_task = asyncio.create_task(tracker.connected.wait())
+    timeout_task = asyncio.create_task(asyncio.sleep(max(0.0, timeout_seconds)))
+    try:
+        done, _ = await asyncio.wait(
+            {reconnect_task, timeout_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+    finally:
+        for task in (reconnect_task, timeout_task):
+            if task.done():
+                continue
+            task.cancel()
+        await asyncio.gather(reconnect_task, timeout_task, return_exceptions=True)
+
+    if tracker.connected.is_set() and reconnect_task in done:
+        return "candidate_reconnected"
+    return "timeout"
+
+
 # ---------------------------------------------------------------------------
 # Candidate presence tracking
 # ---------------------------------------------------------------------------
@@ -204,6 +321,7 @@ class CandidateRoomTracker:
         self._room = room
         self._candidate_identity = candidate_identity
         self.joined: asyncio.Event = asyncio.Event()
+        self.connected: asyncio.Event = asyncio.Event()
         self.disconnected: asyncio.Event = asyncio.Event()
 
     def attach(self) -> None:
@@ -215,6 +333,8 @@ class CandidateRoomTracker:
             identity = getattr(rp, "identity", "") or ""
             if _is_candidate(identity, self._candidate_identity):
                 self.joined.set()
+                self.connected.set()
+                self.disconnected.clear()
                 break
 
     def detach(self) -> None:
@@ -225,10 +345,13 @@ class CandidateRoomTracker:
         identity = getattr(participant, "identity", "") or ""
         if _is_candidate(identity, self._candidate_identity):
             self.joined.set()
+            self.connected.set()
+            self.disconnected.clear()
 
     def _on_disconnected(self, participant: Any) -> None:
         identity = getattr(participant, "identity", "") or ""
         if identity.startswith("candidate_"):
+            self.connected.clear()
             self.disconnected.set()
 
 
@@ -240,16 +363,22 @@ class CandidateRoomTracker:
 def _persist_session_started(db: Any, session_id: str) -> None:
     db.interview_sessions.update_one(
         {"session_id": session_id},
-        {"$set": {"status": "in_progress", "updated_at": now_iso()}},
+        {"$set": {
+            "status": "in_progress",
+            "candidate_connection_status": "waiting",
+            "wrap_up_started_at": None,
+            "wrap_up_ends_at": None,
+            "wrap_up_reason": None,
+            "reconnect_grace_started_at": None,
+            "reconnect_grace_ends_at": None,
+            "updated_at": now_iso(),
+        }},
         upsert=True,
     )
 
 
 def _persist_first_candidate_join(db: Any, session_id: str) -> None:
-    db.interview_sessions.update_one(
-        {"session_id": session_id, "started_at": {"$exists": False}},
-        {"$set": {"started_at": now_iso(), "updated_at": now_iso()}},
-    )
+    _persist_candidate_connected(db, session_id, first_join=True)
 
 
 def _persist_evaluation(
@@ -287,7 +416,11 @@ def _persist_evaluation(
     )
     db.interview_sessions.update_one(
         {"session_id": session_id},
-        {"$set": {"status": "completed", "updated_at": now_iso()}},
+        {"$set": {
+            "status": "completed",
+            "completed_at": now_iso(),
+            "updated_at": now_iso(),
+        }},
     )
 
 
@@ -321,21 +454,149 @@ async def _drive_interview(
 
     await session.generate_reply(instructions=_initial_reply_instructions(has_prepared))
 
-    outcome = await _wait_for_drive_outcome(
-        tracker=tracker,
-        plan_completed=plan_completed,
-        drive_seconds=durations.drive_seconds,
-    )
-    if outcome in ("timeout", "plan_completed"):
-        if outcome == "plan_completed":
-            logger.info("[Interview] Interview plan completed early; starting wrap-up.")
-        await session.generate_reply(instructions=WRAP_UP_INSTRUCTIONS)
-        try:
-            await asyncio.wait_for(
-                tracker.disconnected.wait(), timeout=durations.conclude_buffer_seconds
+    wrap_up_started = False
+    drive_outcome: str | None = None
+    wrap_up_deadline = 0.0
+    loop = asyncio.get_running_loop()
+    drive_deadline = loop.time() + durations.drive_seconds
+
+    while True:
+        if tracker.connected.is_set():
+            remaining_drive = max(0.0, drive_deadline - loop.time())
+            outcome = await _wait_for_drive_outcome(
+                tracker=tracker,
+                plan_completed=plan_completed,
+                drive_seconds=remaining_drive,
             )
-        except asyncio.TimeoutError:
-            logger.info("[Interview] Wrap-up timeout reached; ending session workflow.")
+            if outcome == "candidate_disconnected":
+                grace_ends_at = _persist_candidate_disconnected(
+                    db,
+                    session_id,
+                    grace_seconds=RECONNECT_GRACE_SECONDS,
+                )
+                logger.info(
+                    "[Interview] Candidate disconnected; waiting for reconnect grace.",
+                    extra={"session_id": session_id, "reconnect_grace_ends_at": grace_ends_at},
+                )
+                reconnect_outcome = await _wait_for_reconnect(
+                    tracker=tracker,
+                    timeout_seconds=RECONNECT_GRACE_SECONDS,
+                )
+                if reconnect_outcome == "candidate_reconnected":
+                    _persist_candidate_connected(db, session_id)
+                    logger.info("[Interview] Candidate reconnected; resuming interview.")
+                    continue
+                _persist_session_completed(
+                    db,
+                    session_id,
+                    ended_reason="candidate_disconnect_timeout",
+                )
+                logger.info("[Interview] Candidate did not reconnect within grace window; ending.")
+                return
+            drive_outcome = outcome
+            break
+
+        _persist_candidate_disconnected(db, session_id, grace_seconds=RECONNECT_GRACE_SECONDS)
+        reconnect_outcome = await _wait_for_reconnect(
+            tracker=tracker,
+            timeout_seconds=RECONNECT_GRACE_SECONDS,
+        )
+        if reconnect_outcome == "candidate_reconnected":
+            _persist_candidate_connected(db, session_id)
+            continue
+        _persist_session_completed(
+            db,
+            session_id,
+            ended_reason="candidate_disconnect_timeout",
+        )
+        logger.info("[Interview] Candidate remained disconnected; ending before wrap-up.")
+        return
+
+    if drive_outcome in ("timeout", "plan_completed"):
+        reason = "plan_completed" if drive_outcome == "plan_completed" else "duration_elapsed"
+        wrap_up_deadline = loop.time() + durations.conclude_buffer_seconds
+        wrap_up_started = True
+        wrap_up_ends_at = _persist_wrap_up_started(
+            db,
+            session_id,
+            wrap_up_seconds=durations.conclude_buffer_seconds,
+            reason=reason,
+        )
+        if drive_outcome == "plan_completed":
+            logger.info(
+                "[Interview] Interview plan completed early; starting wrap-up.",
+                extra={"session_id": session_id, "wrap_up_ends_at": wrap_up_ends_at},
+            )
+        if tracker.connected.is_set():
+            await session.generate_reply(
+                instructions=_wrap_up_instruction_text(durations.conclude_buffer_seconds)
+            )
+
+    if not wrap_up_started:
+        _persist_session_completed(
+            db,
+            session_id,
+            ended_reason="candidate_disconnected",
+        )
+        return
+
+    while True:
+        remaining_wrap_up = max(0.0, wrap_up_deadline - loop.time())
+        if remaining_wrap_up <= 0:
+            _persist_session_completed(
+                db,
+                session_id,
+                ended_reason="wrap_up_complete",
+            )
+            logger.info("[Interview] Wrap-up window ended; marking session completed.")
+            return
+
+        if tracker.connected.is_set():
+            try:
+                await asyncio.wait_for(tracker.disconnected.wait(), timeout=remaining_wrap_up)
+            except asyncio.TimeoutError:
+                _persist_session_completed(
+                    db,
+                    session_id,
+                    ended_reason="wrap_up_complete",
+                )
+                logger.info("[Interview] Wrap-up timeout reached; ending session workflow.")
+                return
+
+            _persist_candidate_disconnected(
+                db,
+                session_id,
+                grace_seconds=min(RECONNECT_GRACE_SECONDS, max(1, int(remaining_wrap_up))),
+            )
+            reconnect_outcome = await _wait_for_reconnect(
+                tracker=tracker,
+                timeout_seconds=min(RECONNECT_GRACE_SECONDS, remaining_wrap_up),
+            )
+            if reconnect_outcome == "candidate_reconnected":
+                _persist_candidate_connected(db, session_id)
+                continue
+            _persist_session_completed(
+                db,
+                session_id,
+                ended_reason="wrap_up_disconnect_timeout",
+            )
+            logger.info("[Interview] Candidate did not reconnect before wrap-up ended.")
+            return
+
+        reconnect_outcome = await _wait_for_reconnect(
+            tracker=tracker,
+            timeout_seconds=min(RECONNECT_GRACE_SECONDS, remaining_wrap_up),
+        )
+        if reconnect_outcome == "candidate_reconnected":
+            _persist_candidate_connected(db, session_id)
+            continue
+        _persist_session_completed(
+            db,
+            session_id,
+            ended_reason="wrap_up_disconnect_timeout",
+        )
+        logger.info("[Interview] Wrap-up ended while candidate was disconnected.")
+        return
 
 
 async def run_interview(

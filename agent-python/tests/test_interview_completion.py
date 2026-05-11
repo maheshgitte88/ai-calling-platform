@@ -2,7 +2,7 @@ import asyncio
 import unittest
 
 from app.interview_progress import InterviewProgressTracker
-from app.runner import _wait_for_drive_outcome
+from app.runner import _wait_for_drive_outcome, _wait_for_reconnect
 
 
 class InterviewProgressTrackerTests(unittest.TestCase):
@@ -89,12 +89,14 @@ class InterviewProgressTrackerTests(unittest.TestCase):
 
 class _FakeTracker:
     def __init__(self) -> None:
+        self.connected = asyncio.Event()
         self.disconnected = asyncio.Event()
 
 
 class WaitForDriveOutcomeTests(unittest.IsolatedAsyncioTestCase):
     async def test_completion_event_wins_before_timeout(self) -> None:
         tracker = _FakeTracker()
+        tracker.connected.set()
         plan_completed = asyncio.Event()
 
         async def trigger() -> None:
@@ -111,6 +113,7 @@ class WaitForDriveOutcomeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disconnect_wins_before_completion(self) -> None:
         tracker = _FakeTracker()
+        tracker.connected.set()
         plan_completed = asyncio.Event()
 
         async def trigger() -> None:
@@ -127,6 +130,7 @@ class WaitForDriveOutcomeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_still_falls_back_when_no_completion_signal(self) -> None:
         tracker = _FakeTracker()
+        tracker.connected.set()
         plan_completed = asyncio.Event()
 
         outcome = await _wait_for_drive_outcome(
@@ -135,6 +139,20 @@ class WaitForDriveOutcomeTests(unittest.IsolatedAsyncioTestCase):
             drive_seconds=0,
         )
         self.assertEqual(outcome, "timeout")
+
+    async def test_reconnect_wait_accepts_recovery_before_timeout(self) -> None:
+        tracker = _FakeTracker()
+
+        async def trigger() -> None:
+            await asyncio.sleep(0.01)
+            tracker.connected.set()
+
+        asyncio.create_task(trigger())
+        outcome = await _wait_for_reconnect(
+            tracker=tracker,
+            timeout_seconds=1,
+        )
+        self.assertEqual(outcome, "candidate_reconnected")
 
 
 if __name__ == "__main__":
