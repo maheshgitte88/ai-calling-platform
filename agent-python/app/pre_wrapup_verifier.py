@@ -8,7 +8,7 @@ actually covered.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from .evaluation import _eval_json, format_transcript_chronological
 from .prompt import _normalize_question_groups
@@ -145,8 +145,17 @@ def _normalize_skill_name(raw_skill: Any, display_map: dict[str, str]) -> str:
     return skill
 
 
-def _normalize_verification_result(raw: dict[str, Any], interview_meta: dict) -> PreWrapupVerificationResult:
+def _normalize_verification_result(
+    raw: dict[str, Any],
+    interview_meta: dict,
+    coverage_exempt_skills: Iterable[str] = (),
+) -> PreWrapupVerificationResult:
     display_map = _display_skill_name_map(interview_meta)
+    exempt_keys = {
+        canonical_skill_key(skill)
+        for skill in coverage_exempt_skills
+        if canonical_skill_key(skill)
+    }
     verified_marks: list[tuple[str, int]] = []
     for entry in raw.get("verifiedPreparedQuestions") or []:
         if not isinstance(entry, dict):
@@ -173,8 +182,15 @@ def _normalize_verification_result(raw: dict[str, Any], interview_meta: dict) ->
         if normalized and key and key not in seen_verified:
             verified_skills.append(normalized)
             seen_verified.add(key)
+    for skill in coverage_exempt_skills:
+        normalized = _normalize_skill_name(skill, display_map)
+        key = canonical_skill_key(normalized)
+        if normalized and key and key not in seen_verified:
+            verified_skills.append(normalized)
+            seen_verified.add(key)
 
     missing_items: list[dict] = []
+    raw_missing_skill_count = 0
     for entry in raw.get("missingQuestions") or []:
         if not isinstance(entry, dict):
             continue
@@ -195,14 +211,20 @@ def _normalize_verification_result(raw: dict[str, Any], interview_meta: dict) ->
 
     for skill in raw.get("missingSkills") or []:
         skill_name = _normalize_skill_name(skill, display_map)
+        key = canonical_skill_key(skill_name)
+        if skill_name and key in exempt_keys:
+            raw_missing_skill_count += 1
+            continue
         if skill_name:
+            raw_missing_skill_count += 1
             missing_items.append({"type": "skill", "skill": skill_name})
 
+    exempted_only_missing = raw_missing_skill_count > 0 and not any(item["type"] == "skill" for item in missing_items)
     return PreWrapupVerificationResult(
         verified_question_marks=verified_marks,
         verified_skill_completions=verified_skills,
         missing_items=missing_items,
-        ready_for_wrapup=bool(raw.get("readyForWrapup")) and not missing_items,
+        ready_for_wrapup=(bool(raw.get("readyForWrapup")) or exempted_only_missing) and not missing_items,
         notes=str(raw.get("notes") or "").strip(),
     )
 
@@ -212,6 +234,7 @@ async def verify_pre_wrapup_coverage(
     meta: dict,
     transcript_lines: list[dict],
     provider_cfg: dict,
+    coverage_exempt_skills: Iterable[str] = (),
 ) -> PreWrapupVerificationResult:
     """Verify whether the full interview plan is actually covered before wrap-up."""
     interview_meta = meta.get("interviewMeta") or {}
@@ -238,7 +261,7 @@ async def verify_pre_wrapup_coverage(
         system=_VERIFY_SYSTEM_PROMPT,
         user=_build_verification_user_prompt(meta, transcript_lines),
     )
-    return _normalize_verification_result(raw, interview_meta)
+    return _normalize_verification_result(raw, interview_meta, coverage_exempt_skills)
 
 
 __all__ = ["PreWrapupVerificationResult", "verify_pre_wrapup_coverage"]

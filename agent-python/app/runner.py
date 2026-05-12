@@ -569,6 +569,7 @@ async def _drive_interview(
                         meta=meta,
                         transcript_lines=transcript.lines,
                         provider_cfg=provider_cfg,
+                        coverage_exempt_skills=progress_tracker.verifier_exempt_skill_names(),
                     )
                 except Exception:
                     logger.exception("[Interview] Pre-wrap-up verification failed; continuing interview.")

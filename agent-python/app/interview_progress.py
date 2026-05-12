@@ -396,6 +396,23 @@ class InterviewProgressTracker:
             )
         return "; ".join(parts)
 
+    def verifier_exempt_skill_names(self) -> list[str]:
+        """Return skill names whose substantive-coverage check should be skipped.
+
+        This applies only to the narrow single-skill interview case where the
+        candidate hit the nonresponse threshold and there are no remaining
+        alternative skills to continue with.
+        """
+        if not self._skills_only_mode or len(self._required_skill_completions) != 1:
+            return []
+        only_key = next(iter(self._required_skill_completions), "")
+        if not only_key:
+            return []
+        state = self._runtime_state_by_key.get(only_key)
+        if state and state.completion_reason == "nonresponse_threshold":
+            return [self._display_name_by_key[only_key]]
+        return []
+
     # -- internal ----------------------------------------------------------
 
     def _init_skills_only_runtime(self, skill_specs: list[dict], interview_meta: dict) -> None:

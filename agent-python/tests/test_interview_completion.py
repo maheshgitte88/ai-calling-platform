@@ -179,6 +179,22 @@ class InterviewProgressTrackerTests(unittest.TestCase):
         self.assertTrue(update.accepted)
         self.assertTrue(tracker.is_structurally_complete())
 
+    def test_single_skill_nonresponse_exposes_verifier_exemption(self) -> None:
+        tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
+            "skills": [{"skill": "React.js", "weightage": 100}],
+        })
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            tracker.note_candidate_response("Ready")
+        with patch("app.interview_progress.time.monotonic", return_value=60.0):
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("I don't know")
+            update = tracker.mark_skill_completed("React.js")
+        self.assertTrue(update.accepted)
+        self.assertEqual(tracker.verifier_exempt_skill_names(), ["React.js"])
+
     def test_mark_skill_completed_rejects_prepared_question_skill(self) -> None:
         tracker = InterviewProgressTracker({
             "questions": [{
@@ -327,6 +343,33 @@ class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
                 meta=meta,
                 transcript_lines=[{"role": "assistant", "text": "Explain React hooks.", "is_final": True}],
                 provider_cfg=provider_cfg,
+            )
+
+        self.assertTrue(result.ready_for_wrapup)
+        self.assertEqual(result.verified_skill_completions, ["React.js"])
+        self.assertEqual(result.missing_items, [])
+
+    async def test_verifier_skips_substantive_skill_missing_for_single_skill_nonresponse_exemption(self) -> None:
+        meta = {
+            "interviewMeta": {
+                "skills": [{"skill": "React.js"}],
+            }
+        }
+        provider_cfg = {"llm": {"provider": "openai", "api_key": "k", "model": "m"}}
+        mocked = {
+            "verifiedPreparedQuestions": [],
+            "verifiedSkills": [],
+            "missingQuestions": [],
+            "missingSkills": ["React"],
+            "readyForWrapup": False,
+            "notes": "Candidate repeatedly said they did not know the answers.",
+        }
+        with patch("app.pre_wrapup_verifier._eval_json", new=AsyncMock(return_value=mocked)):
+            result = await verify_pre_wrapup_coverage(
+                meta=meta,
+                transcript_lines=[{"role": "user", "text": "I don't know.", "is_final": True}],
+                provider_cfg=provider_cfg,
+                coverage_exempt_skills=["React.js"],
             )
 
         self.assertTrue(result.ready_for_wrapup)

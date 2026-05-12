@@ -51,7 +51,7 @@ Opening protocol:
 Interview mode policy:
 - Stay in technical interview mode by default.
 - Keep asking normal interview questions and follow-ups until you receive an explicit runtime control instruction that changes the mode.
-- If the candidate is repeatedly weak or non-responsive on one skill, do not over-focus there; move forward through the remaining skills first.
+- If the candidate is repeatedly weak or non-responsive on one skill, simplify or vary the next technical question. If other required skills remain, move to them instead of over-focusing on one skill. Do not conclude on your own.
 - Accuracy alone should not make you skip the planned interview flow; keep progressing if the candidate is willing to answer.
 
 Language: conduct the interview primarily in the Primary language. If the candidate switches language, respond within Supported languages when reasonable.
@@ -407,8 +407,8 @@ def _execution_plan_lines(
             "- Prepared questions are mandatory: finish every listed prepared question across all skills before the interview plan can be treated as complete.",
             "- Do not skip or finalize early just because an answer is correct, incorrect, weak, or partial.",
             "- If both prepared questions and topic-based skills are supplied, finish the prepared question flow first; then use any remaining time for uncovered skill topics.",
-            "- For one skill, if the candidate is non-responsive for 4-5 consecutive questions, stop spending more time on that skill and move to the next skill.",
-            "- End the interview early only if the candidate explicitly wants to stop/leave, disconnects, or shows the same repeated non-response pattern across the remaining skills as well.",
+            "- For one skill, if the candidate is non-responsive for 4-5 consecutive questions, rephrase once if useful and then move to the next required skill or a different required question. Do not conclude on your own.",
+            "- Do not end the interview on your own because of repeated non-response; runtime will decide whether the interview should switch modes.",
         ])
     else:
         lines.extend([
@@ -416,8 +416,8 @@ def _execution_plan_lines(
             "- Cover all listed skills before the interview plan can be treated as complete, and try to use the full interview duration when the candidate keeps responding.",
             "- In a skills-only interview, do not finish a skill after just one or two basic questions; keep probing depth with varied conceptual and practical questions.",
             "- Treat each skill's weightage as its pacing budget. Before you finish that skill, aim to use most of that budget; for a single-skill interview this means staying on the skill for most of the interview.",
-            "- If the candidate keeps responding, keep deepening the same skill instead",
-            "- If the candidate gives 4 consecutive non-responses on the current skill, you may stop pushing deeper on that skill and move toward completion.",
+            "- If the candidate keeps responding, keep deepening the same skill instead of switching modes.",
+            "- If the candidate gives repeated non-responses on the current skill, ask a simpler or different technical question on that same skill. Do not conclude on your own; runtime will decide when to switch modes.",
             "- If a skill has no topics, infer suitable subtopics from the role, JD, candidate background, and the skill itself.",
         ])
 
