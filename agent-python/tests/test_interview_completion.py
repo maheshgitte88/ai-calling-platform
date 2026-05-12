@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from app.provider_resolver import resolve_provider_cfg
 from app.interview_progress import InterviewProgressTracker
-from app.pre_wrapup_verifier import verify_pre_wrapup_coverage
+from app.pre_wrapup_verifier import _build_verification_user_prompt, verify_pre_wrapup_coverage
 from app.runner import _wait_for_drive_outcome, _wait_for_reconnect
 from app.skills import canonical_skill_key
 
@@ -333,6 +333,25 @@ class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result.ready_for_wrapup)
         self.assertEqual(result.missing_items, [])
+
+    def test_verification_prompt_uses_assistant_transcript_only(self) -> None:
+        prompt = _build_verification_user_prompt(
+            {
+                "interviewMeta": {
+                    "questions": [{
+                        "skill": "React",
+                        "questions": ["What are React Hooks?"],
+                    }],
+                }
+            },
+            [
+                {"role": "assistant", "text": "What are React Hooks?", "is_final": True},
+                {"role": "user", "text": "I don't know.", "is_final": True},
+            ],
+        )
+        self.assertIn("Interviewer transcript only:", prompt)
+        self.assertIn("Interviewer: What are React Hooks?", prompt)
+        self.assertNotIn("Candidate: I don't know.", prompt)
 
     async def test_verifier_normalizes_missing_and_verified_items(self) -> None:
         meta = {

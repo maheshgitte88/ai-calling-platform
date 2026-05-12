@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from .evaluation import _eval_json, format_transcript_chronological
+from .evaluation import _eval_json
 from .prompt import _normalize_question_groups
 from .skills import canonical_skill_key, normalize_skill_specs
 
@@ -19,8 +19,10 @@ You verify interview-plan coverage before wrap-up. Reply with ONLY valid JSON.
 
 Rules:
 - Be strict. If a required question or skill is uncertain, treat it as missing.
-- For prepared questions, mark a question verified only if the interviewer clearly asked that question or an unmistakable equivalent in the transcript.
-- For skills without prepared questions, decide whether the interviewer substantively covered the skill in the transcript.
+- For prepared questions, mark a question verified only if the interviewer clearly asked that question or an unmistakable equivalent in the interviewer transcript.
+- Prepared-question coverage depends on whether the interviewer asked it, not on whether the candidate answered well, partially, incorrectly, or said "I don't know".
+- Never mark a prepared question as missing just because the candidate could not answer it after it was asked.
+- For skills without prepared questions, decide whether the interviewer substantively covered the skill in the interviewer transcript.
 - Candidate correctness does NOT determine whether a skill was covered. Incorrect, weak, or incomplete answers should usually be reflected in `notes`, not `missingSkills`.
 - Mark a skill as verified when the interviewer spent meaningful time on that skill and covered multiple core areas, even if one subtopic was answered poorly or not answered.
 - Mark a skill as missing only when the interviewer barely covered it, skipped it, or the candidate gave repeated non-responses so the skill never received real substantive coverage.
@@ -89,11 +91,22 @@ def _skills_without_prepared_questions(interview_meta: dict) -> list[str]:
     ]
 
 
+def _assistant_only_transcript(transcript_lines: list[dict]) -> str:
+    lines_out: list[str] = []
+    for line in transcript_lines:
+        role = line.get("role") or ""
+        text = str(line.get("text") or "").strip()
+        if role != "assistant" or not text:
+            continue
+        lines_out.append(f"Interviewer: {text}")
+    return "\n".join(lines_out) if lines_out else "(empty interviewer transcript)"
+
+
 def _build_verification_user_prompt(meta: dict, transcript_lines: list[dict]) -> str:
     interview_meta = meta.get("interviewMeta") or {}
     prepared_plan = _prepared_question_plan(interview_meta)
     skill_plan = _skills_without_prepared_questions(interview_meta)
-    transcript_text = format_transcript_chronological(transcript_lines)
+    transcript_text = _assistant_only_transcript(transcript_lines)
 
     prepared_lines = ["Prepared questions:"]
     if prepared_plan:
@@ -117,7 +130,10 @@ def _build_verification_user_prompt(meta: dict, transcript_lines: list[dict]) ->
         "",
         *skill_lines,
         "",
-        "Transcript:",
+        "Interviewer transcript only:",
+        "Use this transcript to decide what the interviewer actually asked or covered.",
+        "Do not require candidate answers to verify that a prepared question was asked.",
+        "",
         transcript_text,
     ])
 
