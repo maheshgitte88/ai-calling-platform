@@ -154,7 +154,7 @@ Question-source policy (per-skill prepared questions):
 PROGRESS_TRACKING_POLICY = """
 Progress tracking tools policy:
 - Use the progress tools only after the corresponding question or skill has actually been covered in the live interview.
-- These tools are for tracking completion of the required interview plan so the runtime can start wrap-up immediately once all required items are done.
+- These tools are for tracking completion of the required interview plan so the runtime can verify coverage before wrap-up starts.
 - Never call a progress tool pre-emptively or for optional extra questions.
 """.strip()
 
@@ -489,8 +489,10 @@ def _progress_tracking_lines(skill_specs: list[dict], question_groups: list[dict
         )
 
     lines.extend([
-        "- When you believe all required interview items are finished, call `mark_interview_plan_completed` to verify completion.",
-        "- If `mark_interview_plan_completed` confirms success, immediately ask whether the candidate has any final questions, respond briefly, and conclude the interview.",
+        "- When you believe all required interview items are finished, call `mark_interview_plan_completed` to request a final runtime verification pass.",
+        "- Do not enter wrap-up just because you think the plan is done; wait for runtime verification to confirm it.",
+        "- If runtime verification confirms success, immediately ask whether the candidate has any final questions, respond briefly, and conclude the interview.",
+        "- If runtime verification says something is missing or uncertain, continue the interview and cover only those missing required items first, then request verification again.",
     ])
     return lines
 

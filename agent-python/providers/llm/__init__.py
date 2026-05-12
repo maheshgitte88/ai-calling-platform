@@ -16,6 +16,10 @@ _PROVIDERS = {
         model=cfg.get("model", "grok-4-1-fast-non-reasoning"),
         api_key=(cfg.get("apiKey") or "").strip() or os.getenv("XAI_API_KEY"),
     ),
+    "xai": lambda cfg: xai.responses.LLM(
+        model=cfg.get("model", "grok-4-1-fast-non-reasoning"),
+        api_key=(cfg.get("apiKey") or "").strip() or os.getenv("XAI_API_KEY"),
+    ),
     "deepseek": lambda cfg: openai.LLM(
         model=cfg.get("model", "deepseek-chat"),
         api_key=(cfg.get("apiKey") or "").strip() or os.getenv("DEEPSEEK_API_KEY"),

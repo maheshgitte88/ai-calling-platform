@@ -28,6 +28,7 @@ from .db import get_db
 from .evaluation import generate_structured_evaluation
 from .interview_progress import InterviewProgressTracker
 from .metadata import InterviewDurations, compute_durations, parse_metadata
+from .pre_wrapup_verifier import verify_pre_wrapup_coverage
 from .prompt import build_prompt
 from .provider_resolver import resolve_provider_cfg
 from .time_utils import now_iso
@@ -60,6 +61,39 @@ def _wrap_up_instruction_text(seconds: int) -> str:
         "Ask one concise final check question only if essential, then ask whether the candidate "
         "has any final questions. Respond briefly and conclude politely before the countdown ends."
     )
+
+
+def _missing_items_retry_instruction(missing_items: list[dict], notes: str = "") -> str:
+    """Tell the interviewer exactly what still needs to be covered before wrap-up."""
+    lines = [
+        "Do not start wrap-up yet.",
+        "A transcript verification pass found required interview items that are still missing or uncertain.",
+        "Continue the interview now and cover only these missing required items first.",
+    ]
+    question_items = [item for item in missing_items if item.get("type") == "question"]
+    skill_items = [item for item in missing_items if item.get("type") == "skill"]
+
+    if question_items:
+        lines.append("Missing required prepared questions:")
+        for item in question_items:
+            question_text = str(item.get("question") or "").strip()
+            lines.append(
+                f"- Skill '{item['skill']}', question {item['question_number']}: ask this prepared question now: {question_text}"
+            )
+    if skill_items:
+        lines.append("Missing required skill coverage:")
+        for item in skill_items:
+            lines.append(
+                f"- Skill '{item['skill']}': ask a concise substantive question on this skill now."
+            )
+    lines.extend([
+        "Do not repeat already covered sections unless needed for the missing item itself.",
+        "After you cover each missing item, call the progress tools again.",
+        "Only after all missing items are covered should you call `mark_interview_plan_completed` again to request another verification pass.",
+    ])
+    if notes:
+        lines.append(f"Verifier notes: {notes}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -244,38 +278,38 @@ def _persist_session_completed(
 async def _wait_for_drive_outcome(
     *,
     tracker: "CandidateRoomTracker",
-    plan_completed: asyncio.Event,
+    completion_requested: asyncio.Event,
     drive_seconds: int,
 ) -> str:
     """Wait for the first interview-ending condition.
 
-    Returns one of: ``candidate_disconnected``, ``plan_completed``, ``timeout``.
+    Returns one of: ``candidate_disconnected``, ``completion_requested``, ``timeout``.
     """
     disconnect_task = asyncio.create_task(tracker.disconnected.wait())
-    plan_completed_task = asyncio.create_task(plan_completed.wait())
+    completion_requested_task = asyncio.create_task(completion_requested.wait())
     timeout_task = asyncio.create_task(asyncio.sleep(drive_seconds))
 
     try:
         done, pending = await asyncio.wait(
-            {disconnect_task, plan_completed_task, timeout_task},
+            {disconnect_task, completion_requested_task, timeout_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
     finally:
-        for task in (disconnect_task, plan_completed_task, timeout_task):
+        for task in (disconnect_task, completion_requested_task, timeout_task):
             if task.done():
                 continue
             task.cancel()
         await asyncio.gather(
             disconnect_task,
-            plan_completed_task,
+            completion_requested_task,
             timeout_task,
             return_exceptions=True,
         )
 
     if tracker.disconnected.is_set():
         return "candidate_disconnected"
-    if plan_completed.is_set() and plan_completed_task in done:
-        return "plan_completed"
+    if completion_requested.is_set() and completion_requested_task in done:
+        return "completion_requested"
     return "timeout"
 
 
@@ -433,7 +467,10 @@ async def _drive_interview(
     *,
     session: AgentSession,
     tracker: CandidateRoomTracker,
-    plan_completed: asyncio.Event,
+    progress_tracker: InterviewProgressTracker,
+    transcript: TranscriptRecorder,
+    meta: dict,
+    provider_cfg: dict,
     durations: InterviewDurations,
     has_prepared: bool,
     db: Any,
@@ -465,7 +502,7 @@ async def _drive_interview(
             remaining_drive = max(0.0, drive_deadline - loop.time())
             outcome = await _wait_for_drive_outcome(
                 tracker=tracker,
-                plan_completed=plan_completed,
+                completion_requested=progress_tracker.completion_requested,
                 drive_seconds=remaining_drive,
             )
             if outcome == "candidate_disconnected":
@@ -493,6 +530,52 @@ async def _drive_interview(
                 )
                 logger.info("[Interview] Candidate did not reconnect within grace window; ending.")
                 return
+            if outcome == "completion_requested":
+                progress_tracker.clear_completion_request()
+                try:
+                    verification = await verify_pre_wrapup_coverage(
+                        meta=meta,
+                        transcript_lines=transcript.lines,
+                        provider_cfg=provider_cfg,
+                    )
+                except Exception:
+                    logger.exception("[Interview] Pre-wrap-up verification failed; continuing interview.")
+                    if tracker.connected.is_set():
+                        await session.generate_reply(
+                            instructions=(
+                                "Do not start wrap-up yet. A final verification step could not confirm full coverage. "
+                                "Continue the interview and ensure every required skill and prepared question is covered, "
+                                "then call `mark_interview_plan_completed` again."
+                            )
+                        )
+                    continue
+
+                progress_tracker.apply_verified_question_marks(verification.verified_question_marks)
+                progress_tracker.apply_verified_skill_completions(verification.verified_skill_completions)
+                if verification.ready_for_wrapup:
+                    authorization = progress_tracker.authorize_plan_completion()
+                    if authorization.accepted:
+                        drive_outcome = "plan_completed"
+                        break
+
+                progress_tracker.plan_completed.clear()
+                missing_items = verification.missing_items or progress_tracker.missing_items()
+                logger.info(
+                    "[Interview] Pre-wrap-up verification found missing required items.",
+                    extra={
+                        "session_id": session_id,
+                        "missing_items": missing_items,
+                        "notes": verification.notes,
+                    },
+                )
+                if tracker.connected.is_set():
+                    await session.generate_reply(
+                        instructions=_missing_items_retry_instruction(
+                            missing_items,
+                            verification.notes,
+                        )
+                    )
+                continue
             drive_outcome = outcome
             break
 
@@ -688,7 +771,10 @@ async def run_interview(
         await _drive_interview(
             session=session,
             tracker=tracker,
-            plan_completed=progress_tracker.plan_completed,
+            progress_tracker=progress_tracker,
+            transcript=transcript,
+            meta=meta,
+            provider_cfg=provider_cfg,
             durations=durations,
             has_prepared=has_prepared,
             db=db,
