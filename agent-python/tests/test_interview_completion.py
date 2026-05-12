@@ -102,6 +102,54 @@ class InterviewProgressTrackerTests(unittest.TestCase):
         self.assertTrue(update.accepted)
         self.assertTrue(tracker.is_structurally_complete())
 
+    def test_single_skill_nonresponse_auto_requests_runtime_wrapup(self) -> None:
+        tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
+            "skills": [
+                {"skill": "React.js", "weightage": 100, "difficulty": "easy"},
+            ],
+        })
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            tracker.note_candidate_response("Ready")
+        with patch("app.interview_progress.time.monotonic", return_value=60.0):
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("I don't know")
+        self.assertTrue(tracker.completion_requested.is_set())
+        self.assertTrue(tracker.is_structurally_complete())
+        with patch("app.interview_progress.time.monotonic", return_value=60.0):
+            self.assertEqual(tracker.verifier_exempt_skill_names(), ["React.js"])
+
+    def test_single_skill_nonresponse_threshold_reverses_after_real_answer(self) -> None:
+        tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
+            "skills": [
+                {"skill": "React.js", "weightage": 100, "difficulty": "easy"},
+            ],
+        })
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            tracker.note_candidate_response("Ready")
+        with patch("app.interview_progress.time.monotonic", return_value=60.0):
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("I don't know")
+        self.assertTrue(tracker.completion_requested.is_set())
+        self.assertTrue(tracker.is_structurally_complete())
+
+        with patch("app.interview_progress.time.monotonic", return_value=90.0):
+            tracker.note_candidate_response("React uses reusable components and props.")
+
+        self.assertFalse(tracker.completion_requested.is_set())
+        self.assertFalse(tracker.is_structurally_complete())
+        self.assertEqual(tracker.verifier_exempt_skill_names(), [])
+        with patch("app.interview_progress.time.monotonic", return_value=90.0):
+            self.assertEqual(
+                tracker.runtime_gate_summary(),
+                "React.js needs about 13.5 more min or 4 consecutive non-responses (current streak: 0)",
+            )
+
     def test_mixed_plan_requires_questions_and_skills_without_questions(self) -> None:
         tracker = InterviewProgressTracker({
             "questions": [{
@@ -191,9 +239,9 @@ class InterviewProgressTrackerTests(unittest.TestCase):
             tracker.note_candidate_response("I don't know")
             tracker.note_candidate_response("I don't know")
             tracker.note_candidate_response("I don't know")
-            update = tracker.mark_skill_completed("React.js")
-        self.assertTrue(update.accepted)
-        self.assertEqual(tracker.verifier_exempt_skill_names(), ["React.js"])
+        self.assertTrue(tracker.completion_requested.is_set())
+        with patch("app.interview_progress.time.monotonic", return_value=60.0):
+            self.assertEqual(tracker.verifier_exempt_skill_names(), ["React.js"])
 
     def test_mark_skill_completed_rejects_prepared_question_skill(self) -> None:
         tracker = InterviewProgressTracker({

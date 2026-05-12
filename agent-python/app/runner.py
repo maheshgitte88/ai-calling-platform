@@ -563,6 +563,13 @@ async def _drive_interview(
                 logger.info("[Interview] Candidate did not reconnect within grace window; ending.")
                 return
             if outcome == "completion_requested":
+                logger.info(
+                    "[Interview] Completion request received; starting verification.",
+                    extra={
+                        "session_id": session_id,
+                        "completion_request_state": progress_tracker.completion_request_debug_state(),
+                    },
+                )
                 progress_tracker.clear_completion_request()
                 try:
                     verification = await verify_pre_wrapup_coverage(

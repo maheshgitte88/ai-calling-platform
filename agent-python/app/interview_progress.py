@@ -8,6 +8,7 @@ immediately instead of waiting for the full drive timer.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 from typing import Iterable
@@ -15,6 +16,8 @@ from typing import Iterable
 from .metadata import compute_durations
 from .prompt import _normalize_question_groups
 from .skills import canonical_skill_key, normalize_skill_specs
+
+logger = logging.getLogger(__name__)
 
 
 def _skill_key(skill: str) -> str:
@@ -39,6 +42,7 @@ class SkillRuntimeState:
     started_at_monotonic: float | None = None
     consecutive_nonresponses: int = 0
     completion_reason: str | None = None
+    auto_completed_via_nonresponse: bool = False
 
 
 class InterviewProgressTracker:
@@ -53,6 +57,8 @@ class InterviewProgressTracker:
     def __init__(self, interview_meta: dict) -> None:
         self.plan_completed: asyncio.Event = asyncio.Event()
         self.completion_requested: asyncio.Event = asyncio.Event()
+        self._manual_completion_requested = False
+        self._runtime_completion_requested = False
         self._display_name_by_key: dict[str, str] = {}
         self._required_question_numbers: dict[str, set[int]] = {}
         self._completed_question_numbers: dict[str, set[int]] = {}
@@ -206,7 +212,17 @@ class InterviewProgressTracker:
                 plan_completed=False,
                 message="No structured interview plan is active, so there is nothing to mark complete.",
             )
-        self.completion_requested.set()
+        if not self._manual_completion_requested:
+            logger.info(
+                "[InterviewProgress] Manual completion requested.",
+                extra={
+                    "pending_summary": self.pending_summary(),
+                    "runtime_gate_summary": self.runtime_gate_summary(),
+                    "skills_only_mode": self._skills_only_mode,
+                },
+            )
+        self._manual_completion_requested = True
+        self._sync_completion_requested_event()
         if self.plan_completed.is_set():
             return ProgressUpdate(
                 accepted=True,
@@ -226,7 +242,14 @@ class InterviewProgressTracker:
 
     def clear_completion_request(self) -> None:
         """Clear the outstanding runtime verification request."""
-        self.completion_requested.clear()
+        if self._manual_completion_requested or self._runtime_completion_requested:
+            logger.info(
+                "[InterviewProgress] Clearing completion request state.",
+                extra=self.completion_request_debug_state(),
+            )
+        self._manual_completion_requested = False
+        self._runtime_completion_requested = False
+        self._sync_completion_requested_event()
 
     def authorize_plan_completion(self) -> ProgressUpdate:
         """Release the final wrap-up gate after transcript verification succeeds."""
@@ -249,7 +272,9 @@ class InterviewProgressTracker:
         runtime_summary = self.runtime_gate_summary()
         if runtime_summary != "none":
             self.plan_completed.clear()
-            self.completion_requested.clear()
+            self._manual_completion_requested = False
+            self._runtime_completion_requested = False
+            self._sync_completion_requested_event()
             return ProgressUpdate(
                 accepted=False,
                 plan_completed=False,
@@ -259,7 +284,9 @@ class InterviewProgressTracker:
                 ),
             )
         self.plan_completed.set()
-        self.completion_requested.clear()
+        self._manual_completion_requested = False
+        self._runtime_completion_requested = False
+        self._sync_completion_requested_event()
         return ProgressUpdate(
             accepted=True,
             plan_completed=True,
@@ -348,6 +375,7 @@ class InterviewProgressTracker:
         else:
             state.consecutive_nonresponses = 0
         self._refresh_runtime_eligibility(key)
+        self._sync_runtime_nonresponse_wrapup_request(key)
 
     def runtime_gate_blockers(self) -> list[dict]:
         """Return skills-only pacing blockers that still prevent wrap-up."""
@@ -409,9 +437,30 @@ class InterviewProgressTracker:
         if not only_key:
             return []
         state = self._runtime_state_by_key.get(only_key)
+        self._refresh_runtime_eligibility(only_key)
         if state and state.completion_reason == "nonresponse_threshold":
             return [self._display_name_by_key[only_key]]
         return []
+
+    def completion_request_debug_state(self) -> dict:
+        """Return structured state for logging around wrap-up requests."""
+        active_key = self._active_skill_key
+        active_state = self._runtime_state_by_key.get(active_key or "")
+        active_skill = self._display_name_by_key.get(active_key or "", "") if active_key else ""
+        self._refresh_runtime_eligibility(active_key) if active_key else None
+        active_state = self._runtime_state_by_key.get(active_key or "")
+        return {
+            "manual_completion_requested": self._manual_completion_requested,
+            "runtime_completion_requested": self._runtime_completion_requested,
+            "skills_only_mode": self._skills_only_mode,
+            "active_skill": active_skill or None,
+            "active_skill_completion_reason": active_state.completion_reason if active_state else None,
+            "active_skill_consecutive_nonresponses": (
+                active_state.consecutive_nonresponses if active_state else None
+            ),
+            "pending_summary": self.pending_summary(),
+            "runtime_gate_summary": self.runtime_gate_summary(),
+        }
 
     # -- internal ----------------------------------------------------------
 
@@ -533,13 +582,68 @@ class InterviewProgressTracker:
 
     def _refresh_runtime_eligibility(self, key: str) -> None:
         state = self._runtime_state_by_key.get(key)
-        if state is None or state.completion_reason is not None:
+        if state is None:
             return
-        if state.consecutive_nonresponses >= self._nonresponse_threshold:
-            state.completion_reason = "nonresponse_threshold"
-            return
+        state.completion_reason = self._current_completion_reason(key)
+
+    def _current_completion_reason(self, key: str) -> str | None:
+        state = self._runtime_state_by_key.get(key)
+        if state is None:
+            return None
         if self._skill_elapsed_seconds(key) >= state.min_required_seconds:
-            state.completion_reason = "time_gate_met"
+            return "time_gate_met"
+        if state.consecutive_nonresponses >= self._nonresponse_threshold:
+            return "nonresponse_threshold"
+        return None
+
+    def _sync_runtime_nonresponse_wrapup_request(self, key: str) -> None:
+        state = self._runtime_state_by_key.get(key)
+        if state is None:
+            return
+        previously_requested = self._runtime_completion_requested
+        should_request = (
+            self._skills_only_mode
+            and len(self._required_skill_completions) == 1
+            and key in self._required_skill_completions
+            and state.completion_reason == "nonresponse_threshold"
+            and not self.plan_completed.is_set()
+        )
+        if should_request:
+            self._completed_skills.add(key)
+            state.auto_completed_via_nonresponse = True
+            self._runtime_completion_requested = True
+            if not previously_requested:
+                logger.info(
+                    "[InterviewProgress] Runtime completion requested by nonresponse threshold.",
+                    extra={
+                        "skill": self._display_name_by_key.get(key, key),
+                        "consecutive_nonresponses": state.consecutive_nonresponses,
+                        "nonresponse_threshold": self._nonresponse_threshold,
+                        "pending_summary": self.pending_summary(),
+                    },
+                )
+            self._sync_completion_requested_event()
+            return
+        if state.auto_completed_via_nonresponse:
+            self._completed_skills.discard(key)
+            state.auto_completed_via_nonresponse = False
+            logger.info(
+                "[InterviewProgress] Runtime nonresponse completion request cleared after candidate response.",
+                extra={
+                    "skill": self._display_name_by_key.get(key, key),
+                    "consecutive_nonresponses": state.consecutive_nonresponses,
+                    "nonresponse_threshold": self._nonresponse_threshold,
+                    "runtime_gate_summary": self.runtime_gate_summary(),
+                },
+            )
+        self._runtime_completion_requested = False
+        self._sync_completion_requested_event()
+
+    def _sync_completion_requested_event(self) -> None:
+        if self._manual_completion_requested or self._runtime_completion_requested:
+            self.completion_requested.set()
+        else:
+            self.completion_requested.clear()
 
     def _skill_timing_gate_message(self, key: str, blocker: dict) -> str:
         remaining_minutes = blocker["remaining_seconds"] / 60.0
