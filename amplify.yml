@@ -3,7 +3,7 @@
 # 1) Amplify Console → App settings → Environment variables:
 #    VITE_API_BASE_URL = https://your-api-host   (no trailing slash; Nginx on EC2 or ALB URL)
 #    Example: https://13.234.90.206  or  https://api.yourdomain.com
-# 2) Rewrites (SPA): Hosting → Rewrites and redirects → add single-page app rule if not auto-added.
+# 2) SPA: dashboard-react/public/_redirects is copied to dist (/* → /index.html 200). You can still add rules in the Amplify console if needed.
 version: 1
 applications:
   - appRoot: dashboard-react

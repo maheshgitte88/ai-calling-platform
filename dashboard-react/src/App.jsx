@@ -8,7 +8,9 @@ export default function App() {
   return (
     <BrowserRouter>
       <Routes>
+        {/* Match with or without trailing slash (links and probes may use /interview/join/). */}
         <Route path="/interview/join" element={<InterviewJoin />} />
+        <Route path="/interview/join/" element={<InterviewJoin />} />
         <Route
           path="*"
           element={

@@ -1,0 +1,3 @@
+# AWS Amplify (Netlify-style): serve the SPA shell for client routes so
+# /interview/join, /interview/join/, and deep links do not return 404.
+/*    /index.html   200
