@@ -8,15 +8,17 @@ immediately instead of waiting for the full drive timer.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Iterable
 
+from .metadata import compute_durations
 from .prompt import _normalize_question_groups
-from .skills import normalize_skill_specs
+from .skills import canonical_skill_key, normalize_skill_specs
 
 
 def _skill_key(skill: str) -> str:
-    return str(skill).strip().casefold()
+    return canonical_skill_key(skill)
 
 
 @dataclass(frozen=True)
@@ -26,6 +28,17 @@ class ProgressUpdate:
     accepted: bool
     plan_completed: bool
     message: str
+
+
+@dataclass
+class SkillRuntimeState:
+    """Runtime pacing state for one skills-only interview skill."""
+
+    allocated_seconds: float
+    min_required_seconds: float
+    started_at_monotonic: float | None = None
+    consecutive_nonresponses: int = 0
+    completion_reason: str | None = None
 
 
 class InterviewProgressTracker:
@@ -46,6 +59,11 @@ class InterviewProgressTracker:
         self._required_skill_completions: set[str] = set()
         self._completed_skills: set[str] = set()
         self._skill_order: list[str] = []
+        self._skills_only_mode = False
+        self._skills_only_min_fraction = 0.75
+        self._nonresponse_threshold = 4
+        self._active_skill_key: str | None = None
+        self._runtime_state_by_key: dict[str, SkillRuntimeState] = {}
 
         question_groups = _normalize_question_groups(interview_meta.get("questions") or [])
 
@@ -79,10 +97,19 @@ class InterviewProgressTracker:
             if key not in question_skill_keys:
                 self._required_skill_completions.add(key)
 
+        self._skills_only_mode = bool(self._required_skill_completions) and not bool(self._required_question_numbers)
+        if self._skills_only_mode:
+            self._init_skills_only_runtime(skill_specs, interview_meta)
+
     @property
     def has_plan(self) -> bool:
         """Whether the payload contains any required structured plan items."""
         return bool(self._required_question_numbers or self._required_skill_completions)
+
+    @property
+    def skills_only_mode(self) -> bool:
+        """Whether the active interview uses only topic-based skills."""
+        return self._skills_only_mode
 
     def mark_question_asked(self, skill: str, question_number: int) -> ProgressUpdate:
         """Record that a required prepared question has been asked."""
@@ -154,7 +181,17 @@ class InterviewProgressTracker:
                 plan_completed=self.plan_completed.is_set(),
                 message=f"Skill '{self._display_name_by_key[key]}' was already marked completed.",
             )
+        if self._skills_only_mode:
+            blocker = self.runtime_gate_blockers_for_skill(key)
+            if blocker is not None:
+                return ProgressUpdate(
+                    accepted=False,
+                    plan_completed=self.plan_completed.is_set(),
+                    message=self._skill_timing_gate_message(key, blocker),
+                )
         self._completed_skills.add(key)
+        if self._skills_only_mode:
+            self._activate_next_skill()
         return ProgressUpdate(
             accepted=True,
             plan_completed=self.plan_completed.is_set(),
@@ -207,6 +244,18 @@ class InterviewProgressTracker:
                 message=(
                     "Interview plan is still incomplete after verification. "
                     f"Remaining required items: {self.pending_summary()}."
+                ),
+            )
+        runtime_summary = self.runtime_gate_summary()
+        if runtime_summary != "none":
+            self.plan_completed.clear()
+            self.completion_requested.clear()
+            return ProgressUpdate(
+                accepted=False,
+                plan_completed=False,
+                message=(
+                    "Interview plan is structurally complete, but the skills-only pacing gate is still active. "
+                    f"Remaining runtime requirements: {runtime_summary}."
                 ),
             )
         self.plan_completed.set()
@@ -284,13 +333,134 @@ class InterviewProgressTracker:
                 pending.append(f"{self._display_name_by_key[key]} coverage")
         return "; ".join(pending) if pending else "none"
 
+    def note_candidate_response(self, text: str) -> None:
+        """Track whether the candidate answered or gave a repeated non-response."""
+        if not self._skills_only_mode:
+            return
+        key = self._ensure_active_skill_started()
+        if not key:
+            return
+        state = self._runtime_state_by_key.get(key)
+        if state is None:
+            return
+        if self._is_nonresponse(text):
+            state.consecutive_nonresponses += 1
+        else:
+            state.consecutive_nonresponses = 0
+        self._refresh_runtime_eligibility(key)
+
+    def runtime_gate_blockers(self) -> list[dict]:
+        """Return skills-only pacing blockers that still prevent wrap-up."""
+        if not self._skills_only_mode:
+            return []
+        blockers: list[dict] = []
+        for key in self._skill_order:
+            if key not in self._required_skill_completions:
+                continue
+            blocker = self.runtime_gate_blockers_for_skill(key)
+            if blocker is not None:
+                blockers.append(blocker)
+        return blockers
+
+    def runtime_gate_blockers_for_skill(self, key: str) -> dict | None:
+        """Return pacing blocker for one skill, if still active."""
+        state = self._runtime_state_by_key.get(key)
+        if state is None:
+            return None
+        self._refresh_runtime_eligibility(key)
+        if state.completion_reason is not None:
+            return None
+        elapsed = self._skill_elapsed_seconds(key)
+        return {
+            "type": "skill_timing",
+            "skill": self._display_name_by_key[key],
+            "remaining_seconds": max(0.0, state.min_required_seconds - elapsed),
+            "elapsed_seconds": elapsed,
+            "min_required_seconds": state.min_required_seconds,
+            "consecutive_nonresponses": state.consecutive_nonresponses,
+            "nonresponse_threshold": self._nonresponse_threshold,
+        }
+
+    def runtime_gate_summary(self) -> str:
+        """Human-readable summary of remaining skills-only pacing blockers."""
+        blockers = self.runtime_gate_blockers()
+        if not blockers:
+            return "none"
+        parts: list[str] = []
+        for blocker in blockers:
+            remaining_minutes = blocker["remaining_seconds"] / 60.0
+            parts.append(
+                f"{blocker['skill']} needs about {remaining_minutes:.1f} more min "
+                f"or {self._nonresponse_threshold} consecutive non-responses "
+                f"(current streak: {blocker['consecutive_nonresponses']})"
+            )
+        return "; ".join(parts)
+
     # -- internal ----------------------------------------------------------
+
+    def _init_skills_only_runtime(self, skill_specs: list[dict], interview_meta: dict) -> None:
+        total_seconds = float(compute_durations(interview_meta).total_seconds)
+        weighted: list[tuple[str, float]] = []
+        unweighted: list[str] = []
+        for spec in skill_specs:
+            skill = str(spec.get("skill") or "").strip()
+            if not skill:
+                continue
+            key = _skill_key(skill)
+            if key not in self._required_skill_completions:
+                continue
+            weight = spec.get("weightage")
+            if isinstance(weight, float) and weight > 0:
+                weighted.append((key, weight))
+            else:
+                unweighted.append(key)
+
+        share_by_key: dict[str, float] = {}
+        if weighted:
+            total_weight = sum(weight for _, weight in weighted)
+            if unweighted and total_weight < 100.0:
+                remaining_share = max(0.0, 100.0 - total_weight) / 100.0
+                per_unweighted_share = remaining_share / len(unweighted)
+                for key, weight in weighted:
+                    share_by_key[key] = weight / 100.0
+                for key in unweighted:
+                    share_by_key[key] = per_unweighted_share
+            else:
+                normalizer = total_weight if total_weight > 0 else float(len(weighted))
+                for key, weight in weighted:
+                    share_by_key[key] = weight / normalizer
+                for key in unweighted:
+                    share_by_key[key] = 0.0
+        elif self._required_skill_completions:
+            equal_share = 1.0 / len(self._required_skill_completions)
+            for key in self._required_skill_completions:
+                share_by_key[key] = equal_share
+
+        for key in self._required_skill_completions:
+            share = share_by_key.get(key, 0.0)
+            allocated_seconds = total_seconds * share if share > 0 else total_seconds / len(self._required_skill_completions)
+            self._runtime_state_by_key[key] = SkillRuntimeState(
+                allocated_seconds=allocated_seconds,
+                min_required_seconds=allocated_seconds * self._skills_only_min_fraction,
+            )
 
     def _remember_skill(self, key: str, display_name: str) -> None:
         if key not in self._display_name_by_key:
             self._display_name_by_key[key] = display_name
         if key not in self._skill_order:
             self._skill_order.append(key)
+
+    def _activate_next_skill(self) -> None:
+        if not self._skills_only_mode:
+            return
+        next_key = None
+        for key in self._skill_order:
+            if key in self._required_skill_completions and key not in self._completed_skills:
+                next_key = key
+                break
+        self._active_skill_key = next_key
+        if next_key:
+            self._ensure_active_skill_started()
 
     def _resolve_skill(self, raw_skill: str) -> str:
         skill = str(raw_skill or "").strip()
@@ -322,5 +492,85 @@ class InterviewProgressTracker:
             f"Overall pending items: {self.pending_summary()}."
         )
 
+    def _ensure_active_skill_started(self) -> str | None:
+        if not self._skills_only_mode:
+            return None
+        if self._active_skill_key is None or self._active_skill_key in self._completed_skills:
+            for key in self._skill_order:
+                if key in self._required_skill_completions and key not in self._completed_skills:
+                    self._active_skill_key = key
+                    break
+        key = self._active_skill_key
+        if not key:
+            return None
+        state = self._runtime_state_by_key.get(key)
+        if state and state.started_at_monotonic is None:
+            state.started_at_monotonic = self._now_monotonic()
+        return key
 
-__all__ = ["InterviewProgressTracker", "ProgressUpdate"]
+    def _skill_elapsed_seconds(self, key: str) -> float:
+        state = self._runtime_state_by_key.get(key)
+        if state is None or state.started_at_monotonic is None:
+            return 0.0
+        return max(0.0, self._now_monotonic() - state.started_at_monotonic)
+
+    def _refresh_runtime_eligibility(self, key: str) -> None:
+        state = self._runtime_state_by_key.get(key)
+        if state is None or state.completion_reason is not None:
+            return
+        if state.consecutive_nonresponses >= self._nonresponse_threshold:
+            state.completion_reason = "nonresponse_threshold"
+            return
+        if self._skill_elapsed_seconds(key) >= state.min_required_seconds:
+            state.completion_reason = "time_gate_met"
+
+    def _skill_timing_gate_message(self, key: str, blocker: dict) -> str:
+        remaining_minutes = blocker["remaining_seconds"] / 60.0
+        return (
+            f"Runtime control: completion denied for skill '{self._display_name_by_key[key]}'. "
+            f"Continue normal technical questioning on this skill. Do not mention wrap-up, time remaining, "
+            f"countdowns, final questions, or closing to the candidate. Internal pacing note: about "
+            f"{remaining_minutes:.1f} more minutes remain unless the candidate reaches "
+            f"{self._nonresponse_threshold} consecutive non-responses. Current non-response streak: "
+            f"{blocker['consecutive_nonresponses']}."
+        )
+
+    @staticmethod
+    def _now_monotonic() -> float:
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:
+            return time.monotonic()
+
+    @staticmethod
+    def _is_nonresponse(text: str) -> bool:
+        body = str(text or "").strip().casefold()
+        if not body:
+            return True
+        exact = {
+            "i don't know",
+            "i dont know",
+            "don't know",
+            "dont know",
+            "not sure",
+            "no idea",
+            "skip",
+            "pass",
+        }
+        if body in exact:
+            return True
+        phrases = (
+            "i don't know",
+            "i dont know",
+            "do not know",
+            "not sure",
+            "no idea",
+            "can't answer",
+            "cannot answer",
+            "skip this",
+            "pass this",
+        )
+        return any(phrase in body for phrase in phrases)
+
+
+__all__ = ["InterviewProgressTracker", "ProgressUpdate", "SkillRuntimeState"]

@@ -57,8 +57,9 @@ def _wrap_up_instruction_text(seconds: int) -> str:
     else:
         countdown = f"the final {max(1, int(seconds))} seconds"
     return (
-        f"Begin interview wrap-up now. Clearly tell the candidate that {countdown} have started. "
-        "Ask one concise final check question only if essential, then ask whether the candidate "
+        f"Wrap-up is now explicitly authorized. Clearly tell the candidate that {countdown} have started. "
+        "From this point onward, do not ask any new substantive technical interview questions. "
+        "Ask one concise final check question only if absolutely essential, then ask whether the candidate "
         "has any final questions. Respond briefly and conclude politely before the countdown ends."
     )
 
@@ -66,9 +67,10 @@ def _wrap_up_instruction_text(seconds: int) -> str:
 def _missing_items_retry_instruction(missing_items: list[dict], notes: str = "") -> str:
     """Tell the interviewer exactly what still needs to be covered before wrap-up."""
     lines = [
-        "Do not start wrap-up yet.",
+        "Runtime control: wrap-up is not authorized.",
         "A transcript verification pass found required interview items that are still missing or uncertain.",
-        "Continue the interview now and cover only these missing required items first.",
+        "Continue normal technical interviewing now and cover only these missing required items first.",
+        "Do not mention wrap-up, time remaining, countdowns, final questions, or closing to the candidate.",
     ]
     question_items = [item for item in missing_items if item.get("type") == "question"]
     skill_items = [item for item in missing_items if item.get("type") == "skill"]
@@ -88,11 +90,34 @@ def _missing_items_retry_instruction(missing_items: list[dict], notes: str = "")
             )
     lines.extend([
         "Do not repeat already covered sections unless needed for the missing item itself.",
+        "Ask the next technical question immediately instead of using any closing language.",
         "After you cover each missing item, call the progress tools again.",
         "Only after all missing items are covered should you call `mark_interview_plan_completed` again to request another verification pass.",
     ])
     if notes:
         lines.append(f"Verifier notes: {notes}")
+    return "\n".join(lines)
+
+
+def _skills_only_gate_retry_instruction(blockers: list[dict]) -> str:
+    """Tell the interviewer to keep probing a skills-only interview before wrap-up."""
+    lines = [
+        "Runtime control: wrap-up is not authorized.",
+        "Completion was denied because the skills-only pacing gate is still active.",
+        "Continue normal technical interviewing on the current skill now.",
+        "Do not mention wrap-up, time remaining, countdowns, final questions, or closing to the candidate.",
+        "Ask the next technical question immediately and keep probing the same skill with fresh conceptual and practical questions.",
+    ]
+    for blocker in blockers:
+        lines.append(
+            f"- Skill '{blocker['skill']}': continue this skill until runtime later accepts completion or the candidate reaches "
+            f"{blocker['nonresponse_threshold']} consecutive non-responses. Current non-response streak: "
+            f"{blocker['consecutive_nonresponses']}."
+        )
+    lines.extend([
+        "Do not call `mark_skill_completed` for that skill again immediately after this message.",
+        "After the remaining pacing requirement is satisfied, request completion again.",
+    ])
     return "\n".join(lines)
 
 
@@ -489,6 +514,13 @@ async def _drive_interview(
 
     _persist_first_candidate_join(db, session_id)
 
+    def _on_transcript_line(line: dict) -> None:
+        if line.get("role") != "user" or not bool(line.get("is_final")):
+            return
+        progress_tracker.note_candidate_response(str(line.get("text") or ""))
+
+    transcript.add_listener(_on_transcript_line)
+
     await session.generate_reply(instructions=_initial_reply_instructions(has_prepared))
 
     wrap_up_started = False
@@ -557,6 +589,20 @@ async def _drive_interview(
                     if authorization.accepted:
                         drive_outcome = "plan_completed"
                         break
+                    blockers = progress_tracker.runtime_gate_blockers()
+                    if blockers:
+                        logger.info(
+                            "[Interview] Skills-only pacing gate blocked early wrap-up.",
+                            extra={
+                                "session_id": session_id,
+                                "runtime_gate_blockers": blockers,
+                            },
+                        )
+                        if tracker.connected.is_set():
+                            await session.generate_reply(
+                                instructions=_skills_only_gate_retry_instruction(blockers)
+                            )
+                        continue
 
                 progress_tracker.plan_completed.clear()
                 missing_items = verification.missing_items or progress_tracker.missing_items()

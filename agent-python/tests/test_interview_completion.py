@@ -6,6 +6,7 @@ from app.provider_resolver import resolve_provider_cfg
 from app.interview_progress import InterviewProgressTracker
 from app.pre_wrapup_verifier import verify_pre_wrapup_coverage
 from app.runner import _wait_for_drive_outcome, _wait_for_reconnect
+from app.skills import canonical_skill_key
 
 
 class InterviewProgressTrackerTests(unittest.TestCase):
@@ -45,23 +46,60 @@ class InterviewProgressTrackerTests(unittest.TestCase):
         self.assertTrue(tracker.plan_completed.is_set())
         self.assertFalse(tracker.completion_requested.is_set())
 
-    def test_skills_only_complete_after_all_skills_marked(self) -> None:
+    def test_skills_only_gate_blocks_early_skill_completion(self) -> None:
         tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
             "skills": [
-                {"skill": "Core Java", "weightage": 60, "difficulty": "medium"},
-                {"skill": "SQL", "weightage": 40, "difficulty": "easy"},
+                {"skill": "React", "weightage": 100, "difficulty": "easy"},
             ],
         })
 
-        self.assertEqual(tracker.pending_summary(), "Core Java coverage; SQL coverage")
-        first = tracker.mark_skill_completed("Core Java")
-        self.assertTrue(first.accepted)
+        self.assertEqual(tracker.pending_summary(), "React coverage")
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            tracker.note_candidate_response("Yes, I am ready.")
+            first = tracker.mark_skill_completed("React")
+        self.assertFalse(first.accepted)
         self.assertFalse(first.plan_completed)
-        self.assertIn("SQL coverage", first.message)
+        self.assertIn("Runtime control: completion denied", first.message)
+        self.assertIn("Do not mention wrap-up", first.message)
+        self.assertIn("15.0 more minutes remain", first.message)
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            self.assertEqual(
+                tracker.runtime_gate_summary(),
+                "React needs about 15.0 more min or 4 consecutive non-responses (current streak: 0)",
+            )
 
-        second = tracker.mark_skill_completed("SQL")
+    def test_skills_only_gate_releases_after_time_budget(self) -> None:
+        tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
+            "skills": [
+                {"skill": "React", "weightage": 100, "difficulty": "easy"},
+            ],
+        })
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            tracker.note_candidate_response("Ready")
+        with patch("app.interview_progress.time.monotonic", return_value=900.0):
+            second = tracker.mark_skill_completed("React")
         self.assertTrue(second.accepted)
         self.assertFalse(second.plan_completed)
+        self.assertTrue(tracker.is_structurally_complete())
+
+    def test_skills_only_gate_releases_after_four_nonresponses(self) -> None:
+        tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
+            "skills": [
+                {"skill": "React", "weightage": 100, "difficulty": "easy"},
+            ],
+        })
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            tracker.note_candidate_response("Ready")
+        with patch("app.interview_progress.time.monotonic", return_value=60.0):
+            tracker.note_candidate_response("I don't know")
+            tracker.note_candidate_response("Not sure")
+            tracker.note_candidate_response("No idea")
+            tracker.note_candidate_response("Skip this")
+            update = tracker.mark_skill_completed("React")
+        self.assertTrue(update.accepted)
         self.assertTrue(tracker.is_structurally_complete())
 
     def test_mixed_plan_requires_questions_and_skills_without_questions(self) -> None:
@@ -114,6 +152,32 @@ class InterviewProgressTrackerTests(unittest.TestCase):
         authorize = tracker.authorize_plan_completion()
         self.assertTrue(authorize.accepted)
         self.assertTrue(tracker.plan_completed.is_set())
+
+    def test_skills_only_authorization_blocks_verified_completion_until_time_gate(self) -> None:
+        tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
+            "skills": [{"skill": "React"}],
+        })
+        tracker.apply_verified_skill_completions(["React"])
+        self.assertTrue(tracker.is_structurally_complete())
+
+        confirm = tracker.confirm_plan_completed()
+        self.assertTrue(confirm.accepted)
+        authorize = tracker.authorize_plan_completion()
+        self.assertFalse(authorize.accepted)
+        self.assertIn("skills-only pacing gate", authorize.message)
+
+    def test_skill_aliases_match_for_progress_tracking(self) -> None:
+        tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
+            "skills": [{"skill": "React.js", "weightage": 100}],
+        })
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            tracker.note_candidate_response("Ready")
+        with patch("app.interview_progress.time.monotonic", return_value=900.0):
+            update = tracker.mark_skill_completed("React")
+        self.assertTrue(update.accepted)
+        self.assertTrue(tracker.is_structurally_complete())
 
     def test_mark_skill_completed_rejects_prepared_question_skill(self) -> None:
         tracker = InterviewProgressTracker({
@@ -243,6 +307,32 @@ class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.missing_items[1]["type"], "skill")
         self.assertIn("SQL", result.notes)
 
+    async def test_verifier_normalizes_skill_aliases_to_plan_name(self) -> None:
+        meta = {
+            "interviewMeta": {
+                "skills": [{"skill": "React.js"}],
+            }
+        }
+        provider_cfg = {"llm": {"provider": "openai", "api_key": "k", "model": "m"}}
+        mocked = {
+            "verifiedPreparedQuestions": [],
+            "verifiedSkills": ["React"],
+            "missingQuestions": [],
+            "missingSkills": [],
+            "readyForWrapup": True,
+            "notes": "Candidate covered React fundamentals. One weak topic does not make the whole skill missing.",
+        }
+        with patch("app.pre_wrapup_verifier._eval_json", new=AsyncMock(return_value=mocked)):
+            result = await verify_pre_wrapup_coverage(
+                meta=meta,
+                transcript_lines=[{"role": "assistant", "text": "Explain React hooks.", "is_final": True}],
+                provider_cfg=provider_cfg,
+            )
+
+        self.assertTrue(result.ready_for_wrapup)
+        self.assertEqual(result.verified_skill_completions, ["React.js"])
+        self.assertEqual(result.missing_items, [])
+
 
 class ProviderResolverTests(unittest.TestCase):
     def test_xai_llm_alias_uses_xai_api_key(self) -> None:
@@ -260,6 +350,14 @@ class ProviderResolverTests(unittest.TestCase):
         self.assertEqual(cfg["llm"]["provider"], "xai")
         self.assertEqual(cfg["llm"]["model"], "grok-4-1-fast-non-reasoning")
         self.assertEqual(cfg["llm"]["api_key"], "x-test-key")
+
+
+class SkillsHelpersTests(unittest.TestCase):
+    def test_canonical_skill_key_normalizes_common_aliases(self) -> None:
+        self.assertEqual(canonical_skill_key("React"), "react")
+        self.assertEqual(canonical_skill_key("React.js"), "react")
+        self.assertEqual(canonical_skill_key("Node"), "nodejs")
+        self.assertEqual(canonical_skill_key("Node.js"), "nodejs")
 
 
 if __name__ == "__main__":

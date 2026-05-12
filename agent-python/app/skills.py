@@ -2,7 +2,36 @@
 
 from __future__ import annotations
 
+import re
+
 ALLOWED_DIFFICULTIES = {"easy", "medium", "hard"}
+SKILL_KEY_ALIASES = {
+    "react": "react",
+    "reactjs": "react",
+    "node": "nodejs",
+    "nodejs": "nodejs",
+    "express": "express",
+    "expressjs": "express",
+    "next": "nextjs",
+    "nextjs": "nextjs",
+    "vue": "vue",
+    "vuejs": "vue",
+    "angular": "angular",
+    "angularjs": "angular",
+}
+
+
+def canonical_skill_key(raw_skill: str) -> str:
+    """Canonicalize skill names so common aliases map to the same key.
+
+    Examples:
+    - ``React`` / ``React.js`` -> ``react``
+    - ``Node`` / ``Node.js`` -> ``nodejs``
+    """
+    compact = re.sub(r"[^a-z0-9]+", "", str(raw_skill or "").strip().lower())
+    if not compact:
+        return ""
+    return SKILL_KEY_ALIASES.get(compact, compact)
 
 
 def normalize_skill_specs(skill_specs: list[dict]) -> list[dict]:
@@ -80,4 +109,4 @@ def normalize_skill_specs(skill_specs: list[dict]) -> list[dict]:
     return cleaned
 
 
-__all__ = ["ALLOWED_DIFFICULTIES", "normalize_skill_specs"]
+__all__ = ["ALLOWED_DIFFICULTIES", "SKILL_KEY_ALIASES", "canonical_skill_key", "normalize_skill_specs"]

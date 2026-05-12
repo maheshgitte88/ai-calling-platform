@@ -12,7 +12,7 @@ from typing import Any
 
 from .evaluation import _eval_json, format_transcript_chronological
 from .prompt import _normalize_question_groups
-from .skills import normalize_skill_specs
+from .skills import canonical_skill_key, normalize_skill_specs
 
 _VERIFY_SYSTEM_PROMPT = """
 You verify interview-plan coverage before wrap-up. Reply with ONLY valid JSON.
@@ -20,9 +20,12 @@ You verify interview-plan coverage before wrap-up. Reply with ONLY valid JSON.
 Rules:
 - Be strict. If a required question or skill is uncertain, treat it as missing.
 - For prepared questions, mark a question verified only if the interviewer clearly asked that question or an unmistakable equivalent in the transcript.
-- For skills without prepared questions, mark the skill verified only if there is clear substantive coverage for that skill in the transcript.
+- For skills without prepared questions, decide whether the interviewer substantively covered the skill in the transcript.
+- Candidate correctness does NOT determine whether a skill was covered. Incorrect, weak, or incomplete answers should usually be reflected in `notes`, not `missingSkills`.
+- Mark a skill as verified when the interviewer spent meaningful time on that skill and covered multiple core areas, even if one subtopic was answered poorly or not answered.
+- Mark a skill as missing only when the interviewer barely covered it, skipped it, or the candidate gave repeated non-responses so the skill never received real substantive coverage.
 - Do not assume coverage from greetings, wrap-up, or vague mentions.
-- Use the EXACT skill names and prepared question numbers from the provided plan.
+- Use the provided skill names and prepared question numbers from the plan. Treat common aliases like `React` and `React.js` as the same skill.
 
 Output JSON shape:
 {
@@ -75,14 +78,14 @@ def _skills_without_prepared_questions(interview_meta: dict) -> list[str]:
         skill_specs_raw = []
     skill_specs = normalize_skill_specs(skill_specs_raw)
     prepared_skill_keys = {
-        str(group.get("skill") or "").strip().casefold()
+        canonical_skill_key(group.get("skill") or "")
         for group in _normalize_question_groups(interview_meta.get("questions") or [])
-        if str(group.get("skill") or "").strip()
+        if canonical_skill_key(group.get("skill") or "")
     }
     return [
         spec["skill"]
         for spec in skill_specs
-        if spec.get("skill") and spec["skill"].casefold() not in prepared_skill_keys
+        if spec.get("skill") and canonical_skill_key(spec["skill"]) not in prepared_skill_keys
     ]
 
 
@@ -119,12 +122,36 @@ def _build_verification_user_prompt(meta: dict, transcript_lines: list[dict]) ->
     ])
 
 
-def _normalize_verification_result(raw: dict[str, Any]) -> PreWrapupVerificationResult:
+def _display_skill_name_map(interview_meta: dict) -> dict[str, str]:
+    display: dict[str, str] = {}
+    for group in _normalize_question_groups(interview_meta.get("questions") or []):
+        skill = str(group.get("skill") or "").strip()
+        key = canonical_skill_key(skill)
+        if key and key not in display:
+            display[key] = skill
+    for spec in normalize_skill_specs(interview_meta.get("skills") or interview_meta.get("skillWeights") or []):
+        skill = str(spec.get("skill") or "").strip()
+        key = canonical_skill_key(skill)
+        if key and key not in display:
+            display[key] = skill
+    return display
+
+
+def _normalize_skill_name(raw_skill: Any, display_map: dict[str, str]) -> str:
+    skill = str(raw_skill or "").strip()
+    key = canonical_skill_key(skill)
+    if key and key in display_map:
+        return display_map[key]
+    return skill
+
+
+def _normalize_verification_result(raw: dict[str, Any], interview_meta: dict) -> PreWrapupVerificationResult:
+    display_map = _display_skill_name_map(interview_meta)
     verified_marks: list[tuple[str, int]] = []
     for entry in raw.get("verifiedPreparedQuestions") or []:
         if not isinstance(entry, dict):
             continue
-        skill = str(entry.get("skill") or "").strip()
+        skill = _normalize_skill_name(entry.get("skill"), display_map)
         if not skill:
             continue
         question_numbers = entry.get("questionNumbers") or []
@@ -138,17 +165,20 @@ def _normalize_verification_result(raw: dict[str, Any]) -> PreWrapupVerification
             if question_number > 0:
                 verified_marks.append((skill, question_number))
 
-    verified_skills = [
-        str(skill).strip()
-        for skill in (raw.get("verifiedSkills") or [])
-        if str(skill).strip()
-    ]
+    verified_skills: list[str] = []
+    seen_verified: set[str] = set()
+    for skill in (raw.get("verifiedSkills") or []):
+        normalized = _normalize_skill_name(skill, display_map)
+        key = canonical_skill_key(normalized)
+        if normalized and key and key not in seen_verified:
+            verified_skills.append(normalized)
+            seen_verified.add(key)
 
     missing_items: list[dict] = []
     for entry in raw.get("missingQuestions") or []:
         if not isinstance(entry, dict):
             continue
-        skill = str(entry.get("skill") or "").strip()
+        skill = _normalize_skill_name(entry.get("skill"), display_map)
         question = str(entry.get("question") or "").strip()
         try:
             question_number = int(entry.get("questionNumber"))
@@ -164,7 +194,7 @@ def _normalize_verification_result(raw: dict[str, Any]) -> PreWrapupVerification
         })
 
     for skill in raw.get("missingSkills") or []:
-        skill_name = str(skill).strip()
+        skill_name = _normalize_skill_name(skill, display_map)
         if skill_name:
             missing_items.append({"type": "skill", "skill": skill_name})
 
@@ -208,7 +238,7 @@ async def verify_pre_wrapup_coverage(
         system=_VERIFY_SYSTEM_PROMPT,
         user=_build_verification_user_prompt(meta, transcript_lines),
     )
-    return _normalize_verification_result(raw)
+    return _normalize_verification_result(raw, interview_meta)
 
 
 __all__ = ["PreWrapupVerificationResult", "verify_pre_wrapup_coverage"]

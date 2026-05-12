@@ -7,6 +7,7 @@ objects.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 from uuid import uuid4
 
@@ -20,6 +21,7 @@ class TranscriptRecorder:
         self._db = db
         self._session_id = session_id
         self.lines: list[dict] = []
+        self._listeners: list[Callable[[dict], None]] = []
 
     # -- registration ------------------------------------------------------
 
@@ -27,6 +29,10 @@ class TranscriptRecorder:
         """Register listeners on a LiveKit ``AgentSession``."""
         session.on("user_input_transcribed", self._on_user_transcribed)
         session.on("conversation_item_added", self._on_conversation_item)
+
+    def add_listener(self, listener: Callable[[dict], None]) -> None:
+        """Subscribe to stored transcript lines."""
+        self._listeners.append(listener)
 
     # -- handlers ----------------------------------------------------------
 
@@ -67,6 +73,8 @@ class TranscriptRecorder:
             "payload": line,
             "created_at": line["created_at"],
         })
+        for listener in list(self._listeners):
+            listener(line)
 
 
 __all__ = ["TranscriptRecorder"]

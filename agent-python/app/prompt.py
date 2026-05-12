@@ -26,7 +26,7 @@ the LLM never reads rules about something it does not have.
 
 from __future__ import annotations
 
-from .skills import normalize_skill_specs
+from .skills import canonical_skill_key, normalize_skill_specs
 
 # ---------------------------------------------------------------------------
 # Always-on instructions (no section-specific rules here)
@@ -41,20 +41,18 @@ Core behavior (always follow):
 - Use brief follow-ups to clarify, probe depth, or when the answer is incomplete (only when allowed for that skill).
 - If the candidate asks for clarification, restate the same question in simpler words.
 - Keep your spoken lines concise for real-time voice.
-- Behave like a real human interviewer: adaptive, attentive, and conversational without being verbose.
-- Close politely when the session ends, the candidate leaves, or time is nearly over.
+- Stay in normal interview mode unless you receive an explicit runtime control instruction that changes the mode.
 
 Opening protocol:
 - First turn: short greeting + a single readiness check (e.g. "Are you ready to begin interview?").
-- Only after the candidate confirms (yes / ready), start the interview with a brief candidate introduction. If they aren't ready, acknowledge briefly and give them time.
+- Only after the candidate confirms (yes / ready), If they aren't ready, acknowledge briefly and give them time.
+- Ask brief introduction questions to the candidate to get a sense of their background and experience.
 
-Time and conclusion policy:
-- Use the provided interview duration carefully and stay on schedule.
-- Do not conclude before the interview plan is completed, unless the candidate explicitly asks to stop/leave or the interview must end for repeated non-response.
-- You MUST conclude within the provided interview duration.
-- Keep a small final wrap-up window for: final candidate comments/questions + polite closing.
+Interview mode policy:
+- Stay in technical interview mode by default.
+- Keep asking normal interview questions and follow-ups until you receive an explicit runtime control instruction that changes the mode.
 - If the candidate is repeatedly weak or non-responsive on one skill, do not over-focus there; move forward through the remaining skills first.
-- Accuracy alone should not make you skip the planned interview flow; keep progressing unless an early-stop condition applies.
+- Accuracy alone should not make you skip the planned interview flow; keep progressing if the candidate is willing to answer.
 
 Language: conduct the interview primarily in the Primary language. If the candidate switches language, respond within Supported languages when reasonable.
 """.strip()
@@ -68,7 +66,7 @@ MUST_ASK_TOPICS_POLICY = """
 Must-ask topics policy:
 - Topics flagged "ask now" are high priority — cover them early in the interview, before low-priority skills run too long.
 - Topics flagged "normal flow" should be covered naturally whenever they fit the conversation.
-- Either way, all must-ask topics MUST be touched before wrap-up.
+- Either way, all must-ask topics MUST be touched before the interview plan can be treated as complete.
 """.strip()
 
 SKILLS_WEIGHTAGE_POLICY = """
@@ -142,7 +140,7 @@ def build_difficulty_policy(years_experience) -> str:
 QUESTION_SOURCE_POLICY = """
 Question-source policy (per-skill prepared questions):
 - The "Prepared questions per skill" section is the backbone — ask its questions in the listed order, grouped by skill.
-- Every prepared question in every listed skill must be asked before wrap-up, regardless of whether the candidate answers correctly, incorrectly, or only partially.
+- Every prepared question in every listed skill must be asked before the interview plan can be treated as complete, regardless of whether the candidate answers correctly, incorrectly, or only partially.
 - For each skill group, honour its flags:
     * ask_follow_ups=true  → you MAY ask 1-2 brief follow-ups per prepared question to probe depth.
     * ask_follow_ups=false → ask the prepared question as written and move on (no follow-ups).
@@ -154,7 +152,7 @@ Question-source policy (per-skill prepared questions):
 PROGRESS_TRACKING_POLICY = """
 Progress tracking tools policy:
 - Use the progress tools only after the corresponding question or skill has actually been covered in the live interview.
-- These tools are for tracking completion of the required interview plan so the runtime can verify coverage before wrap-up starts.
+- These tools are for tracking completion of the required interview plan so the runtime can verify coverage before changing the interview mode.
 - Never call a progress tool pre-emptively or for optional extra questions.
 """.strip()
 
@@ -310,12 +308,12 @@ def _build_execution_plan(
     years_experience,
 ) -> list[dict]:
     """Merge skills + prepared-question groups into one execution plan."""
-    spec_by_skill = {spec["skill"].lower(): spec for spec in skill_specs}
+    spec_by_skill = {canonical_skill_key(spec["skill"]): spec for spec in skill_specs}
     plan: list[dict] = []
     seen: set[str] = set()
 
     for group in question_groups:
-        key = group["skill"].lower()
+        key = canonical_skill_key(group["skill"])
         seen.add(key)
         spec = spec_by_skill.get(key) or {}
         weight = group.get("weightage")
@@ -333,7 +331,7 @@ def _build_execution_plan(
         })
 
     for spec in skill_specs:
-        key = spec["skill"].lower()
+        key = canonical_skill_key(spec["skill"])
         if key in seen:
             continue
         plan.append({
@@ -399,27 +397,27 @@ def _execution_plan_lines(
     if not plan:
         return []
 
-    wrap_up_minutes = _default_wrap_up_minutes(duration_minutes)
     lines = ["Dynamic interview execution plan:"]
-    lines.append(
-        f"- Reserve about {_format_minutes(wrap_up_minutes)} at the end for candidate questions and a polite closing."
-    )
     lines.append(
         "- Keep the greeting/readiness check brief; the main interview flow starts only after the candidate confirms they are ready."
     )
 
     if question_groups:
         lines.extend([
-            "- Prepared questions are mandatory: finish every listed prepared question across all skills before final wrap-up.",
+            "- Prepared questions are mandatory: finish every listed prepared question across all skills before the interview plan can be treated as complete.",
             "- Do not skip or finalize early just because an answer is correct, incorrect, weak, or partial.",
-            "- If both prepared questions and topic-based skills are supplied, finish the prepared question flow first; then use any remaining time for uncovered skill topics before wrap-up.",
+            "- If both prepared questions and topic-based skills are supplied, finish the prepared question flow first; then use any remaining time for uncovered skill topics.",
             "- For one skill, if the candidate is non-responsive for 4-5 consecutive questions, stop spending more time on that skill and move to the next skill.",
             "- End the interview early only if the candidate explicitly wants to stop/leave, disconnects, or shows the same repeated non-response pattern across the remaining skills as well.",
         ])
     else:
         lines.extend([
             "- No prepared question list is supplied, so generate questions from the skill plan, topics, role, JD, and candidate experience.",
-            "- Cover all listed skills before wrap-up and try to use the full interview duration when the candidate keeps responding.",
+            "- Cover all listed skills before the interview plan can be treated as complete, and try to use the full interview duration when the candidate keeps responding.",
+            "- In a skills-only interview, do not finish a skill after just one or two basic questions; keep probing depth with varied conceptual and practical questions.",
+            "- Treat each skill's weightage as its pacing budget. Before you finish that skill, aim to use most of that budget; for a single-skill interview this means staying on the skill for most of the interview.",
+            "- If the candidate keeps responding, keep deepening the same skill instead",
+            "- If the candidate gives 4 consecutive non-responses on the current skill, you may stop pushing deeper on that skill and move toward completion.",
             "- If a skill has no topics, infer suitable subtopics from the role, JD, candidate background, and the skill itself.",
         ])
 
@@ -485,13 +483,13 @@ def _progress_tracking_lines(skill_specs: list[dict], question_groups: list[dict
         )
     if skill_specs:
         lines.append(
-            "- For any required skill that does not have a prepared question list, call `mark_skill_completed` only after you have covered that skill and are ready to move on."
+            "- For any required skill that does not have a prepared question list, call `mark_skill_completed` only after you have covered that skill and the runtime pacing rule for that skill has been satisfied."
         )
 
     lines.extend([
         "- When you believe all required interview items are finished, call `mark_interview_plan_completed` to request a final runtime verification pass.",
-        "- Do not enter wrap-up just because you think the plan is done; wait for runtime verification to confirm it.",
-        "- If runtime verification confirms success, immediately ask whether the candidate has any final questions, respond briefly, and conclude the interview.",
+        "- Do not change the interview mode just because you think the plan is done; wait for runtime verification to confirm it.",
+        "- If runtime verification confirms success, wait for the next explicit runtime control instruction before changing your behavior.",
         "- If runtime verification says something is missing or uncertain, continue the interview and cover only those missing required items first, then request verification again.",
     ])
     return lines
@@ -631,12 +629,12 @@ def _normalize_must_ask_topics(raw: list) -> list[dict]:
 
 def _must_ask_topic_lines(topics: list[dict]) -> list[str]:
     """Render the must-ask topics section. Caller guarantees non-empty."""
-    lines = ["Must-ask topic areas (cover all of these before wrap-up):"]
+    lines = ["Must-ask topic areas (cover all of these before the interview plan is treated as complete):"]
     high_priority = [t for t in topics if t["ask_now"]]
     normal = [t for t in topics if not t["ask_now"]]
     if high_priority:
         lines.append(
-            "  High priority (ask now / cover early): "
+            "  High priority (ask immediately after interview starts / cover early): "
             + ", ".join(t["topic"] for t in high_priority)
         )
     if normal:
