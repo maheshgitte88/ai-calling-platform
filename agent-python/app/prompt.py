@@ -324,6 +324,7 @@ def _skills_only_execution_plan_lines(skill_specs: list[dict], years_experience)
         "- Stay on the current skill until runtime later accepts that the skill is complete.",
         "- If the candidate keeps responding, continue probing depth with fresh conceptual, practical, and scenario-based questions.",
         "- If the candidate gives repeated non-responses, simplify or vary the next technical question on the same skill. Do not conclude on your own.",
+        "- Do not repeat the same question or the same topic angle on the current skill unless the next prompt is a clearly deeper follow-up tied to the candidate's latest answer.",
         "- Do not switch into wrap-up, closing, final-question mode, or conclusion mode on your own. Runtime alone will authorize that change.",
     ])
     lines.append("- Skills-only execution:")
@@ -620,6 +621,7 @@ def build_interview_memory_message(
     earlier_summary: str = "",
     pending_summary: str = "none",
     runtime_gate_summary: str = "none",
+    anti_repeat_summary: str = "none",
     wrap_up_authorized: bool = False,
 ) -> str | None:
     """Build a compact long-conversation memory block for the interviewer."""
@@ -635,6 +637,9 @@ def build_interview_memory_message(
         has_content = True
     if not wrap_up_authorized and runtime_gate_summary != "none":
         lines.append(f"Runtime pacing state: {runtime_gate_summary}.")
+        has_content = True
+    if not wrap_up_authorized and anti_repeat_summary != "none":
+        lines.append(anti_repeat_summary)
         has_content = True
 
     if not has_content:

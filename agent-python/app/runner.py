@@ -202,6 +202,7 @@ class _BaseInterviewAgent(Agent):
                 earlier_summary=self._memory_state.summary_text,
                 pending_summary=self._progress_tracker.pending_summary(),
                 runtime_gate_summary=self._progress_tracker.runtime_gate_summary(),
+                anti_repeat_summary=self._progress_tracker.anti_repeat_summary(),
                 wrap_up_authorized=self._wrap_up_authorized_provider(),
             ),
             runtime_control=self._runtime_control_provider(),
@@ -421,6 +422,7 @@ def _build_scripted_reply_chat_ctx(
             earlier_summary=memory_state.summary_text,
             pending_summary=progress_tracker.pending_summary(),
             runtime_gate_summary=progress_tracker.runtime_gate_summary(),
+            anti_repeat_summary=progress_tracker.anti_repeat_summary(),
             wrap_up_authorized=wrap_up_authorized_provider(),
         ),
         runtime_control=runtime_control_provider(),
@@ -617,9 +619,15 @@ async def _drive_interview(
     runtime_state["wrap_up_started"] = False
 
     def _on_transcript_line(line: dict) -> None:
-        if line.get("role") != "user" or not bool(line.get("is_final")):
+        if not bool(line.get("is_final")):
             return
-        progress_tracker.note_candidate_response(str(line.get("text") or ""))
+        role = line.get("role")
+        text = str(line.get("text") or "")
+        if role == "user":
+            progress_tracker.note_candidate_response(text)
+            return
+        if role == "assistant" and not wrap_up_started:
+            progress_tracker.note_interviewer_prompt(text)
 
     transcript.add_listener(_on_transcript_line)
     await _generate_interview_reply(

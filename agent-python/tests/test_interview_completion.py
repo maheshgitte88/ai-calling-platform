@@ -223,6 +223,28 @@ class InterviewProgressTrackerTests(unittest.TestCase):
         with patch("app.interview_progress.time.monotonic", return_value=60.0):
             self.assertEqual(tracker.verifier_exempt_skill_names(), ["React.js"])
 
+    def test_skills_only_tracks_already_asked_question_angles(self) -> None:
+        tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
+            "skills": [{"skill": "React", "weightage": 100}],
+        })
+
+        tracker.note_interviewer_prompt("Are you ready to begin?")
+        self.assertEqual(tracker.anti_repeat_summary(), "none")
+
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            tracker.note_candidate_response("Ready")
+
+        tracker.note_interviewer_prompt("Can you explain state vs props in React?")
+        tracker.note_interviewer_prompt("Please explain state vs props in React?")
+        tracker.note_interviewer_prompt("How do React hooks help with component state?")
+
+        summary = tracker.anti_repeat_summary()
+        self.assertIn("Already asked on React:", summary)
+        self.assertIn("state vs props in react", summary)
+        self.assertIn("react hooks help with component state", summary)
+        self.assertEqual(summary.count("state vs props in react"), 1)
+
     def test_mark_skill_completed_rejects_prepared_question_skill(self) -> None:
         tracker = InterviewProgressTracker({
             "questions": [{
@@ -588,6 +610,15 @@ class LongConversationContextTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("Wrap-up is already authorized by runtime.", message)
         self.assertNotIn("Required coverage still pending", message)
+
+    def test_build_interview_memory_message_includes_anti_repeat_guidance(self) -> None:
+        message = build_interview_memory_message(
+            earlier_summary="Earlier interviewer topics: React state.",
+            pending_summary="React coverage",
+            runtime_gate_summary="React needs about 10.0 more min",
+            anti_repeat_summary="Already asked on React: state vs props in react.",
+        )
+        self.assertIn("Already asked on React: state vs props in react.", message)
 
     async def test_prepared_verifier_allows_wrapup_when_missing_questions_stay_within_20_percent(self) -> None:
         meta = {

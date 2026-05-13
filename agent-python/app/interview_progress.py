@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Iterable
@@ -179,6 +180,9 @@ class _BaseProgressTracker:
     def note_candidate_response(self, text: str) -> None:
         del text
 
+    def note_interviewer_prompt(self, text: str) -> None:
+        del text
+
     def runtime_gate_blockers(self) -> list[dict]:
         return []
 
@@ -187,6 +191,9 @@ class _BaseProgressTracker:
 
     def verifier_exempt_skill_names(self) -> list[str]:
         return []
+
+    def anti_repeat_summary(self) -> str:
+        return "none"
 
     def completion_request_debug_state(self) -> dict:
         return {
@@ -367,8 +374,10 @@ class _SkillsOnlyProgressTracker(_BaseProgressTracker):
         self._skill_order: list[str] = []
         self._skills_only_min_fraction = 0.75
         self._nonresponse_threshold = 4
+        self._max_question_signatures = 5
         self._active_skill_key: str | None = None
         self._runtime_state_by_key: dict[str, SkillRuntimeState] = {}
+        self._asked_question_signatures_by_key: dict[str, list[str]] = {}
 
         for spec in plan.skill_specs:
             skill = str(spec.get("skill") or "").strip()
@@ -447,6 +456,20 @@ class _SkillsOnlyProgressTracker(_BaseProgressTracker):
         self._refresh_runtime_eligibility(key)
         self._sync_runtime_nonresponse_wrapup_request(key)
 
+    def note_interviewer_prompt(self, text: str) -> None:
+        key = self._ensure_active_skill_started()
+        if not key:
+            return
+        signature = self._question_signature(text)
+        if not signature:
+            return
+        seen = self._asked_question_signatures_by_key.setdefault(key, [])
+        if signature in seen:
+            return
+        seen.append(signature)
+        if len(seen) > self._max_question_signatures:
+            del seen[0 : len(seen) - self._max_question_signatures]
+
     def runtime_gate_blockers(self) -> list[dict]:
         blockers: list[dict] = []
         for key in self._skill_order:
@@ -499,6 +522,18 @@ class _SkillsOnlyProgressTracker(_BaseProgressTracker):
         if state and state.completion_reason == "nonresponse_threshold":
             return [self._display_name_by_key[only_key]]
         return []
+
+    def anti_repeat_summary(self) -> str:
+        key = self._ensure_active_skill_started()
+        if not key:
+            return "none"
+        seen = self._asked_question_signatures_by_key.get(key) or []
+        if not seen:
+            return "none"
+        return (
+            f"Already asked on {self._display_name_by_key[key]}: {'; '.join(seen)}. "
+            "Ask a different angle next, or ask a clearly deeper follow-up tied to the candidate's last answer."
+        )
 
     def completion_request_debug_state(self) -> dict:
         active_key = self._active_skill_key
@@ -686,6 +721,63 @@ class _SkillsOnlyProgressTracker(_BaseProgressTracker):
             f"{self._nonresponse_threshold} consecutive non-responses. Current non-response streak: "
             f"{blocker['consecutive_nonresponses']}."
         )
+
+    @staticmethod
+    def _question_signature(text: str) -> str:
+        body = " ".join(str(text or "").strip().split())
+        if not body:
+            return ""
+        lowered = body.casefold()
+        ignore_markers = (
+            "are you ready",
+            "ready to begin",
+            "let's begin",
+            "lets begin",
+            "final questions",
+            "wrap-up",
+            "wrap up",
+            "countdown",
+            "time remaining",
+            "thank you",
+            "thanks for your time",
+        )
+        if any(marker in lowered for marker in ignore_markers):
+            return ""
+
+        question_text = body.split("?", 1)[0] if "?" in body else body
+        opener_match = re.match(
+            r"^(what|why|how|when|where|which|who|can|could|would|should|is|are|do|does|did|explain|describe|compare|walk me through|tell me about|give me)\b",
+            question_text.strip(),
+            flags=re.IGNORECASE,
+        )
+        if "?" not in body and opener_match is None:
+            return ""
+
+        normalized = re.sub(r"[^a-z0-9\s]", " ", question_text.casefold())
+        normalized = " ".join(normalized.split())
+        if not normalized:
+            return ""
+
+        lead_patterns = (
+            r"^please\s+",
+            r"^(can|could|would|will|please)\s+you\s+",
+            r"^(what|why|how|when|where|which|who)\s+(is|are|do|does|did)\s+",
+            r"^(what|why|how|when|where|which|who)\s+",
+            r"^(explain|describe|compare|walk me through|tell me about|give me)\s+",
+        )
+        changed = True
+        while changed and normalized:
+            changed = False
+            for pattern in lead_patterns:
+                updated = re.sub(pattern, "", normalized, count=1)
+                if updated != normalized:
+                    normalized = updated.strip()
+                    changed = True
+        normalized = normalized.strip()
+        if not normalized:
+            return ""
+        words = normalized.split()
+        return " ".join(words[:8])
 
     @staticmethod
     def _now_monotonic() -> float:
