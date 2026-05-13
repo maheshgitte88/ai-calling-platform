@@ -26,10 +26,11 @@ from .avatar import maybe_attach_avatar
 from .config import Settings, settings as default_settings
 from .db import get_db
 from .evaluation import generate_structured_evaluation
+from .interview_memory import InterviewMemoryState, build_compact_chat_context
 from .interview_progress import InterviewProgressTracker
 from .metadata import InterviewDurations, compute_durations, parse_metadata
 from .pre_wrapup_verifier import verify_pre_wrapup_coverage
-from .prompt import build_prompt, build_runtime_control_message
+from .prompt import build_interview_memory_message, build_prompt, build_runtime_control_message
 from .provider_resolver import resolve_provider_cfg
 from .time_utils import now_iso
 from .transcript import TranscriptRecorder
@@ -179,11 +180,33 @@ class _BaseInterviewAgent(Agent):
         llm: Any,
         tts: Any,
         progress_tracker: InterviewProgressTracker,
+        transcript: TranscriptRecorder,
+        memory_state: InterviewMemoryState,
         runtime_control_provider: Callable[[], str | None],
+        wrap_up_authorized_provider: Callable[[], bool],
     ) -> None:
         super().__init__(instructions=instructions, stt=stt, llm=llm, tts=tts)
+        self._base_prompt = instructions
         self._progress_tracker = progress_tracker
+        self._transcript = transcript
+        self._memory_state = memory_state
         self._runtime_control_provider = runtime_control_provider
+        self._wrap_up_authorized_provider = wrap_up_authorized_provider
+
+    def _build_compact_turn_context(self, source_ctx: ChatContext) -> ChatContext:
+        self._memory_state.refresh_from_transcript(self._transcript.lines)
+        return build_compact_chat_context(
+            source_ctx=source_ctx,
+            base_instructions=self._base_prompt,
+            memory_message=build_interview_memory_message(
+                earlier_summary=self._memory_state.summary_text,
+                pending_summary=self._progress_tracker.pending_summary(),
+                runtime_gate_summary=self._progress_tracker.runtime_gate_summary(),
+                wrap_up_authorized=self._wrap_up_authorized_provider(),
+            ),
+            runtime_control=self._runtime_control_provider(),
+            max_tail_items=self._memory_state.max_tail_items,
+        )
 
     async def on_user_turn_completed(
         self,
@@ -191,9 +214,7 @@ class _BaseInterviewAgent(Agent):
         new_message: ChatMessage,
     ) -> None:
         del new_message
-        runtime_control = self._runtime_control_provider()
-        if runtime_control:
-            turn_ctx.add_message(role="system", content=runtime_control)
+        turn_ctx.items[:] = self._build_compact_turn_context(turn_ctx).items
 
     @function_tool(flags=ToolFlag.IGNORE_ON_ENTER)
     async def mark_interview_plan_completed(self, context: RunContext) -> str:
@@ -382,6 +403,56 @@ async def _wait_for_reconnect(
     return "timeout"
 
 
+def _build_scripted_reply_chat_ctx(
+    *,
+    session: AgentSession,
+    base_prompt: str,
+    transcript: TranscriptRecorder,
+    progress_tracker: InterviewProgressTracker,
+    memory_state: InterviewMemoryState,
+    runtime_control_provider: Callable[[], str | None],
+    wrap_up_authorized_provider: Callable[[], bool],
+) -> ChatContext:
+    memory_state.refresh_from_transcript(transcript.lines, force=True)
+    return build_compact_chat_context(
+        source_ctx=session.history,
+        base_instructions=base_prompt,
+        memory_message=build_interview_memory_message(
+            earlier_summary=memory_state.summary_text,
+            pending_summary=progress_tracker.pending_summary(),
+            runtime_gate_summary=progress_tracker.runtime_gate_summary(),
+            wrap_up_authorized=wrap_up_authorized_provider(),
+        ),
+        runtime_control=runtime_control_provider(),
+        max_tail_items=memory_state.max_tail_items,
+    )
+
+
+async def _generate_interview_reply(
+    *,
+    session: AgentSession,
+    base_prompt: str,
+    transcript: TranscriptRecorder,
+    progress_tracker: InterviewProgressTracker,
+    memory_state: InterviewMemoryState,
+    runtime_control_provider: Callable[[], str | None],
+    wrap_up_authorized_provider: Callable[[], bool],
+    instructions: str,
+) -> None:
+    await session.generate_reply(
+        instructions=instructions,
+        chat_ctx=_build_scripted_reply_chat_ctx(
+            session=session,
+            base_prompt=base_prompt,
+            transcript=transcript,
+            progress_tracker=progress_tracker,
+            memory_state=memory_state,
+            runtime_control_provider=runtime_control_provider,
+            wrap_up_authorized_provider=wrap_up_authorized_provider,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Candidate presence tracking
 # ---------------------------------------------------------------------------
@@ -513,6 +584,10 @@ async def _drive_interview(
     tracker: CandidateRoomTracker,
     progress_tracker: InterviewProgressTracker,
     runtime_state: dict[str, Any],
+    memory_state: InterviewMemoryState,
+    runtime_control_provider: Callable[[], str | None],
+    wrap_up_authorized_provider: Callable[[], bool],
+    base_prompt: str,
     transcript: TranscriptRecorder,
     meta: dict,
     provider_cfg: dict,
@@ -547,7 +622,16 @@ async def _drive_interview(
         progress_tracker.note_candidate_response(str(line.get("text") or ""))
 
     transcript.add_listener(_on_transcript_line)
-    await session.generate_reply(instructions=_initial_reply_instructions())
+    await _generate_interview_reply(
+        session=session,
+        base_prompt=base_prompt,
+        transcript=transcript,
+        progress_tracker=progress_tracker,
+        memory_state=memory_state,
+        runtime_control_provider=runtime_control_provider,
+        wrap_up_authorized_provider=wrap_up_authorized_provider,
+        instructions=_initial_reply_instructions(),
+    )
 
     while True:
         if tracker.connected.is_set():
@@ -601,12 +685,19 @@ async def _drive_interview(
                 except Exception:
                     logger.exception("[Interview] Pre-wrap-up verification failed; continuing interview.")
                     if tracker.connected.is_set():
-                        await session.generate_reply(
+                        await _generate_interview_reply(
+                            session=session,
+                            base_prompt=base_prompt,
+                            transcript=transcript,
+                            progress_tracker=progress_tracker,
+                            memory_state=memory_state,
+                            runtime_control_provider=runtime_control_provider,
+                            wrap_up_authorized_provider=wrap_up_authorized_provider,
                             instructions=(
                                 "Do not start wrap-up yet. A final verification step could not confirm full coverage. "
                                 "Continue the interview and ensure every required interview item is covered, "
                                 "then call `mark_interview_plan_completed` again."
-                            )
+                            ),
                         )
                     continue
 
@@ -627,8 +718,15 @@ async def _drive_interview(
                             },
                         )
                         if tracker.connected.is_set():
-                            await session.generate_reply(
-                                instructions=_skills_only_gate_retry_instruction(blockers)
+                            await _generate_interview_reply(
+                                session=session,
+                                base_prompt=base_prompt,
+                                transcript=transcript,
+                                progress_tracker=progress_tracker,
+                                memory_state=memory_state,
+                                runtime_control_provider=runtime_control_provider,
+                                wrap_up_authorized_provider=wrap_up_authorized_provider,
+                                instructions=_skills_only_gate_retry_instruction(blockers),
                             )
                         continue
 
@@ -643,11 +741,18 @@ async def _drive_interview(
                     },
                 )
                 if tracker.connected.is_set():
-                    await session.generate_reply(
+                    await _generate_interview_reply(
+                        session=session,
+                        base_prompt=base_prompt,
+                        transcript=transcript,
+                        progress_tracker=progress_tracker,
+                        memory_state=memory_state,
+                        runtime_control_provider=runtime_control_provider,
+                        wrap_up_authorized_provider=wrap_up_authorized_provider,
                         instructions=_missing_items_retry_instruction(
                             missing_items,
                             verification.notes,
-                        )
+                        ),
                     )
                 continue
             drive_outcome = outcome
@@ -691,8 +796,15 @@ async def _drive_interview(
                 extra={"session_id": session_id, "wrap_up_ends_at": wrap_up_ends_at},
             )
         if tracker.connected.is_set():
-            await session.generate_reply(
-                instructions=_wrap_up_instruction_text(durations.conclude_buffer_seconds)
+            await _generate_interview_reply(
+                session=session,
+                base_prompt=base_prompt,
+                transcript=transcript,
+                progress_tracker=progress_tracker,
+                memory_state=memory_state,
+                runtime_control_provider=runtime_control_provider,
+                wrap_up_authorized_provider=wrap_up_authorized_provider,
+                instructions=_wrap_up_instruction_text(durations.conclude_buffer_seconds),
             )
 
     if not wrap_up_started:
@@ -818,12 +930,16 @@ async def run_interview(
     transcript = TranscriptRecorder(db, session_id)
 
     await ctx.connect()
-    session = AgentSession()
+    memory_state = InterviewMemoryState()
+    session = AgentSession(userdata=memory_state)
     runtime_state: dict[str, Any] = {
         "loop": None,
         "drive_deadline": None,
         "wrap_up_started": False,
     }
+    def _wrap_up_authorized_provider() -> bool:
+        return bool(runtime_state.get("wrap_up_started"))
+
     def _runtime_control_provider() -> str | None:
         if progress_tracker.plan_mode == "none":
             return None
@@ -851,7 +967,10 @@ async def run_interview(
             llm=llm,
             tts=tts,
             progress_tracker=progress_tracker,
+            transcript=transcript,
+            memory_state=memory_state,
             runtime_control_provider=_runtime_control_provider,
+            wrap_up_authorized_provider=_wrap_up_authorized_provider,
         )
     elif progress_tracker.plan_mode == "skills_only":
         agent = SkillsOnlyInterviewAgent(
@@ -860,7 +979,10 @@ async def run_interview(
             llm=llm,
             tts=tts,
             progress_tracker=progress_tracker,
+            transcript=transcript,
+            memory_state=memory_state,
             runtime_control_provider=_runtime_control_provider,
+            wrap_up_authorized_provider=_wrap_up_authorized_provider,
         )
     else:
         agent = Agent(instructions=prompt, stt=stt, llm=llm, tts=tts)
@@ -887,6 +1009,10 @@ async def run_interview(
             tracker=tracker,
             progress_tracker=progress_tracker,
             runtime_state=runtime_state,
+            memory_state=memory_state,
+            runtime_control_provider=_runtime_control_provider,
+            wrap_up_authorized_provider=_wrap_up_authorized_provider,
+            base_prompt=prompt,
             transcript=transcript,
             meta=meta,
             provider_cfg=provider_cfg,

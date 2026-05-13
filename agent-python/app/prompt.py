@@ -615,6 +615,42 @@ def build_runtime_control_message(
     return "\n".join(lines)
 
 
+def build_interview_memory_message(
+    *,
+    earlier_summary: str = "",
+    pending_summary: str = "none",
+    runtime_gate_summary: str = "none",
+    wrap_up_authorized: bool = False,
+) -> str | None:
+    """Build a compact long-conversation memory block for the interviewer."""
+    lines = ["Interview memory:"]
+    has_content = False
+
+    earlier_summary = (earlier_summary or "").strip()
+    if earlier_summary:
+        lines.append(earlier_summary)
+        has_content = True
+    if not wrap_up_authorized and pending_summary != "none":
+        lines.append(f"Required coverage still pending: {pending_summary}.")
+        has_content = True
+    if not wrap_up_authorized and runtime_gate_summary != "none":
+        lines.append(f"Runtime pacing state: {runtime_gate_summary}.")
+        has_content = True
+
+    if not has_content:
+        return None
+
+    if wrap_up_authorized:
+        lines.append(
+            "Wrap-up is already authorized by runtime. Do not reopen missing coverage items or resume substantive technical interviewing."
+        )
+    else:
+        lines.append(
+            "Use this compressed memory to stay consistent across the long interview. Continue interviewing normally unless runtime explicitly authorizes wrap-up."
+        )
+    return "\n".join(lines)
+
+
 __all__ = [
     "INTERVIEW_AGENT_DEFAULT_INSTRUCTIONS",
     "MUST_ASK_TOPICS_POLICY",
@@ -624,6 +660,7 @@ __all__ = [
     "build_difficulty_policy",
     "default_difficulty_for_experience",
     "build_prompt",
+    "build_interview_memory_message",
     "build_runtime_control_message",
     "compose_runtime_instructions",
 ]

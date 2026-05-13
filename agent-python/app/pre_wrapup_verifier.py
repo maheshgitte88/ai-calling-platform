@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .evaluation import _eval_json
 from .interview_plan import InterviewPlan, resolve_interview_plan
 from .skills import canonical_skill_key
+
+PREPARED_QUESTION_WRAPUP_MIN_COVERAGE = 0.8
 
 _PREPARED_VERIFY_SYSTEM_PROMPT = """
 You verify prepared-question interview coverage before wrap-up. Reply with ONLY valid JSON.
@@ -17,6 +20,7 @@ Rules:
 - Use only the interviewer transcript to decide whether a required prepared question was clearly asked or an unmistakable equivalent was asked.
 - Prepared-question coverage depends on whether the interviewer asked it, not on whether the candidate answered well, partially, incorrectly, or said "I don't know".
 - Never mark a prepared question as missing just because the candidate could not answer it after it was asked.
+- The runtime may still authorize wrap-up when overall prepared-question coverage is high enough, so keep the missing list accurate and concise.
 - Do not assume coverage from greetings, wrap-up, or vague mentions.
 - Use the provided skill names and prepared question numbers from the plan. Treat common aliases like `React` and `React.js` as the same skill.
 
@@ -85,6 +89,10 @@ def _prepared_question_plan(plan: InterviewPlan) -> list[dict]:
 
 def _skills_only_plan(plan: InterviewPlan) -> list[str]:
     return [spec["skill"] for spec in plan.skill_specs if spec.get("skill")]
+
+
+def _prepared_question_total(plan: InterviewPlan) -> int:
+    return sum(len(group.get("questions") or []) for group in plan.question_groups)
 
 
 def _assistant_only_transcript(transcript_lines: list[dict]) -> str:
@@ -242,6 +250,56 @@ def _normalize_verification_result(
     )
 
 
+def _apply_prepared_question_tolerance(
+    result: PreWrapupVerificationResult,
+    plan: InterviewPlan,
+) -> PreWrapupVerificationResult:
+    total_questions = _prepared_question_total(plan)
+    if total_questions <= 0 or result.ready_for_wrapup:
+        return result
+
+    missing_questions = [item for item in result.missing_items if item.get("type") == "question"]
+    non_question_missing = [item for item in result.missing_items if item.get("type") != "question"]
+    if non_question_missing:
+        return result
+
+    required_questions = max(1, math.ceil(total_questions * PREPARED_QUESTION_WRAPUP_MIN_COVERAGE))
+    asked_questions = total_questions - len(missing_questions)
+    if asked_questions < required_questions:
+        return result
+
+    tolerated_marks = [
+        (str(item["skill"]), int(item["question_number"]))
+        for item in missing_questions
+        if item.get("skill") and isinstance(item.get("question_number"), int)
+    ]
+    verified_marks = list(result.verified_question_marks)
+    seen_marks = set(verified_marks)
+    for mark in tolerated_marks:
+        if mark not in seen_marks:
+            verified_marks.append(mark)
+            seen_marks.add(mark)
+
+    allowed_missing = total_questions - required_questions
+    tolerance_note = (
+        f"Prepared-question wrap-up tolerance applied: {len(missing_questions)} of {total_questions} "
+        f"questions were still missing, which is within the allowed overall gap of {allowed_missing}."
+    )
+    notes = result.notes
+    if notes:
+        notes = f"{notes} {tolerance_note}"
+    else:
+        notes = tolerance_note
+
+    return PreWrapupVerificationResult(
+        verified_question_marks=verified_marks,
+        verified_skill_completions=result.verified_skill_completions,
+        missing_items=[],
+        ready_for_wrapup=True,
+        notes=notes,
+    )
+
+
 async def _verify_prepared_question_coverage(
     *,
     plan: InterviewPlan,
@@ -262,7 +320,7 @@ async def _verify_prepared_question_coverage(
         system=_PREPARED_VERIFY_SYSTEM_PROMPT,
         user=_build_prepared_verification_user_prompt(plan, transcript_lines),
     )
-    return _normalize_verification_result(raw, plan)
+    return _apply_prepared_question_tolerance(_normalize_verification_result(raw, plan), plan)
 
 
 async def _verify_skills_only_coverage(

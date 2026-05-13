@@ -2,12 +2,15 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from livekit.agents import ChatContext
+
+from app.interview_memory import InterviewMemoryState
 from app.interview_plan import resolve_interview_plan
 from app.provider_resolver import resolve_provider_cfg
 from app.interview_progress import InterviewProgressTracker
 from app.pre_wrapup_verifier import _build_verification_user_prompt, verify_pre_wrapup_coverage
-from app.prompt import compose_runtime_instructions
-from app.runner import _wait_for_drive_outcome, _wait_for_reconnect
+from app.prompt import build_interview_memory_message, compose_runtime_instructions
+from app.runner import _build_scripted_reply_chat_ctx, _generate_interview_reply, _wait_for_drive_outcome, _wait_for_reconnect
 from app.skills import canonical_skill_key
 
 
@@ -462,6 +465,193 @@ class ProviderResolverTests(unittest.TestCase):
         self.assertEqual(cfg["llm"]["provider"], "xai")
         self.assertEqual(cfg["llm"]["model"], "grok-4-1-fast-non-reasoning")
         self.assertEqual(cfg["llm"]["api_key"], "x-test-key")
+
+
+class LongConversationContextTests(unittest.IsolatedAsyncioTestCase):
+    def test_interview_memory_refresh_only_summarizes_older_lines(self) -> None:
+        memory_state = InterviewMemoryState(summary_tail_lines=2)
+        transcript_lines = [
+            {"role": "assistant", "text": "Explain React state.", "is_final": True},
+            {"role": "user", "text": "State stores component data.", "is_final": True},
+            {"role": "assistant", "text": "How do hooks work?", "is_final": True},
+            {"role": "user", "text": "Hooks let function components use state.", "is_final": True},
+        ]
+
+        summary = memory_state.refresh_from_transcript(transcript_lines, force=True)
+
+        self.assertIn("Explain React state.", summary)
+        self.assertIn("State stores component data.", summary)
+        self.assertNotIn("How do hooks work?", summary)
+        self.assertNotIn("Hooks let function components use state.", summary)
+
+    def test_build_scripted_reply_chat_ctx_uses_bounded_tail(self) -> None:
+        tracker = InterviewProgressTracker({
+            "questions": [{"skill": "React", "questions": ["Q1", "Q2"]}],
+        })
+        history = ChatContext()
+        history.add_message(role="system", content="old instructions")
+        for idx in range(6):
+            history.add_message(role="assistant", content=f"assistant-{idx}")
+            history.add_message(role="user", content=f"user-{idx}")
+
+        session = type("Session", (), {"history": history})()
+        transcript = type("Transcript", (), {
+            "lines": [
+                {"role": "assistant", "text": "Explain React state.", "is_final": True},
+                {"role": "user", "text": "State stores component data.", "is_final": True},
+                {"role": "assistant", "text": "How do hooks work?", "is_final": True},
+                {"role": "user", "text": "Hooks let function components use state.", "is_final": True},
+            ]
+        })()
+        memory_state = InterviewMemoryState(max_tail_items=4, summary_tail_lines=2)
+
+        chat_ctx = _build_scripted_reply_chat_ctx(
+            session=session,
+            base_prompt="Base prompt",
+            transcript=transcript,
+            progress_tracker=tracker,
+            memory_state=memory_state,
+            runtime_control_provider=lambda: "Runtime control: continue interviewing.",
+            wrap_up_authorized_provider=lambda: False,
+        )
+
+        text_items = [item.text_content for item in chat_ctx.items if getattr(item, "type", "") == "message"]
+        self.assertEqual(text_items[0], "Base prompt")
+        self.assertTrue(any("Interview memory:" in text for text in text_items))
+        self.assertTrue(any("Runtime control: continue interviewing." in text for text in text_items))
+        self.assertIn("assistant-4", text_items)
+        self.assertIn("user-5", text_items)
+        self.assertNotIn("assistant-0", text_items)
+        self.assertLessEqual(len(chat_ctx.items), 7)
+
+    async def test_generate_interview_reply_passes_compact_chat_ctx(self) -> None:
+        tracker = InterviewProgressTracker({
+            "skills": [{"skill": "React", "weightage": 100}],
+            "durationMinutes": 20,
+        })
+        history = ChatContext()
+        for idx in range(8):
+            history.add_message(role="assistant", content=f"assistant-{idx}")
+            history.add_message(role="user", content=f"user-{idx}")
+
+        session = type("Session", (), {
+            "history": history,
+            "generate_reply": AsyncMock(),
+        })()
+        transcript = type("Transcript", (), {
+            "lines": [
+                {"role": "assistant", "text": "Explain React state.", "is_final": True},
+                {"role": "user", "text": "State stores component data.", "is_final": True},
+                {"role": "assistant", "text": "How do hooks work?", "is_final": True},
+                {"role": "user", "text": "Hooks let function components use state.", "is_final": True},
+            ]
+        })()
+        memory_state = InterviewMemoryState(max_tail_items=4, summary_tail_lines=2)
+
+        await _generate_interview_reply(
+            session=session,
+            base_prompt="Base prompt",
+            transcript=transcript,
+            progress_tracker=tracker,
+            memory_state=memory_state,
+            runtime_control_provider=lambda: "Runtime control: continue interviewing.",
+            wrap_up_authorized_provider=lambda: False,
+            instructions="Ask the next question now.",
+        )
+
+        session.generate_reply.assert_awaited_once()
+        kwargs = session.generate_reply.await_args.kwargs
+        self.assertEqual(kwargs["instructions"], "Ask the next question now.")
+        self.assertIn("chat_ctx", kwargs)
+        chat_ctx = kwargs["chat_ctx"]
+        text_items = [item.text_content for item in chat_ctx.items if getattr(item, "type", "") == "message"]
+        self.assertEqual(text_items[0], "Base prompt")
+        self.assertTrue(any("Interview memory:" in text for text in text_items))
+        self.assertNotIn("assistant-0", text_items)
+        self.assertIn("assistant-6", text_items)
+
+    def test_build_interview_memory_message_returns_none_without_content(self) -> None:
+        self.assertIsNone(
+            build_interview_memory_message(
+                earlier_summary="",
+                pending_summary="none",
+                runtime_gate_summary="none",
+            )
+        )
+
+    def test_build_interview_memory_message_omits_pending_items_after_wrapup(self) -> None:
+        message = build_interview_memory_message(
+            earlier_summary="Earlier interviewer topics: React state.",
+            pending_summary="React questions 7, 20",
+            runtime_gate_summary="none",
+            wrap_up_authorized=True,
+        )
+        self.assertIn("Wrap-up is already authorized by runtime.", message)
+        self.assertNotIn("Required coverage still pending", message)
+
+    async def test_prepared_verifier_allows_wrapup_when_missing_questions_stay_within_20_percent(self) -> None:
+        meta = {
+            "interviewMeta": {
+                "questions": [{
+                    "skill": "React",
+                    "questions": [f"Q{i}" for i in range(1, 21)],
+                }],
+            }
+        }
+        provider_cfg = {"llm": {"provider": "openai", "api_key": "k", "model": "m"}}
+        mocked = {
+            "verifiedPreparedQuestions": [{"skill": "React", "questionNumbers": list(range(1, 19))}],
+            "missingQuestions": [
+                {"skill": "React", "questionNumber": 19, "question": "Q19"},
+                {"skill": "React", "questionNumber": 20, "question": "Q20"},
+            ],
+            "readyForWrapup": False,
+            "notes": "2 out of 20 prepared questions were not asked.",
+        }
+        with patch("app.pre_wrapup_verifier._eval_json", new=AsyncMock(return_value=mocked)):
+            result = await verify_pre_wrapup_coverage(
+                meta=meta,
+                transcript_lines=[{"role": "assistant", "text": "Q1", "is_final": True}],
+                provider_cfg=provider_cfg,
+            )
+
+        self.assertTrue(result.ready_for_wrapup)
+        self.assertEqual(result.missing_items, [])
+        self.assertIn(("React", 19), result.verified_question_marks)
+        self.assertIn(("React", 20), result.verified_question_marks)
+        self.assertIn("tolerance applied", result.notes.lower())
+
+    async def test_prepared_verifier_blocks_wrapup_when_missing_questions_exceed_20_percent(self) -> None:
+        meta = {
+            "interviewMeta": {
+                "questions": [{
+                    "skill": "React",
+                    "questions": [f"Q{i}" for i in range(1, 21)],
+                }],
+            }
+        }
+        provider_cfg = {"llm": {"provider": "openai", "api_key": "k", "model": "m"}}
+        mocked = {
+            "verifiedPreparedQuestions": [{"skill": "React", "questionNumbers": list(range(1, 16))}],
+            "missingQuestions": [
+                {"skill": "React", "questionNumber": 16, "question": "Q16"},
+                {"skill": "React", "questionNumber": 17, "question": "Q17"},
+                {"skill": "React", "questionNumber": 18, "question": "Q18"},
+                {"skill": "React", "questionNumber": 19, "question": "Q19"},
+                {"skill": "React", "questionNumber": 20, "question": "Q20"},
+            ],
+            "readyForWrapup": False,
+            "notes": "5 out of 20 prepared questions were not asked.",
+        }
+        with patch("app.pre_wrapup_verifier._eval_json", new=AsyncMock(return_value=mocked)):
+            result = await verify_pre_wrapup_coverage(
+                meta=meta,
+                transcript_lines=[{"role": "assistant", "text": "Q1", "is_final": True}],
+                provider_cfg=provider_cfg,
+            )
+
+        self.assertFalse(result.ready_for_wrapup)
+        self.assertEqual(len(result.missing_items), 5)
 
 
 class SkillsHelpersTests(unittest.TestCase):
