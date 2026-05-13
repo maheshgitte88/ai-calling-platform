@@ -2,9 +2,11 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from app.interview_plan import resolve_interview_plan
 from app.provider_resolver import resolve_provider_cfg
 from app.interview_progress import InterviewProgressTracker
 from app.pre_wrapup_verifier import _build_verification_user_prompt, verify_pre_wrapup_coverage
+from app.prompt import compose_runtime_instructions
 from app.runner import _wait_for_drive_outcome, _wait_for_reconnect
 from app.skills import canonical_skill_key
 
@@ -150,35 +152,15 @@ class InterviewProgressTrackerTests(unittest.TestCase):
                 "React.js needs about 13.5 more min or 4 consecutive non-responses (current streak: 0)",
             )
 
-    def test_mixed_plan_requires_questions_and_skills_without_questions(self) -> None:
-        tracker = InterviewProgressTracker({
-            "questions": [{
-                "skill": "Core Java",
-                "questions": ["Q1", "Q2"],
-                "weightage": 70,
-            }],
-            "skills": [
-                {"skill": "Core Java", "weightage": 70},
-                {"skill": "SQL", "weightage": 30},
-            ],
-        })
-
-        tracker.mark_question_asked("Core Java", 1)
-        self.assertFalse(tracker.plan_completed.is_set())
-        tracker.mark_question_asked("Core Java", 2)
-        self.assertFalse(tracker.plan_completed.is_set())
-
-        confirm_before_sql = tracker.confirm_plan_completed()
-        self.assertTrue(confirm_before_sql.accepted)
-        self.assertIn("Current tracker state", confirm_before_sql.message)
-        self.assertTrue(tracker.completion_requested.is_set())
-        authorize_before_sql = tracker.authorize_plan_completion()
-        self.assertFalse(authorize_before_sql.accepted)
-        self.assertIn("SQL coverage", authorize_before_sql.message)
-        self.assertFalse(tracker.plan_completed.is_set())
-
-        tracker.mark_skill_completed("SQL")
-        self.assertFalse(tracker.plan_completed.is_set())
+    def test_mixed_plan_is_rejected_at_boundary(self) -> None:
+        with self.assertRaises(ValueError):
+            InterviewProgressTracker({
+                "questions": [{
+                    "skill": "Core Java",
+                    "questions": ["Q1", "Q2"],
+                }],
+                "skills": [{"skill": "SQL"}],
+            })
 
     def test_verified_corrections_can_release_wrapup(self) -> None:
         tracker = InterviewProgressTracker({
@@ -186,14 +168,9 @@ class InterviewProgressTrackerTests(unittest.TestCase):
                 "skill": "Core Java",
                 "questions": ["Q1", "Q2"],
             }],
-            "skills": [
-                {"skill": "Core Java"},
-                {"skill": "SQL"},
-            ],
         })
 
         tracker.apply_verified_question_marks([("Core Java", 1), ("Core Java", 2)])
-        tracker.apply_verified_skill_completions(["SQL"])
         self.assertTrue(tracker.is_structurally_complete())
 
         tracker.confirm_plan_completed()
@@ -324,6 +301,35 @@ class WaitForDriveOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "candidate_reconnected")
 
 
+class InterviewPlanHelpersTests(unittest.TestCase):
+    def test_resolve_interview_plan_picks_prepared_flow(self) -> None:
+        plan = resolve_interview_plan({
+            "questions": [{"skill": "React", "questions": ["Q1"]}],
+        })
+        self.assertEqual(plan.mode, "prepared_questions")
+        self.assertEqual(len(plan.question_groups), 1)
+        self.assertEqual(plan.skill_specs, [])
+
+    def test_compose_runtime_instructions_adds_remaining_time_before_wrapup(self) -> None:
+        instructions = compose_runtime_instructions(
+            "Base prompt",
+            plan_mode="prepared_questions",
+            remaining_minutes=12.5,
+        )
+        self.assertIn("Remaining interview time before runtime wrap-up authorization: 12.5 min.", instructions)
+        self.assertIn("Do not say the remaining time aloud", instructions)
+        self.assertNotIn("Wrap-up is explicitly authorized", instructions)
+
+    def test_compose_runtime_instructions_switches_to_wrapup_mode(self) -> None:
+        instructions = compose_runtime_instructions(
+            "Base prompt",
+            plan_mode="skills_only",
+            wrap_up_authorized=True,
+        )
+        self.assertIn("Wrap-up is explicitly authorized by runtime.", instructions)
+        self.assertNotIn("Remaining interview time before runtime wrap-up authorization", instructions)
+
+
 class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
     async def test_verifier_short_circuits_when_no_structured_plan(self) -> None:
         result = await verify_pre_wrapup_coverage(
@@ -360,7 +366,6 @@ class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
                     "skill": "Core Java",
                     "questions": ["Q1", "Q2"],
                 }],
-                "skills": [{"skill": "SQL"}],
             }
         }
         transcript_lines = [
@@ -370,11 +375,9 @@ class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
         provider_cfg = {"llm": {"provider": "openai", "api_key": "k", "model": "m"}}
         mocked = {
             "verifiedPreparedQuestions": [{"skill": "Core Java", "questionNumbers": [1]}],
-            "verifiedSkills": [],
             "missingQuestions": [{"skill": "Core Java", "questionNumber": 2, "question": "Q2"}],
-            "missingSkills": ["SQL"],
             "readyForWrapup": False,
-            "notes": "Question 2 and SQL were not clearly covered.",
+            "notes": "Question 2 was not clearly covered.",
         }
         with patch("app.pre_wrapup_verifier._eval_json", new=AsyncMock(return_value=mocked)):
             result = await verify_pre_wrapup_coverage(
@@ -385,10 +388,9 @@ class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.ready_for_wrapup)
         self.assertEqual(result.verified_question_marks, [("Core Java", 1)])
-        self.assertEqual(len(result.missing_items), 2)
+        self.assertEqual(len(result.missing_items), 1)
         self.assertEqual(result.missing_items[0]["type"], "question")
-        self.assertEqual(result.missing_items[1]["type"], "skill")
-        self.assertIn("SQL", result.notes)
+        self.assertIn("Question 2", result.notes)
 
     async def test_verifier_normalizes_skill_aliases_to_plan_name(self) -> None:
         meta = {

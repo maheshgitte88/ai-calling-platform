@@ -298,7 +298,6 @@ sudo systemctl restart ai-interview-agent
 - Interview architecture: `docs/LIVEKIT_VIDEO_INTERVIEW_E2E.md`
 - General architecture: `docs/ARCHITECTURE.md`
 
-
 Here’s a straightforward way to **change `agent-python/.env`** and **restart** the worker.
 
 ### 1. Edit the file on the server (SSH)
@@ -348,7 +347,6 @@ In the logs you should see something like **`registered worker`** with **`"url":
 ---
 
 **Note:** Don’t run **both** systemd **and** PM2 for the same agent—only one process should own `interview_agent_entrypoint.py`.
-
 
 <!-- how to setup nginx -->
 
@@ -424,7 +422,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 ### 3. Open ports (AWS + optional UFW)
 
-- **EC2 security group:** **80** and **443** inbound from the internet.  
+- **EC2 security group:** **80** and **443** inbound from the internet.
 - **UFW (if used):**  
   `sudo ufw allow 'Nginx Full'`  
   or `sudo ufw allow 80,443/tcp`
@@ -471,8 +469,8 @@ VITE_API_BASE_URL=https://api.maheshgitte.online
 
 ### 6. Reminders
 
-- LiveKit **UDP** (e.g. **50000–60000**) must still be open in the security group.  
-- Node must be listening on **`127.0.0.1:4040`**, LiveKit on **`127.0.0.1:7880`**.  
+- LiveKit **UDP** (e.g. **50000–60000**) must still be open in the security group.
+- Node must be listening on **`127.0.0.1:4040`**, LiveKit on **`127.0.0.1:7880`**.
 - If **403/404** on static files, that’s expected on **`api.…`** if you only proxy **`/api/`**.
 
 That’s the full Nginx path: **install → config → `nginx -t` → Certbot → update envs**.

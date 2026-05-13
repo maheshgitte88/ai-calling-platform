@@ -1,9 +1,4 @@
-"""Runtime interview-plan progress tracking.
-
-This module turns the dispatch payload into a deterministic checklist so the
-runtime can detect when the interview plan is complete and start wrap-up
-immediately instead of waiting for the full drive timer.
-"""
+"""Runtime interview-plan progress tracking."""
 
 from __future__ import annotations
 
@@ -13,9 +8,9 @@ import time
 from dataclasses import dataclass
 from typing import Iterable
 
+from .interview_plan import InterviewPlan, PlanMode, resolve_interview_plan
 from .metadata import compute_durations
-from .prompt import _normalize_question_groups
-from .skills import canonical_skill_key, normalize_skill_specs
+from .skills import canonical_skill_key
 
 logger = logging.getLogger(__name__)
 
@@ -45,88 +40,203 @@ class SkillRuntimeState:
     auto_completed_via_nonresponse: bool = False
 
 
-class InterviewProgressTracker:
-    """Track completion of the required interview plan.
-
-    Required items come from two sources:
-    - Prepared questions (`interviewMeta.questions`) → each question is required.
-    - Skills without prepared questions (`interviewMeta.skills`) → the skill must
-      be explicitly marked completed after the interviewer has covered it.
-    """
-
-    def __init__(self, interview_meta: dict) -> None:
+class _BaseProgressTracker:
+    def __init__(self, plan_mode: PlanMode) -> None:
+        self.plan_mode = plan_mode
         self.plan_completed: asyncio.Event = asyncio.Event()
         self.completion_requested: asyncio.Event = asyncio.Event()
         self._manual_completion_requested = False
         self._runtime_completion_requested = False
+
+    @property
+    def has_plan(self) -> bool:
+        return self.plan_mode != "none"
+
+    @property
+    def skills_only_mode(self) -> bool:
+        return self.plan_mode == "skills_only"
+
+    def mark_question_asked(self, skill: str, question_number: int) -> ProgressUpdate:
+        del skill, question_number
+        return ProgressUpdate(
+            accepted=False,
+            plan_completed=self.plan_completed.is_set(),
+            message="No prepared-question flow is active in this interview plan.",
+        )
+
+    def mark_skill_completed(self, skill: str) -> ProgressUpdate:
+        del skill
+        return ProgressUpdate(
+            accepted=False,
+            plan_completed=self.plan_completed.is_set(),
+            message="No skills-only flow is active in this interview plan.",
+        )
+
+    def confirm_plan_completed(self) -> ProgressUpdate:
+        if not self.has_plan:
+            return ProgressUpdate(
+                accepted=False,
+                plan_completed=False,
+                message="No structured interview plan is active, so there is nothing to mark complete.",
+            )
+        if not self._manual_completion_requested:
+            logger.info(
+                "[InterviewProgress] Manual completion requested.",
+                extra={
+                    "plan_mode": self.plan_mode,
+                    "pending_summary": self.pending_summary(),
+                    "runtime_gate_summary": self.runtime_gate_summary(),
+                },
+            )
+        self._manual_completion_requested = True
+        self._sync_completion_requested_event()
+        if self.plan_completed.is_set():
+            return ProgressUpdate(
+                accepted=True,
+                plan_completed=True,
+                message="Interview plan completion has already been verified. Wait for runtime wrap-up instructions.",
+            )
+        return ProgressUpdate(
+            accepted=True,
+            plan_completed=False,
+            message=(
+                "Final completion check requested. Wait for runtime verification before entering wrap-up. "
+                f"Current tracker state: {self.pending_summary()}."
+            ),
+        )
+
+    def clear_completion_request(self) -> None:
+        if self._manual_completion_requested or self._runtime_completion_requested:
+            logger.info(
+                "[InterviewProgress] Clearing completion request state.",
+                extra=self.completion_request_debug_state(),
+            )
+        self._manual_completion_requested = False
+        self._runtime_completion_requested = False
+        self._sync_completion_requested_event()
+
+    def authorize_plan_completion(self) -> ProgressUpdate:
+        if not self.has_plan:
+            return ProgressUpdate(
+                accepted=False,
+                plan_completed=False,
+                message="No structured interview plan is active, so wrap-up authorization is not applicable.",
+            )
+        if not self.is_structurally_complete():
+            self.plan_completed.clear()
+            return ProgressUpdate(
+                accepted=False,
+                plan_completed=False,
+                message=(
+                    "Interview plan is still incomplete after verification. "
+                    f"Remaining required items: {self.pending_summary()}."
+                ),
+            )
+        runtime_summary = self.runtime_gate_summary()
+        if runtime_summary != "none":
+            self.plan_completed.clear()
+            self._manual_completion_requested = False
+            self._runtime_completion_requested = False
+            self._sync_completion_requested_event()
+            gate_label = (
+                "skills-only pacing gate"
+                if self.plan_mode == "skills_only"
+                else "runtime pacing gate"
+            )
+            return ProgressUpdate(
+                accepted=False,
+                plan_completed=False,
+                message=(
+                    f"Interview plan is structurally complete, but the {gate_label} is still active. "
+                    f"Remaining runtime requirements: {runtime_summary}."
+                ),
+            )
+        self.plan_completed.set()
+        self._manual_completion_requested = False
+        self._runtime_completion_requested = False
+        self._sync_completion_requested_event()
+        return ProgressUpdate(
+            accepted=True,
+            plan_completed=True,
+            message="Interview plan completion verified. Wrap-up may begin now.",
+        )
+
+    def apply_verified_question_marks(self, marks: Iterable[tuple[str, int]]) -> None:
+        del marks
+
+    def apply_verified_skill_completions(self, skills: Iterable[str]) -> None:
+        del skills
+
+    def is_structurally_complete(self) -> bool:
+        return False
+
+    def missing_items(self) -> list[dict]:
+        return []
+
+    def pending_summary(self) -> str:
+        return "none"
+
+    def note_candidate_response(self, text: str) -> None:
+        del text
+
+    def runtime_gate_blockers(self) -> list[dict]:
+        return []
+
+    def runtime_gate_summary(self) -> str:
+        return "none"
+
+    def verifier_exempt_skill_names(self) -> list[str]:
+        return []
+
+    def completion_request_debug_state(self) -> dict:
+        return {
+            "plan_mode": self.plan_mode,
+            "manual_completion_requested": self._manual_completion_requested,
+            "runtime_completion_requested": self._runtime_completion_requested,
+            "pending_summary": self.pending_summary(),
+            "runtime_gate_summary": self.runtime_gate_summary(),
+        }
+
+    def _sync_completion_requested_event(self) -> None:
+        if self._manual_completion_requested or self._runtime_completion_requested:
+            self.completion_requested.set()
+        else:
+            self.completion_requested.clear()
+
+
+class _NoPlanProgressTracker(_BaseProgressTracker):
+    def __init__(self) -> None:
+        super().__init__("none")
+
+
+class _PreparedQuestionsProgressTracker(_BaseProgressTracker):
+    def __init__(self, plan: InterviewPlan) -> None:
+        super().__init__("prepared_questions")
         self._display_name_by_key: dict[str, str] = {}
         self._required_question_numbers: dict[str, set[int]] = {}
         self._completed_question_numbers: dict[str, set[int]] = {}
-        self._required_skill_completions: set[str] = set()
-        self._completed_skills: set[str] = set()
         self._skill_order: list[str] = []
-        self._skills_only_mode = False
-        self._skills_only_min_fraction = 0.75
-        self._nonresponse_threshold = 4
-        self._active_skill_key: str | None = None
-        self._runtime_state_by_key: dict[str, SkillRuntimeState] = {}
 
-        question_groups = _normalize_question_groups(interview_meta.get("questions") or [])
-
-        skill_specs_raw = interview_meta.get("skills") or interview_meta.get("skillWeights") or []
-        if not isinstance(skill_specs_raw, list):
-            skill_specs_raw = []
-        skill_specs = normalize_skill_specs(skill_specs_raw)
-
-        question_skill_keys: set[str] = set()
-        for group in question_groups:
+        for group in plan.question_groups:
             skill = str(group.get("skill") or "").strip()
             if not skill:
                 continue
             key = _skill_key(skill)
             self._remember_skill(key, skill)
-            question_skill_keys.add(key)
             question_count = len(group.get("questions") or [])
             if question_count <= 0:
                 continue
-            required = self._required_question_numbers.setdefault(key, set())
-            next_index = len(required) + 1
-            required.update(range(next_index, next_index + question_count))
+            self._required_question_numbers[key] = set(range(1, question_count + 1))
             self._completed_question_numbers.setdefault(key, set())
 
-        for spec in skill_specs:
-            skill = str(spec.get("skill") or "").strip()
-            if not skill:
-                continue
-            key = _skill_key(skill)
-            self._remember_skill(key, skill)
-            if key not in question_skill_keys:
-                self._required_skill_completions.add(key)
-
-        self._skills_only_mode = bool(self._required_skill_completions) and not bool(self._required_question_numbers)
-        if self._skills_only_mode:
-            self._init_skills_only_runtime(skill_specs, interview_meta)
-
-    @property
-    def has_plan(self) -> bool:
-        """Whether the payload contains any required structured plan items."""
-        return bool(self._required_question_numbers or self._required_skill_completions)
-
-    @property
-    def skills_only_mode(self) -> bool:
-        """Whether the active interview uses only topic-based skills."""
-        return self._skills_only_mode
-
     def mark_question_asked(self, skill: str, question_number: int) -> ProgressUpdate:
-        """Record that a required prepared question has been asked."""
         key = self._resolve_skill(skill)
         if key not in self._required_question_numbers:
             return ProgressUpdate(
                 accepted=False,
                 plan_completed=self.plan_completed.is_set(),
                 message=(
-                    f"Skill '{skill}' does not have required prepared questions in the active interview plan. "
-                    "Use mark_skill_completed only for skills without prepared questions."
+                    f"Skill '{skill}' does not have required prepared questions in the active interview plan."
                 ),
             )
         if not isinstance(question_number, int) or question_number <= 0:
@@ -162,139 +272,19 @@ class InterviewProgressTracker:
         )
 
     def mark_skill_completed(self, skill: str) -> ProgressUpdate:
-        """Record that a required non-prepared skill has been covered."""
         key = self._resolve_skill(skill)
         if key in self._required_question_numbers:
             return ProgressUpdate(
                 accepted=False,
                 plan_completed=self.plan_completed.is_set(),
                 message=(
-                    f"Skill '{self._display_name_by_key[key]}' has required prepared questions. "
+                    f"Skill '{self._display_name_by_key[key]}' is tracked through prepared questions. "
                     "Record each prepared question with mark_question_asked instead."
                 ),
             )
-        if key not in self._required_skill_completions:
-            return ProgressUpdate(
-                accepted=False,
-                plan_completed=self.plan_completed.is_set(),
-                message=(
-                    f"Skill '{skill}' is not a pending skill-completion item in the active interview plan."
-                ),
-            )
-        if key in self._completed_skills:
-            return ProgressUpdate(
-                accepted=True,
-                plan_completed=self.plan_completed.is_set(),
-                message=f"Skill '{self._display_name_by_key[key]}' was already marked completed.",
-            )
-        if self._skills_only_mode:
-            blocker = self.runtime_gate_blockers_for_skill(key)
-            if blocker is not None:
-                return ProgressUpdate(
-                    accepted=False,
-                    plan_completed=self.plan_completed.is_set(),
-                    message=self._skill_timing_gate_message(key, blocker),
-                )
-        self._completed_skills.add(key)
-        if self._skills_only_mode:
-            self._activate_next_skill()
-        return ProgressUpdate(
-            accepted=True,
-            plan_completed=self.plan_completed.is_set(),
-            message=self._skill_progress_message(key),
-        )
-
-    def confirm_plan_completed(self) -> ProgressUpdate:
-        """Request a final runtime verification pass before wrap-up."""
-        if not self.has_plan:
-            return ProgressUpdate(
-                accepted=False,
-                plan_completed=False,
-                message="No structured interview plan is active, so there is nothing to mark complete.",
-            )
-        if not self._manual_completion_requested:
-            logger.info(
-                "[InterviewProgress] Manual completion requested.",
-                extra={
-                    "pending_summary": self.pending_summary(),
-                    "runtime_gate_summary": self.runtime_gate_summary(),
-                    "skills_only_mode": self._skills_only_mode,
-                },
-            )
-        self._manual_completion_requested = True
-        self._sync_completion_requested_event()
-        if self.plan_completed.is_set():
-            return ProgressUpdate(
-                accepted=True,
-                plan_completed=True,
-                message=(
-                    "Interview plan completion has already been verified. Move directly to final candidate questions and close now."
-                ),
-            )
-        return ProgressUpdate(
-            accepted=True,
-            plan_completed=False,
-            message=(
-                "Final completion check requested. Wait for runtime verification before entering wrap-up. "
-                f"Current tracker state: {self.pending_summary()}."
-            ),
-        )
-
-    def clear_completion_request(self) -> None:
-        """Clear the outstanding runtime verification request."""
-        if self._manual_completion_requested or self._runtime_completion_requested:
-            logger.info(
-                "[InterviewProgress] Clearing completion request state.",
-                extra=self.completion_request_debug_state(),
-            )
-        self._manual_completion_requested = False
-        self._runtime_completion_requested = False
-        self._sync_completion_requested_event()
-
-    def authorize_plan_completion(self) -> ProgressUpdate:
-        """Release the final wrap-up gate after transcript verification succeeds."""
-        if not self.has_plan:
-            return ProgressUpdate(
-                accepted=False,
-                plan_completed=False,
-                message="No structured interview plan is active, so wrap-up authorization is not applicable.",
-            )
-        if not self.is_structurally_complete():
-            self.plan_completed.clear()
-            return ProgressUpdate(
-                accepted=False,
-                plan_completed=False,
-                message=(
-                    "Interview plan is still incomplete after verification. "
-                    f"Remaining required items: {self.pending_summary()}."
-                ),
-            )
-        runtime_summary = self.runtime_gate_summary()
-        if runtime_summary != "none":
-            self.plan_completed.clear()
-            self._manual_completion_requested = False
-            self._runtime_completion_requested = False
-            self._sync_completion_requested_event()
-            return ProgressUpdate(
-                accepted=False,
-                plan_completed=False,
-                message=(
-                    "Interview plan is structurally complete, but the skills-only pacing gate is still active. "
-                    f"Remaining runtime requirements: {runtime_summary}."
-                ),
-            )
-        self.plan_completed.set()
-        self._manual_completion_requested = False
-        self._runtime_completion_requested = False
-        self._sync_completion_requested_event()
-        return ProgressUpdate(
-            accepted=True,
-            plan_completed=True,
-            message="Interview plan completion verified. Wrap-up may begin now.",
-        )
+        return super().mark_skill_completed(skill)
 
     def apply_verified_question_marks(self, marks: Iterable[tuple[str, int]]) -> None:
-        """Apply transcript-verified prepared-question coverage without trusting the live model."""
         for raw_skill, question_number in marks:
             key = self._resolve_skill(raw_skill)
             if key not in self._required_question_numbers:
@@ -305,65 +295,145 @@ class InterviewProgressTracker:
                 continue
             self._completed_question_numbers.setdefault(key, set()).add(question_number)
 
+    def is_structurally_complete(self) -> bool:
+        return all(
+            required.issubset(self._completed_question_numbers.get(key, set()))
+            for key, required in self._required_question_numbers.items()
+        )
+
+    def missing_items(self) -> list[dict]:
+        missing: list[dict] = []
+        for key in self._skill_order:
+            required_questions = self._required_question_numbers.get(key)
+            if not required_questions:
+                continue
+            for question_number in sorted(required_questions - self._completed_question_numbers.get(key, set())):
+                missing.append({
+                    "type": "question",
+                    "skill": self._display_name_by_key[key],
+                    "question_number": question_number,
+                })
+        return missing
+
+    def pending_summary(self) -> str:
+        pending: list[str] = []
+        for key in self._skill_order:
+            required_questions = self._required_question_numbers.get(key)
+            if not required_questions:
+                continue
+            missing = sorted(required_questions - self._completed_question_numbers.get(key, set()))
+            if missing:
+                pending.append(
+                    f"{self._display_name_by_key[key]} questions {', '.join(str(n) for n in missing)}"
+                )
+        return "; ".join(pending) if pending else "none"
+
+    def _remember_skill(self, key: str, display_name: str) -> None:
+        if key not in self._display_name_by_key:
+            self._display_name_by_key[key] = display_name
+        if key not in self._skill_order:
+            self._skill_order.append(key)
+
+    def _resolve_skill(self, raw_skill: str) -> str:
+        skill = str(raw_skill or "").strip()
+        key = _skill_key(skill)
+        if key and key not in self._display_name_by_key:
+            self._display_name_by_key[key] = skill
+            self._skill_order.append(key)
+        return key
+
+    def _question_progress_message(self, key: str, question_number: int) -> str:
+        missing = sorted(
+            self._required_question_numbers[key] - self._completed_question_numbers.get(key, set())
+        )
+        if missing:
+            return (
+                f"Recorded prepared question {question_number} for '{self._display_name_by_key[key]}'. "
+                f"Remaining required questions for this skill: {', '.join(str(n) for n in missing)}. "
+                f"Overall pending items: {self.pending_summary()}."
+            )
+        return (
+            f"Recorded prepared question {question_number} for '{self._display_name_by_key[key]}'. "
+            f"That skill's required prepared list is complete. Overall pending items: {self.pending_summary()}."
+        )
+
+
+class _SkillsOnlyProgressTracker(_BaseProgressTracker):
+    def __init__(self, plan: InterviewPlan, interview_meta: dict) -> None:
+        super().__init__("skills_only")
+        self._display_name_by_key: dict[str, str] = {}
+        self._required_skill_completions: set[str] = set()
+        self._completed_skills: set[str] = set()
+        self._skill_order: list[str] = []
+        self._skills_only_min_fraction = 0.75
+        self._nonresponse_threshold = 4
+        self._active_skill_key: str | None = None
+        self._runtime_state_by_key: dict[str, SkillRuntimeState] = {}
+
+        for spec in plan.skill_specs:
+            skill = str(spec.get("skill") or "").strip()
+            if not skill:
+                continue
+            key = _skill_key(skill)
+            self._remember_skill(key, skill)
+            self._required_skill_completions.add(key)
+
+        self._init_skills_only_runtime(plan.skill_specs, interview_meta)
+
+    def mark_skill_completed(self, skill: str) -> ProgressUpdate:
+        key = self._resolve_skill(skill)
+        if key not in self._required_skill_completions:
+            return ProgressUpdate(
+                accepted=False,
+                plan_completed=self.plan_completed.is_set(),
+                message=f"Skill '{skill}' is not a pending skills-only item in the active interview plan.",
+            )
+        if key in self._completed_skills:
+            return ProgressUpdate(
+                accepted=True,
+                plan_completed=self.plan_completed.is_set(),
+                message=f"Skill '{self._display_name_by_key[key]}' was already marked completed.",
+            )
+        blocker = self.runtime_gate_blockers_for_skill(key)
+        if blocker is not None:
+            return ProgressUpdate(
+                accepted=False,
+                plan_completed=self.plan_completed.is_set(),
+                message=self._skill_timing_gate_message(key, blocker),
+            )
+        self._completed_skills.add(key)
+        self._activate_next_skill()
+        return ProgressUpdate(
+            accepted=True,
+            plan_completed=self.plan_completed.is_set(),
+            message=self._skill_progress_message(key),
+        )
+
     def apply_verified_skill_completions(self, skills: Iterable[str]) -> None:
-        """Apply transcript-verified skill coverage without trusting the live model."""
         for raw_skill in skills:
             key = self._resolve_skill(raw_skill)
             if key in self._required_skill_completions:
                 self._completed_skills.add(key)
 
     def is_structurally_complete(self) -> bool:
-        """Whether the tracker currently has every required item marked complete."""
-        if not self.has_plan:
-            return False
-        all_questions_done = all(
-            required.issubset(self._completed_question_numbers.get(key, set()))
-            for key, required in self._required_question_numbers.items()
-        )
-        all_skills_done = self._required_skill_completions.issubset(self._completed_skills)
-        return all_questions_done and all_skills_done
+        return self._required_skill_completions.issubset(self._completed_skills)
 
     def missing_items(self) -> list[dict]:
-        """Structured list of still-pending required questions and skills."""
         missing: list[dict] = []
         for key in self._skill_order:
-            required_questions = self._required_question_numbers.get(key)
-            if required_questions:
-                question_numbers = sorted(
-                    required_questions - self._completed_question_numbers.get(key, set())
-                )
-                for question_number in question_numbers:
-                    missing.append({
-                        "type": "question",
-                        "skill": self._display_name_by_key[key],
-                        "question_number": question_number,
-                    })
             if key in self._required_skill_completions and key not in self._completed_skills:
-                missing.append({
-                    "type": "skill",
-                    "skill": self._display_name_by_key[key],
-                })
+                missing.append({"type": "skill", "skill": self._display_name_by_key[key]})
         return missing
 
     def pending_summary(self) -> str:
-        """Human-readable summary of still-pending required items."""
-        pending: list[str] = []
-        for key in self._skill_order:
-            required_questions = self._required_question_numbers.get(key)
-            if required_questions:
-                missing = sorted(required_questions - self._completed_question_numbers.get(key, set()))
-                if missing:
-                    missing_str = ", ".join(str(n) for n in missing)
-                    pending.append(f"{self._display_name_by_key[key]} questions {missing_str}")
-                    continue
-            if key in self._required_skill_completions and key not in self._completed_skills:
-                pending.append(f"{self._display_name_by_key[key]} coverage")
+        pending = [
+            f"{self._display_name_by_key[key]} coverage"
+            for key in self._skill_order
+            if key in self._required_skill_completions and key not in self._completed_skills
+        ]
         return "; ".join(pending) if pending else "none"
 
     def note_candidate_response(self, text: str) -> None:
-        """Track whether the candidate answered or gave a repeated non-response."""
-        if not self._skills_only_mode:
-            return
         key = self._ensure_active_skill_started()
         if not key:
             return
@@ -378,9 +448,6 @@ class InterviewProgressTracker:
         self._sync_runtime_nonresponse_wrapup_request(key)
 
     def runtime_gate_blockers(self) -> list[dict]:
-        """Return skills-only pacing blockers that still prevent wrap-up."""
-        if not self._skills_only_mode:
-            return []
         blockers: list[dict] = []
         for key in self._skill_order:
             if key not in self._required_skill_completions:
@@ -391,7 +458,6 @@ class InterviewProgressTracker:
         return blockers
 
     def runtime_gate_blockers_for_skill(self, key: str) -> dict | None:
-        """Return pacing blocker for one skill, if still active."""
         state = self._runtime_state_by_key.get(key)
         if state is None:
             return None
@@ -410,28 +476,20 @@ class InterviewProgressTracker:
         }
 
     def runtime_gate_summary(self) -> str:
-        """Human-readable summary of remaining skills-only pacing blockers."""
         blockers = self.runtime_gate_blockers()
         if not blockers:
             return "none"
-        parts: list[str] = []
-        for blocker in blockers:
-            remaining_minutes = blocker["remaining_seconds"] / 60.0
-            parts.append(
-                f"{blocker['skill']} needs about {remaining_minutes:.1f} more min "
+        return "; ".join(
+            (
+                f"{blocker['skill']} needs about {blocker['remaining_seconds'] / 60.0:.1f} more min "
                 f"or {self._nonresponse_threshold} consecutive non-responses "
                 f"(current streak: {blocker['consecutive_nonresponses']})"
             )
-        return "; ".join(parts)
+            for blocker in blockers
+        )
 
     def verifier_exempt_skill_names(self) -> list[str]:
-        """Return skill names whose substantive-coverage check should be skipped.
-
-        This applies only to the narrow single-skill interview case where the
-        candidate hit the nonresponse threshold and there are no remaining
-        alternative skills to continue with.
-        """
-        if not self._skills_only_mode or len(self._required_skill_completions) != 1:
+        if len(self._required_skill_completions) != 1:
             return []
         only_key = next(iter(self._required_skill_completions), "")
         if not only_key:
@@ -443,26 +501,21 @@ class InterviewProgressTracker:
         return []
 
     def completion_request_debug_state(self) -> dict:
-        """Return structured state for logging around wrap-up requests."""
         active_key = self._active_skill_key
         active_state = self._runtime_state_by_key.get(active_key or "")
         active_skill = self._display_name_by_key.get(active_key or "", "") if active_key else ""
-        self._refresh_runtime_eligibility(active_key) if active_key else None
-        active_state = self._runtime_state_by_key.get(active_key or "")
-        return {
-            "manual_completion_requested": self._manual_completion_requested,
-            "runtime_completion_requested": self._runtime_completion_requested,
-            "skills_only_mode": self._skills_only_mode,
+        if active_key:
+            self._refresh_runtime_eligibility(active_key)
+            active_state = self._runtime_state_by_key.get(active_key or "")
+        state = super().completion_request_debug_state()
+        state.update({
             "active_skill": active_skill or None,
             "active_skill_completion_reason": active_state.completion_reason if active_state else None,
             "active_skill_consecutive_nonresponses": (
                 active_state.consecutive_nonresponses if active_state else None
             ),
-            "pending_summary": self.pending_summary(),
-            "runtime_gate_summary": self.runtime_gate_summary(),
-        }
-
-    # -- internal ----------------------------------------------------------
+        })
+        return state
 
     def _init_skills_only_runtime(self, skill_specs: list[dict], interview_meta: dict) -> None:
         total_seconds = float(compute_durations(interview_meta).total_seconds)
@@ -485,8 +538,7 @@ class InterviewProgressTracker:
         if weighted:
             total_weight = sum(weight for _, weight in weighted)
             if unweighted and total_weight < 100.0:
-                remaining_share = max(0.0, 100.0 - total_weight) / 100.0
-                per_unweighted_share = remaining_share / len(unweighted)
+                per_unweighted_share = max(0.0, 100.0 - total_weight) / 100.0 / len(unweighted)
                 for key, weight in weighted:
                     share_by_key[key] = weight / 100.0
                 for key in unweighted:
@@ -504,7 +556,11 @@ class InterviewProgressTracker:
 
         for key in self._required_skill_completions:
             share = share_by_key.get(key, 0.0)
-            allocated_seconds = total_seconds * share if share > 0 else total_seconds / len(self._required_skill_completions)
+            allocated_seconds = (
+                total_seconds * share
+                if share > 0
+                else total_seconds / max(1, len(self._required_skill_completions))
+            )
             self._runtime_state_by_key[key] = SkillRuntimeState(
                 allocated_seconds=allocated_seconds,
                 min_required_seconds=allocated_seconds * self._skills_only_min_fraction,
@@ -516,9 +572,15 @@ class InterviewProgressTracker:
         if key not in self._skill_order:
             self._skill_order.append(key)
 
+    def _resolve_skill(self, raw_skill: str) -> str:
+        skill = str(raw_skill or "").strip()
+        key = _skill_key(skill)
+        if key and key not in self._display_name_by_key:
+            self._display_name_by_key[key] = skill
+            self._skill_order.append(key)
+        return key
+
     def _activate_next_skill(self) -> None:
-        if not self._skills_only_mode:
-            return
         next_key = None
         for key in self._skill_order:
             if key in self._required_skill_completions and key not in self._completed_skills:
@@ -528,30 +590,6 @@ class InterviewProgressTracker:
         if next_key:
             self._ensure_active_skill_started()
 
-    def _resolve_skill(self, raw_skill: str) -> str:
-        skill = str(raw_skill or "").strip()
-        key = _skill_key(skill)
-        if key and key not in self._display_name_by_key:
-            self._display_name_by_key[key] = skill
-            self._skill_order.append(key)
-        return key
-
-    def _question_progress_message(self, key: str, question_number: int) -> str:
-        missing = sorted(
-            self._required_question_numbers[key] - self._completed_question_numbers.get(key, set())
-        )
-        if missing:
-            missing_str = ", ".join(str(n) for n in missing)
-            return (
-                f"Recorded prepared question {question_number} for '{self._display_name_by_key[key]}'. "
-                f"Remaining required questions for this skill: {missing_str}. "
-                f"Overall pending items: {self.pending_summary()}."
-            )
-        return (
-            f"Recorded prepared question {question_number} for '{self._display_name_by_key[key]}'. "
-            f"That skill's required prepared list is complete. Overall pending items: {self.pending_summary()}."
-        )
-
     def _skill_progress_message(self, key: str) -> str:
         return (
             f"Recorded skill completion for '{self._display_name_by_key[key]}'. "
@@ -559,8 +597,6 @@ class InterviewProgressTracker:
         )
 
     def _ensure_active_skill_started(self) -> str | None:
-        if not self._skills_only_mode:
-            return None
         if self._active_skill_key is None or self._active_skill_key in self._completed_skills:
             for key in self._skill_order:
                 if key in self._required_skill_completions and key not in self._completed_skills:
@@ -602,8 +638,7 @@ class InterviewProgressTracker:
             return
         previously_requested = self._runtime_completion_requested
         should_request = (
-            self._skills_only_mode
-            and len(self._required_skill_completions) == 1
+            len(self._required_skill_completions) == 1
             and key in self._required_skill_completions
             and state.completion_reason == "nonresponse_threshold"
             and not self.plan_completed.is_set()
@@ -616,6 +651,7 @@ class InterviewProgressTracker:
                 logger.info(
                     "[InterviewProgress] Runtime completion requested by nonresponse threshold.",
                     extra={
+                        "plan_mode": self.plan_mode,
                         "skill": self._display_name_by_key.get(key, key),
                         "consecutive_nonresponses": state.consecutive_nonresponses,
                         "nonresponse_threshold": self._nonresponse_threshold,
@@ -630,6 +666,7 @@ class InterviewProgressTracker:
             logger.info(
                 "[InterviewProgress] Runtime nonresponse completion request cleared after candidate response.",
                 extra={
+                    "plan_mode": self.plan_mode,
                     "skill": self._display_name_by_key.get(key, key),
                     "consecutive_nonresponses": state.consecutive_nonresponses,
                     "nonresponse_threshold": self._nonresponse_threshold,
@@ -638,12 +675,6 @@ class InterviewProgressTracker:
             )
         self._runtime_completion_requested = False
         self._sync_completion_requested_event()
-
-    def _sync_completion_requested_event(self) -> None:
-        if self._manual_completion_requested or self._runtime_completion_requested:
-            self.completion_requested.set()
-        else:
-            self.completion_requested.clear()
 
     def _skill_timing_gate_message(self, key: str, blocker: dict) -> str:
         remaining_minutes = blocker["remaining_seconds"] / 60.0
@@ -692,6 +723,26 @@ class InterviewProgressTracker:
             "pass this",
         )
         return any(phrase in body for phrase in phrases)
+
+
+class InterviewProgressTracker:
+    """Facade over the active interview-plan progress tracker."""
+
+    def __init__(self, interview_meta: dict) -> None:
+        self.plan = resolve_interview_plan(interview_meta)
+        if self.plan.mode == "prepared_questions":
+            self._impl = _PreparedQuestionsProgressTracker(self.plan)
+        elif self.plan.mode == "skills_only":
+            self._impl = _SkillsOnlyProgressTracker(self.plan, interview_meta)
+        else:
+            self._impl = _NoPlanProgressTracker()
+
+    @property
+    def plan_mode(self) -> PlanMode:
+        return self._impl.plan_mode
+
+    def __getattr__(self, name: str):
+        return getattr(self._impl, name)
 
 
 __all__ = ["InterviewProgressTracker", "ProgressUpdate", "SkillRuntimeState"]

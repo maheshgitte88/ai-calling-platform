@@ -324,18 +324,85 @@ async def _eval_json(provider: str, api_key: str, model: str, system: str, user:
 
 
 _ANALYSIS_SYSTEM_PROMPT = """
-You analyze interview transcripts. Read the transcript carefully and produce a structured plain-text analysis (NOT JSON yet).
+You analyze interview transcripts.
 
-For each substantive interview question (skip greetings, small-talk, and pure introductions):
-- Quote the question.
-- Quote the candidate's relevant answer (or write "no answer / off-topic / refusal" if there isn't one).
-- Identify which skill from the provided skill list it probes; if none fit, write "skill: (other)".
-- Note technical strengths in the answer (specific facts correct, key concepts covered, real examples mentioned).
-- Note weaknesses (errors, gaps, surface-level only, off-topic).
-- IMPORTANT: explicitly distinguish substance from style. If the answer is fluent but shallow, say so. If it is awkwardly phrased but technically correct, also say so.
-- Do not score yet. Strict JSON scoring is the next step.
+CRITICAL RULES:
+- ONLY use transcript content.
+- NEVER invent answers.
+- NEVER merge unrelated answers.
+- Preserve exact conversation order.
 
-Be concise. Use simple bullet points.
+QUESTION-ANSWER MAPPING RULES:
+1. Every interviewer question maps to its relevant candidate response.
+2. Stop an answer when:
+   - a completely new topic starts
+   - a different technical concept is asked
+3. Clarification follow-ups belong to the SAME parent question when:
+   - the interviewer asks the candidate to clarify
+   - the interviewer says:
+     "explain more"
+     "I asked about X"
+     "can you elaborate"
+     "what do you mean"
+     "I asked final, not super"
+     or similar correction/clarification prompts
+4. In clarification chains:
+   - combine the clarification exchange into ONE final evaluated answer
+   - prefer the clarified technical answer over the earlier vague response
+5. Mark the initial vague answer as weak/incomplete if needed.
+6. The FINAL clarified response should be treated as the primary answer.
+7. Do NOT split clarification loops into unrelated Q&A pairs.
+
+EXAMPLE BEHAVIOR:
+
+Interviewer:
+"What is final keyword in Java?"
+
+Candidate:
+"super"
+
+Interviewer:
+"I asked final, explain final keyword."
+
+Candidate:
+"final is used to prevent inheritance, method overriding, or variable reassignment."
+
+Correct handling:
+- Treat this as ONE question thread
+- Final evaluated answer is the clarified explanation
+- Mention that the candidate initially misunderstood the question
+
+IMPORTANT:
+- Clarifications are NOT new questions if they refine the same concept.
+- Topic changes ARE new questions.
+- Follow-up depth questions belong to the same thread.
+- New independent concepts create a new question.
+
+OUTPUT FORMAT:
+
+Question:
+- original interviewer question
+
+Answer:
+- consolidated answer for that question thread
+
+Clarification Notes:
+- mention if interviewer had to redirect or correct the candidate
+
+Skill:
+- mapped skill
+
+Strengths:
+- explicit demonstrated knowledge
+
+Weaknesses:
+- confusion, correction needed, shallow understanding, etc.
+
+Communication vs Substance:
+- distinguish fluency vs actual technical accuracy
+
+Be concise.
+Use bullets.
 """.strip()
 
 
