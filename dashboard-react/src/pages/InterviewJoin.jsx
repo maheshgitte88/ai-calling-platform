@@ -92,12 +92,39 @@ function mapResolveError(err) {
       canRetry: true,
     };
   }
+  if (
+    lower.includes("connection refused") ||
+    lower.includes("failed to fetch") ||
+    lower.includes("signal connection") ||
+    lower.includes("websocket")
+  ) {
+    return {
+      title: "Cannot reach LiveKit",
+      message:
+        "The interview page could not open a connection to the video server. If you self-host LK, set LIVEKIT_PUBLIC_URL in the backend to a WebSocket URL this browser can reach (your machine's LAN IP or public host), not only ws://localhost when LiveKit runs on another server. Open ports 7880, 7881 TCP and your UDP media range.",
+      variant: "error",
+      canRetry: true,
+    };
+  }
   return {
     title: "Unable to join interview",
     message: msg,
     variant: "error",
     canRetry: true,
   };
+}
+
+function isRecoverableRoomError(err) {
+  const msg = err?.message || String(err || "");
+  const lower = msg.toLowerCase();
+  return (
+    lower.includes("signal connection") ||
+    lower.includes("websocket") ||
+    lower.includes("reconnect") ||
+    lower.includes("connection closed") ||
+    lower.includes("connection lost") ||
+    lower.includes("network")
+  );
 }
 
 export default function InterviewJoin() {
@@ -112,6 +139,7 @@ export default function InterviewJoin() {
   const [completion, setCompletion] = useState(null);
   const [leaving, setLeaving] = useState(false);
   const pollRef = useRef(null);
+  const hasEverConnectedRef = useRef(false);
 
   const clearPoll = () => {
     if (pollRef.current) {
@@ -192,6 +220,7 @@ export default function InterviewJoin() {
   }, [phase, resolved?.sessionId, sessionInfo?.status]);
 
   const handleRoomConnected = useCallback(() => {
+    hasEverConnectedRef.current = true;
     setPhase("live");
     if (resolved?.sessionId) {
       api
@@ -206,6 +235,9 @@ export default function InterviewJoin() {
   }, [resolved?.sessionId]);
 
   const handleRoomError = useCallback((err) => {
+    if (hasEverConnectedRef.current && isRecoverableRoomError(err)) {
+      return;
+    }
     setErrorInfo(
       mapResolveError(new Error(err?.message || "Could not connect to the interview room."))
     );
@@ -322,6 +354,9 @@ export default function InterviewJoin() {
                   leaving={leaving}
                 />
                 <CandidateConnectionReporter sessionId={resolved.sessionId} />
+                {phase === "live" && (
+                  <LiveReconnectBanner sessionInfo={sessionInfo} />
+                )}
                 {phase === "wrap_up" && (
                   <WrapUpBanner sessionInfo={sessionInfo} />
                 )}
@@ -492,6 +527,49 @@ function WrapUpBanner({ sessionInfo }) {
       {showReconnect && remainingReconnectMs > 0 && (
         <p style={{ ...styles.wrapUpText, color: "#fde68a", marginTop: 6 }}>
           Reconnecting now. Return before {formatCountdown(remainingReconnectMs)} to continue this wrap-up.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function LiveReconnectBanner({ sessionInfo }) {
+  const connectionState = useConnectionState();
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const reconnectGraceMs = useMemo(
+    () => parseIsoMs(sessionInfo?.reconnect_grace_ends_at),
+    [sessionInfo?.reconnect_grace_ends_at]
+  );
+
+  useEffect(() => {
+    setNowMs(Date.now());
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const remainingReconnectMs = Math.max(0, reconnectGraceMs - nowMs);
+  const showReconnect =
+    sessionInfo?.candidate_connection_status === "disconnected"
+    || connectionState === ConnectionState.Reconnecting
+    || connectionState === ConnectionState.SignalReconnecting
+    || connectionState === ConnectionState.Disconnected;
+
+  if (!showReconnect) return null;
+
+  return (
+    <div style={styles.reconnectBanner} aria-live="polite">
+      <div style={styles.reconnectBannerTop}>
+        <span style={styles.reconnectTitle}>Connection is weak</span>
+        {remainingReconnectMs > 0 && (
+          <span style={styles.reconnectCountdown}>{formatCountdown(remainingReconnectMs)}</span>
+        )}
+      </div>
+      <p style={styles.reconnectText}>
+        Your interview is not closed. Stay on this page and we will reconnect automatically when the network is stable.
+      </p>
+      {remainingReconnectMs > 0 && (
+        <p style={{ ...styles.reconnectText, color: "#fde68a", marginTop: 6 }}>
+          Return before {formatCountdown(remainingReconnectMs)} to continue from the same place.
         </p>
       )}
     </div>
@@ -1007,6 +1085,47 @@ const styles = {
   wrapUpText: {
     margin: 0,
     color: "#ddd6fe",
+    fontSize: "0.84rem",
+    lineHeight: 1.45,
+  },
+  reconnectBanner: {
+    margin: "10px 10px 0",
+    padding: "12px 14px",
+    borderRadius: 12,
+    background: "rgba(180,83,9,0.18)",
+    border: "1px solid rgba(251,191,36,0.32)",
+    color: "#fef3c7",
+    boxShadow: "0 12px 30px -20px rgba(180,83,9,0.85)",
+  },
+  reconnectBannerTop: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    marginBottom: 6,
+  },
+  reconnectTitle: {
+    fontSize: "0.9rem",
+    fontWeight: 700,
+    color: "#fef3c7",
+  },
+  reconnectCountdown: {
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    minWidth: 62,
+    padding: "5px 10px",
+    borderRadius: 999,
+    background: "rgba(15,23,42,0.7)",
+    border: "1px solid rgba(251,191,36,0.3)",
+    color: "#fde68a",
+    fontSize: "0.9rem",
+    fontWeight: 700,
+    letterSpacing: "0.04em",
+  },
+  reconnectText: {
+    margin: 0,
+    color: "#fde68a",
     fontSize: "0.84rem",
     lineHeight: 1.45,
   },
