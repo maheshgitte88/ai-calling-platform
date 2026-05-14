@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 EXPECTED_MODE = "video_interview"
 CANDIDATE_JOIN_TIMEOUT_SECONDS = 10 * 60
-RECONNECT_GRACE_SECONDS = 90
+RECONNECT_GRACE_SECONDS = 300
 
 
 def _utc_now() -> datetime:
@@ -130,6 +130,20 @@ def _skills_only_gate_retry_instruction(blockers: list[dict]) -> str:
 def _initial_reply_instructions() -> str:
     """Kickoff turn: greet + readiness check only. Do NOT ask the first question yet."""
     return "Give a short greeting and ask if the candidate is ready to begin. Do not ask the first interview question yet."
+
+
+def _resume_after_reconnect_instructions(*, wrap_up_active: bool = False) -> str:
+    if wrap_up_active:
+        return (
+            "Briefly acknowledge the network interruption in one short sentence. "
+            "Tell the candidate the interview is still connected and the final wrap-up is continuing now. "
+            "Do not restart the interview or repeat the greeting."
+        )
+    return (
+        "Briefly acknowledge the network interruption in one short sentence. "
+        "Tell the candidate the interview is resuming from the current topic or skill. "
+        "Continue from where you left off without restarting the interview or repeating the greeting."
+    )
 
 
 def _candidate_identity(candidate_id: str) -> str:
@@ -501,7 +515,7 @@ class CandidateRoomTracker:
 
     def _on_disconnected(self, participant: Any) -> None:
         identity = getattr(participant, "identity", "") or ""
-        if identity.startswith("candidate_"):
+        if _is_candidate(identity, self._candidate_identity):
             self.connected.clear()
             self.disconnected.set()
 
@@ -666,6 +680,17 @@ async def _drive_interview(
                 if reconnect_outcome == "candidate_reconnected":
                     _persist_candidate_connected(db, session_id)
                     logger.info("[Interview] Candidate reconnected; resuming interview.")
+                    if tracker.connected.is_set():
+                        await _generate_interview_reply(
+                            session=session,
+                            base_prompt=base_prompt,
+                            transcript=transcript,
+                            progress_tracker=progress_tracker,
+                            memory_state=memory_state,
+                            runtime_control_provider=runtime_control_provider,
+                            wrap_up_authorized_provider=wrap_up_authorized_provider,
+                            instructions=_resume_after_reconnect_instructions(),
+                        )
                     continue
                 _persist_session_completed(
                     db,
@@ -773,6 +798,17 @@ async def _drive_interview(
         )
         if reconnect_outcome == "candidate_reconnected":
             _persist_candidate_connected(db, session_id)
+            if tracker.connected.is_set():
+                await _generate_interview_reply(
+                    session=session,
+                    base_prompt=base_prompt,
+                    transcript=transcript,
+                    progress_tracker=progress_tracker,
+                    memory_state=memory_state,
+                    runtime_control_provider=runtime_control_provider,
+                    wrap_up_authorized_provider=wrap_up_authorized_provider,
+                    instructions=_resume_after_reconnect_instructions(),
+                )
             continue
         _persist_session_completed(
             db,
@@ -857,6 +893,17 @@ async def _drive_interview(
             )
             if reconnect_outcome == "candidate_reconnected":
                 _persist_candidate_connected(db, session_id)
+                if tracker.connected.is_set():
+                    await _generate_interview_reply(
+                        session=session,
+                        base_prompt=base_prompt,
+                        transcript=transcript,
+                        progress_tracker=progress_tracker,
+                        memory_state=memory_state,
+                        runtime_control_provider=runtime_control_provider,
+                        wrap_up_authorized_provider=wrap_up_authorized_provider,
+                        instructions=_resume_after_reconnect_instructions(wrap_up_active=True),
+                    )
                 continue
             _persist_session_completed(
                 db,
@@ -872,6 +919,17 @@ async def _drive_interview(
         )
         if reconnect_outcome == "candidate_reconnected":
             _persist_candidate_connected(db, session_id)
+            if tracker.connected.is_set():
+                await _generate_interview_reply(
+                    session=session,
+                    base_prompt=base_prompt,
+                    transcript=transcript,
+                    progress_tracker=progress_tracker,
+                    memory_state=memory_state,
+                    runtime_control_provider=runtime_control_provider,
+                    wrap_up_authorized_provider=wrap_up_authorized_provider,
+                    instructions=_resume_after_reconnect_instructions(wrap_up_active=True),
+                )
             continue
         _persist_session_completed(
             db,

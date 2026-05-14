@@ -10,7 +10,14 @@ from app.provider_resolver import resolve_provider_cfg
 from app.interview_progress import InterviewProgressTracker
 from app.pre_wrapup_verifier import _build_verification_user_prompt, verify_pre_wrapup_coverage
 from app.prompt import build_interview_memory_message, compose_runtime_instructions
-from app.runner import _build_scripted_reply_chat_ctx, _generate_interview_reply, _wait_for_drive_outcome, _wait_for_reconnect
+from app.runner import (
+    CandidateRoomTracker,
+    _build_scripted_reply_chat_ctx,
+    _generate_interview_reply,
+    _resume_after_reconnect_instructions,
+    _wait_for_drive_outcome,
+    _wait_for_reconnect,
+)
 from app.skills import canonical_skill_key
 
 
@@ -264,6 +271,24 @@ class _FakeTracker:
         self.disconnected = asyncio.Event()
 
 
+class _FakeRoom:
+    def __init__(self) -> None:
+        self.handlers = {}
+        self.remote_participants = {}
+
+    def on(self, event, handler) -> None:
+        self.handlers[event] = handler
+
+    def off(self, event, handler) -> None:
+        if self.handlers.get(event) is handler:
+            del self.handlers[event]
+
+
+class _FakeParticipant:
+    def __init__(self, identity: str) -> None:
+        self.identity = identity
+
+
 class WaitForDriveOutcomeTests(unittest.IsolatedAsyncioTestCase):
     async def test_completion_request_wins_before_timeout(self) -> None:
         tracker = _FakeTracker()
@@ -353,6 +378,31 @@ class InterviewPlanHelpersTests(unittest.TestCase):
         )
         self.assertIn("Wrap-up is explicitly authorized by runtime.", instructions)
         self.assertNotIn("Remaining interview time before runtime wrap-up authorization", instructions)
+
+    def test_resume_after_reconnect_instruction_differs_for_wrapup(self) -> None:
+        live = _resume_after_reconnect_instructions()
+        wrap = _resume_after_reconnect_instructions(wrap_up_active=True)
+        self.assertIn("resuming from the current topic or skill", live)
+        self.assertIn("final wrap-up is continuing now", wrap)
+
+
+class CandidateReconnectTrackerTests(unittest.TestCase):
+    def test_disconnect_only_tracks_expected_candidate_identity(self) -> None:
+        room = _FakeRoom()
+        tracker = CandidateRoomTracker(room, "candidate_123")
+        tracker.attach()
+
+        tracker._on_connected(_FakeParticipant("candidate_123"))
+        self.assertTrue(tracker.connected.is_set())
+        self.assertFalse(tracker.disconnected.is_set())
+
+        tracker._on_disconnected(_FakeParticipant("candidate_other"))
+        self.assertTrue(tracker.connected.is_set())
+        self.assertFalse(tracker.disconnected.is_set())
+
+        tracker._on_disconnected(_FakeParticipant("candidate_123"))
+        self.assertFalse(tracker.connected.is_set())
+        self.assertTrue(tracker.disconnected.is_set())
 
 
 class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
