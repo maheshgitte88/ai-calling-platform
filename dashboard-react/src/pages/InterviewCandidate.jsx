@@ -62,6 +62,15 @@ const defaultForm = {
   mustAskTopics: [makeMustAskTopicRow()],
 };
 
+/** Unique IDs for API (backend only requires non-empty strings). */
+function newSessionIdentifiers() {
+  const next = () =>
+    typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`;
+  return { candidateId: next(), interviewId: next() };
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -181,7 +190,7 @@ function buildStartSessionPayload(form) {
 // ---------------------------------------------------------------------------
 
 export default function InterviewCandidate() {
-  const [form, setForm] = useState(defaultForm);
+  const [form, setForm] = useState(() => ({ ...defaultForm, ...newSessionIdentifiers() }));
   const [status, setStatus] = useState("idle");
   const [generated, setGenerated] = useState(null);
   const [error, setError] = useState("");
@@ -231,7 +240,7 @@ export default function InterviewCandidate() {
   };
 
   const resetForm = () => {
-    setForm(defaultForm);
+    setForm({ ...defaultForm, ...newSessionIdentifiers() });
     setGenerated(null);
     setError("");
     setCopied("");
@@ -243,6 +252,10 @@ export default function InterviewCandidate() {
     await navigator.clipboard.writeText(value);
     setCopied(label);
     window.setTimeout(() => setCopied(""), 1500);
+  };
+
+  const regenerateIds = () => {
+    updateForm(newSessionIdentifiers());
   };
 
   return (
@@ -257,24 +270,38 @@ export default function InterviewCandidate() {
         <div style={styles.sectionHeader}>
           <div>
             <h2 style={styles.sectionTitle}>Candidate and interview</h2>
-            <p style={styles.sectionSubtext}>Only candidateId and interviewId are required.</p>
+            <p style={styles.sectionSubtext}>
+              Candidate and interview IDs are auto-generated (UUID). Edit them if you need stable
+              values for testing, or use &quot;New IDs&quot; for another pair.
+            </p>
           </div>
           <span style={styles.badge}>Link generator</span>
         </div>
 
         <div style={styles.grid}>
-          <input
-            style={styles.input}
-            placeholder="candidateId"
-            value={form.candidateId}
-            onChange={(e) => updateForm({ candidateId: e.target.value })}
-          />
-          <input
-            style={styles.input}
-            placeholder="interviewId"
-            value={form.interviewId}
-            onChange={(e) => updateForm({ interviewId: e.target.value })}
-          />
+          <div style={styles.idRow}>
+            <input
+              style={{ ...styles.input, flex: "1 1 220px" }}
+              placeholder="candidateId"
+              value={form.candidateId}
+              onChange={(e) => updateForm({ candidateId: e.target.value })}
+              aria-label="Candidate ID"
+            />
+            <input
+              style={{ ...styles.input, flex: "1 1 220px" }}
+              placeholder="interviewId"
+              value={form.interviewId}
+              onChange={(e) => updateForm({ interviewId: e.target.value })}
+              aria-label="Interview ID"
+            />
+            <button
+              type="button"
+              style={{ ...styles.btnSecondary, flex: "0 0 auto", alignSelf: "center" }}
+              onClick={regenerateIds}
+            >
+              New IDs
+            </button>
+          </div>
           <input
             style={styles.input}
             placeholder="Candidate name (optional)"
@@ -755,6 +782,13 @@ const styles = {
     display: "grid",
     gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
     gap: 10,
+  },
+  idRow: {
+    gridColumn: "1 / -1",
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    alignItems: "stretch",
   },
   gridFull: {
     marginTop: 10,
