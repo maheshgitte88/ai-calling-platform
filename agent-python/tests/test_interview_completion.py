@@ -2,10 +2,15 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from livekit.agents import ChatContext
+
+from app.interview_memory import InterviewMemoryState
+from app.interview_plan import resolve_interview_plan
 from app.provider_resolver import resolve_provider_cfg
 from app.interview_progress import InterviewProgressTracker
 from app.pre_wrapup_verifier import _build_verification_user_prompt, verify_pre_wrapup_coverage
-from app.runner import _wait_for_drive_outcome, _wait_for_reconnect
+from app.prompt import build_interview_memory_message, compose_runtime_instructions
+from app.runner import _build_scripted_reply_chat_ctx, _generate_interview_reply, _wait_for_drive_outcome, _wait_for_reconnect
 from app.skills import canonical_skill_key
 
 
@@ -150,35 +155,15 @@ class InterviewProgressTrackerTests(unittest.TestCase):
                 "React.js needs about 13.5 more min or 4 consecutive non-responses (current streak: 0)",
             )
 
-    def test_mixed_plan_requires_questions_and_skills_without_questions(self) -> None:
-        tracker = InterviewProgressTracker({
-            "questions": [{
-                "skill": "Core Java",
-                "questions": ["Q1", "Q2"],
-                "weightage": 70,
-            }],
-            "skills": [
-                {"skill": "Core Java", "weightage": 70},
-                {"skill": "SQL", "weightage": 30},
-            ],
-        })
-
-        tracker.mark_question_asked("Core Java", 1)
-        self.assertFalse(tracker.plan_completed.is_set())
-        tracker.mark_question_asked("Core Java", 2)
-        self.assertFalse(tracker.plan_completed.is_set())
-
-        confirm_before_sql = tracker.confirm_plan_completed()
-        self.assertTrue(confirm_before_sql.accepted)
-        self.assertIn("Current tracker state", confirm_before_sql.message)
-        self.assertTrue(tracker.completion_requested.is_set())
-        authorize_before_sql = tracker.authorize_plan_completion()
-        self.assertFalse(authorize_before_sql.accepted)
-        self.assertIn("SQL coverage", authorize_before_sql.message)
-        self.assertFalse(tracker.plan_completed.is_set())
-
-        tracker.mark_skill_completed("SQL")
-        self.assertFalse(tracker.plan_completed.is_set())
+    def test_mixed_plan_is_rejected_at_boundary(self) -> None:
+        with self.assertRaises(ValueError):
+            InterviewProgressTracker({
+                "questions": [{
+                    "skill": "Core Java",
+                    "questions": ["Q1", "Q2"],
+                }],
+                "skills": [{"skill": "SQL"}],
+            })
 
     def test_verified_corrections_can_release_wrapup(self) -> None:
         tracker = InterviewProgressTracker({
@@ -186,14 +171,9 @@ class InterviewProgressTrackerTests(unittest.TestCase):
                 "skill": "Core Java",
                 "questions": ["Q1", "Q2"],
             }],
-            "skills": [
-                {"skill": "Core Java"},
-                {"skill": "SQL"},
-            ],
         })
 
         tracker.apply_verified_question_marks([("Core Java", 1), ("Core Java", 2)])
-        tracker.apply_verified_skill_completions(["SQL"])
         self.assertTrue(tracker.is_structurally_complete())
 
         tracker.confirm_plan_completed()
@@ -242,6 +222,28 @@ class InterviewProgressTrackerTests(unittest.TestCase):
         self.assertTrue(tracker.completion_requested.is_set())
         with patch("app.interview_progress.time.monotonic", return_value=60.0):
             self.assertEqual(tracker.verifier_exempt_skill_names(), ["React.js"])
+
+    def test_skills_only_tracks_already_asked_question_angles(self) -> None:
+        tracker = InterviewProgressTracker({
+            "durationMinutes": 20,
+            "skills": [{"skill": "React", "weightage": 100}],
+        })
+
+        tracker.note_interviewer_prompt("Are you ready to begin?")
+        self.assertEqual(tracker.anti_repeat_summary(), "none")
+
+        with patch("app.interview_progress.time.monotonic", return_value=0.0):
+            tracker.note_candidate_response("Ready")
+
+        tracker.note_interviewer_prompt("Can you explain state vs props in React?")
+        tracker.note_interviewer_prompt("Please explain state vs props in React?")
+        tracker.note_interviewer_prompt("How do React hooks help with component state?")
+
+        summary = tracker.anti_repeat_summary()
+        self.assertIn("Already asked on React:", summary)
+        self.assertIn("state vs props in react", summary)
+        self.assertIn("react hooks help with component state", summary)
+        self.assertEqual(summary.count("state vs props in react"), 1)
 
     def test_mark_skill_completed_rejects_prepared_question_skill(self) -> None:
         tracker = InterviewProgressTracker({
@@ -324,6 +326,35 @@ class WaitForDriveOutcomeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "candidate_reconnected")
 
 
+class InterviewPlanHelpersTests(unittest.TestCase):
+    def test_resolve_interview_plan_picks_prepared_flow(self) -> None:
+        plan = resolve_interview_plan({
+            "questions": [{"skill": "React", "questions": ["Q1"]}],
+        })
+        self.assertEqual(plan.mode, "prepared_questions")
+        self.assertEqual(len(plan.question_groups), 1)
+        self.assertEqual(plan.skill_specs, [])
+
+    def test_compose_runtime_instructions_adds_remaining_time_before_wrapup(self) -> None:
+        instructions = compose_runtime_instructions(
+            "Base prompt",
+            plan_mode="prepared_questions",
+            remaining_minutes=12.5,
+        )
+        self.assertIn("Remaining interview time before runtime wrap-up authorization: 12.5 min.", instructions)
+        self.assertIn("Do not say the remaining time aloud", instructions)
+        self.assertNotIn("Wrap-up is explicitly authorized", instructions)
+
+    def test_compose_runtime_instructions_switches_to_wrapup_mode(self) -> None:
+        instructions = compose_runtime_instructions(
+            "Base prompt",
+            plan_mode="skills_only",
+            wrap_up_authorized=True,
+        )
+        self.assertIn("Wrap-up is explicitly authorized by runtime.", instructions)
+        self.assertNotIn("Remaining interview time before runtime wrap-up authorization", instructions)
+
+
 class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
     async def test_verifier_short_circuits_when_no_structured_plan(self) -> None:
         result = await verify_pre_wrapup_coverage(
@@ -360,7 +391,6 @@ class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
                     "skill": "Core Java",
                     "questions": ["Q1", "Q2"],
                 }],
-                "skills": [{"skill": "SQL"}],
             }
         }
         transcript_lines = [
@@ -370,11 +400,9 @@ class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
         provider_cfg = {"llm": {"provider": "openai", "api_key": "k", "model": "m"}}
         mocked = {
             "verifiedPreparedQuestions": [{"skill": "Core Java", "questionNumbers": [1]}],
-            "verifiedSkills": [],
             "missingQuestions": [{"skill": "Core Java", "questionNumber": 2, "question": "Q2"}],
-            "missingSkills": ["SQL"],
             "readyForWrapup": False,
-            "notes": "Question 2 and SQL were not clearly covered.",
+            "notes": "Question 2 was not clearly covered.",
         }
         with patch("app.pre_wrapup_verifier._eval_json", new=AsyncMock(return_value=mocked)):
             result = await verify_pre_wrapup_coverage(
@@ -385,10 +413,9 @@ class PreWrapupVerifierTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.ready_for_wrapup)
         self.assertEqual(result.verified_question_marks, [("Core Java", 1)])
-        self.assertEqual(len(result.missing_items), 2)
+        self.assertEqual(len(result.missing_items), 1)
         self.assertEqual(result.missing_items[0]["type"], "question")
-        self.assertEqual(result.missing_items[1]["type"], "skill")
-        self.assertIn("SQL", result.notes)
+        self.assertIn("Question 2", result.notes)
 
     async def test_verifier_normalizes_skill_aliases_to_plan_name(self) -> None:
         meta = {
@@ -460,6 +487,202 @@ class ProviderResolverTests(unittest.TestCase):
         self.assertEqual(cfg["llm"]["provider"], "xai")
         self.assertEqual(cfg["llm"]["model"], "grok-4-1-fast-non-reasoning")
         self.assertEqual(cfg["llm"]["api_key"], "x-test-key")
+
+
+class LongConversationContextTests(unittest.IsolatedAsyncioTestCase):
+    def test_interview_memory_refresh_only_summarizes_older_lines(self) -> None:
+        memory_state = InterviewMemoryState(summary_tail_lines=2)
+        transcript_lines = [
+            {"role": "assistant", "text": "Explain React state.", "is_final": True},
+            {"role": "user", "text": "State stores component data.", "is_final": True},
+            {"role": "assistant", "text": "How do hooks work?", "is_final": True},
+            {"role": "user", "text": "Hooks let function components use state.", "is_final": True},
+        ]
+
+        summary = memory_state.refresh_from_transcript(transcript_lines, force=True)
+
+        self.assertIn("Explain React state.", summary)
+        self.assertIn("State stores component data.", summary)
+        self.assertNotIn("How do hooks work?", summary)
+        self.assertNotIn("Hooks let function components use state.", summary)
+
+    def test_build_scripted_reply_chat_ctx_uses_bounded_tail(self) -> None:
+        tracker = InterviewProgressTracker({
+            "questions": [{"skill": "React", "questions": ["Q1", "Q2"]}],
+        })
+        history = ChatContext()
+        history.add_message(role="system", content="old instructions")
+        for idx in range(6):
+            history.add_message(role="assistant", content=f"assistant-{idx}")
+            history.add_message(role="user", content=f"user-{idx}")
+
+        session = type("Session", (), {"history": history})()
+        transcript = type("Transcript", (), {
+            "lines": [
+                {"role": "assistant", "text": "Explain React state.", "is_final": True},
+                {"role": "user", "text": "State stores component data.", "is_final": True},
+                {"role": "assistant", "text": "How do hooks work?", "is_final": True},
+                {"role": "user", "text": "Hooks let function components use state.", "is_final": True},
+            ]
+        })()
+        memory_state = InterviewMemoryState(max_tail_items=4, summary_tail_lines=2)
+
+        chat_ctx = _build_scripted_reply_chat_ctx(
+            session=session,
+            base_prompt="Base prompt",
+            transcript=transcript,
+            progress_tracker=tracker,
+            memory_state=memory_state,
+            runtime_control_provider=lambda: "Runtime control: continue interviewing.",
+            wrap_up_authorized_provider=lambda: False,
+        )
+
+        text_items = [item.text_content for item in chat_ctx.items if getattr(item, "type", "") == "message"]
+        self.assertEqual(text_items[0], "Base prompt")
+        self.assertTrue(any("Interview memory:" in text for text in text_items))
+        self.assertTrue(any("Runtime control: continue interviewing." in text for text in text_items))
+        self.assertIn("assistant-4", text_items)
+        self.assertIn("user-5", text_items)
+        self.assertNotIn("assistant-0", text_items)
+        self.assertLessEqual(len(chat_ctx.items), 7)
+
+    async def test_generate_interview_reply_passes_compact_chat_ctx(self) -> None:
+        tracker = InterviewProgressTracker({
+            "skills": [{"skill": "React", "weightage": 100}],
+            "durationMinutes": 20,
+        })
+        history = ChatContext()
+        for idx in range(8):
+            history.add_message(role="assistant", content=f"assistant-{idx}")
+            history.add_message(role="user", content=f"user-{idx}")
+
+        session = type("Session", (), {
+            "history": history,
+            "generate_reply": AsyncMock(),
+        })()
+        transcript = type("Transcript", (), {
+            "lines": [
+                {"role": "assistant", "text": "Explain React state.", "is_final": True},
+                {"role": "user", "text": "State stores component data.", "is_final": True},
+                {"role": "assistant", "text": "How do hooks work?", "is_final": True},
+                {"role": "user", "text": "Hooks let function components use state.", "is_final": True},
+            ]
+        })()
+        memory_state = InterviewMemoryState(max_tail_items=4, summary_tail_lines=2)
+
+        await _generate_interview_reply(
+            session=session,
+            base_prompt="Base prompt",
+            transcript=transcript,
+            progress_tracker=tracker,
+            memory_state=memory_state,
+            runtime_control_provider=lambda: "Runtime control: continue interviewing.",
+            wrap_up_authorized_provider=lambda: False,
+            instructions="Ask the next question now.",
+        )
+
+        session.generate_reply.assert_awaited_once()
+        kwargs = session.generate_reply.await_args.kwargs
+        self.assertEqual(kwargs["instructions"], "Ask the next question now.")
+        self.assertIn("chat_ctx", kwargs)
+        chat_ctx = kwargs["chat_ctx"]
+        text_items = [item.text_content for item in chat_ctx.items if getattr(item, "type", "") == "message"]
+        self.assertEqual(text_items[0], "Base prompt")
+        self.assertTrue(any("Interview memory:" in text for text in text_items))
+        self.assertNotIn("assistant-0", text_items)
+        self.assertIn("assistant-6", text_items)
+
+    def test_build_interview_memory_message_returns_none_without_content(self) -> None:
+        self.assertIsNone(
+            build_interview_memory_message(
+                earlier_summary="",
+                pending_summary="none",
+                runtime_gate_summary="none",
+            )
+        )
+
+    def test_build_interview_memory_message_omits_pending_items_after_wrapup(self) -> None:
+        message = build_interview_memory_message(
+            earlier_summary="Earlier interviewer topics: React state.",
+            pending_summary="React questions 7, 20",
+            runtime_gate_summary="none",
+            wrap_up_authorized=True,
+        )
+        self.assertIn("Wrap-up is already authorized by runtime.", message)
+        self.assertNotIn("Required coverage still pending", message)
+
+    def test_build_interview_memory_message_includes_anti_repeat_guidance(self) -> None:
+        message = build_interview_memory_message(
+            earlier_summary="Earlier interviewer topics: React state.",
+            pending_summary="React coverage",
+            runtime_gate_summary="React needs about 10.0 more min",
+            anti_repeat_summary="Already asked on React: state vs props in react.",
+        )
+        self.assertIn("Already asked on React: state vs props in react.", message)
+
+    async def test_prepared_verifier_allows_wrapup_when_missing_questions_stay_within_20_percent(self) -> None:
+        meta = {
+            "interviewMeta": {
+                "questions": [{
+                    "skill": "React",
+                    "questions": [f"Q{i}" for i in range(1, 21)],
+                }],
+            }
+        }
+        provider_cfg = {"llm": {"provider": "openai", "api_key": "k", "model": "m"}}
+        mocked = {
+            "verifiedPreparedQuestions": [{"skill": "React", "questionNumbers": list(range(1, 19))}],
+            "missingQuestions": [
+                {"skill": "React", "questionNumber": 19, "question": "Q19"},
+                {"skill": "React", "questionNumber": 20, "question": "Q20"},
+            ],
+            "readyForWrapup": False,
+            "notes": "2 out of 20 prepared questions were not asked.",
+        }
+        with patch("app.pre_wrapup_verifier._eval_json", new=AsyncMock(return_value=mocked)):
+            result = await verify_pre_wrapup_coverage(
+                meta=meta,
+                transcript_lines=[{"role": "assistant", "text": "Q1", "is_final": True}],
+                provider_cfg=provider_cfg,
+            )
+
+        self.assertTrue(result.ready_for_wrapup)
+        self.assertEqual(result.missing_items, [])
+        self.assertIn(("React", 19), result.verified_question_marks)
+        self.assertIn(("React", 20), result.verified_question_marks)
+        self.assertIn("tolerance applied", result.notes.lower())
+
+    async def test_prepared_verifier_blocks_wrapup_when_missing_questions_exceed_20_percent(self) -> None:
+        meta = {
+            "interviewMeta": {
+                "questions": [{
+                    "skill": "React",
+                    "questions": [f"Q{i}" for i in range(1, 21)],
+                }],
+            }
+        }
+        provider_cfg = {"llm": {"provider": "openai", "api_key": "k", "model": "m"}}
+        mocked = {
+            "verifiedPreparedQuestions": [{"skill": "React", "questionNumbers": list(range(1, 16))}],
+            "missingQuestions": [
+                {"skill": "React", "questionNumber": 16, "question": "Q16"},
+                {"skill": "React", "questionNumber": 17, "question": "Q17"},
+                {"skill": "React", "questionNumber": 18, "question": "Q18"},
+                {"skill": "React", "questionNumber": 19, "question": "Q19"},
+                {"skill": "React", "questionNumber": 20, "question": "Q20"},
+            ],
+            "readyForWrapup": False,
+            "notes": "5 out of 20 prepared questions were not asked.",
+        }
+        with patch("app.pre_wrapup_verifier._eval_json", new=AsyncMock(return_value=mocked)):
+            result = await verify_pre_wrapup_coverage(
+                meta=meta,
+                transcript_lines=[{"role": "assistant", "text": "Q1", "is_final": True}],
+                provider_cfg=provider_cfg,
+            )
+
+        self.assertFalse(result.ready_for_wrapup)
+        self.assertEqual(len(result.missing_items), 5)
 
 
 class SkillsHelpersTests(unittest.TestCase):

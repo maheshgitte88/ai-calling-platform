@@ -1,31 +1,26 @@
-"""Transcript-based verification gate before wrap-up.
-
-This module asks a second LLM pass to compare the live transcript against the
-required interview plan so wrap-up only starts after every required item is
-actually covered.
-"""
+"""Transcript-based verification gate before wrap-up."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .evaluation import _eval_json
-from .prompt import _normalize_question_groups
-from .skills import canonical_skill_key, normalize_skill_specs
+from .interview_plan import InterviewPlan, resolve_interview_plan
+from .skills import canonical_skill_key
 
-_VERIFY_SYSTEM_PROMPT = """
-You verify interview-plan coverage before wrap-up. Reply with ONLY valid JSON.
+PREPARED_QUESTION_WRAPUP_MIN_COVERAGE = 0.8
+
+_PREPARED_VERIFY_SYSTEM_PROMPT = """
+You verify prepared-question interview coverage before wrap-up. Reply with ONLY valid JSON.
 
 Rules:
-- Be strict. If a required question or skill is uncertain, treat it as missing.
-- For prepared questions, mark a question verified only if the interviewer clearly asked that question or an unmistakable equivalent in the interviewer transcript.
+- Be strict. If a required prepared question is uncertain, treat it as missing.
+- Use only the interviewer transcript to decide whether a required prepared question was clearly asked or an unmistakable equivalent was asked.
 - Prepared-question coverage depends on whether the interviewer asked it, not on whether the candidate answered well, partially, incorrectly, or said "I don't know".
 - Never mark a prepared question as missing just because the candidate could not answer it after it was asked.
-- For skills without prepared questions, decide whether the interviewer substantively covered the skill in the interviewer transcript.
-- Candidate correctness does NOT determine whether a skill was covered. Incorrect, weak, or incomplete answers should usually be reflected in `notes`, not `missingSkills`.
-- Mark a skill as verified when the interviewer spent meaningful time on that skill and covered multiple core areas, even if one subtopic was answered poorly or not answered.
-- Mark a skill as missing only when the interviewer barely covered it, skipped it, or the candidate gave repeated non-responses so the skill never received real substantive coverage.
+- The runtime may still authorize wrap-up when overall prepared-question coverage is high enough, so keep the missing list accurate and concise.
 - Do not assume coverage from greetings, wrap-up, or vague mentions.
 - Use the provided skill names and prepared question numbers from the plan. Treat common aliases like `React` and `React.js` as the same skill.
 
@@ -34,10 +29,29 @@ Output JSON shape:
   "verifiedPreparedQuestions": [
     { "skill": string, "questionNumbers": [integer] }
   ],
-  "verifiedSkills": [string],
   "missingQuestions": [
     { "skill": string, "questionNumber": integer, "question": string }
   ],
+  "readyForWrapup": boolean,
+  "notes": string
+}
+""".strip()
+
+_SKILLS_VERIFY_SYSTEM_PROMPT = """
+You verify skills-only interview coverage before wrap-up. Reply with ONLY valid JSON.
+
+Rules:
+- Be strict. If a required skill is uncertain, treat it as missing.
+- Use only the interviewer transcript to decide whether the interviewer substantively covered each skill.
+- Candidate correctness does NOT determine whether a skill was covered. Incorrect, weak, or incomplete answers should usually be reflected in `notes`, not `missingSkills`.
+- Mark a skill as verified when the interviewer spent meaningful time on that skill and covered multiple core areas, even if one subtopic was answered poorly or not answered.
+- Mark a skill as missing only when the interviewer barely covered it, skipped it, or the candidate gave repeated non-responses so the skill never received real substantive coverage.
+- Do not assume coverage from greetings, wrap-up, or vague mentions.
+- Use the provided skill names from the plan. Treat common aliases like `React` and `React.js` as the same skill.
+
+Output JSON shape:
+{
+  "verifiedSkills": [string],
   "missingSkills": [string],
   "readyForWrapup": boolean,
   "notes": string
@@ -56,10 +70,9 @@ class PreWrapupVerificationResult:
     notes: str
 
 
-def _prepared_question_plan(interview_meta: dict) -> list[dict]:
-    groups = _normalize_question_groups(interview_meta.get("questions") or [])
+def _prepared_question_plan(plan: InterviewPlan) -> list[dict]:
     out: list[dict] = []
-    for group in groups:
+    for group in plan.question_groups:
         skill = str(group.get("skill") or "").strip()
         questions = [str(q).strip() for q in group.get("questions") or [] if str(q).strip()]
         if not skill or not questions:
@@ -74,21 +87,12 @@ def _prepared_question_plan(interview_meta: dict) -> list[dict]:
     return out
 
 
-def _skills_without_prepared_questions(interview_meta: dict) -> list[str]:
-    skill_specs_raw = interview_meta.get("skills") or interview_meta.get("skillWeights") or []
-    if not isinstance(skill_specs_raw, list):
-        skill_specs_raw = []
-    skill_specs = normalize_skill_specs(skill_specs_raw)
-    prepared_skill_keys = {
-        canonical_skill_key(group.get("skill") or "")
-        for group in _normalize_question_groups(interview_meta.get("questions") or [])
-        if canonical_skill_key(group.get("skill") or "")
-    }
-    return [
-        spec["skill"]
-        for spec in skill_specs
-        if spec.get("skill") and canonical_skill_key(spec["skill"]) not in prepared_skill_keys
-    ]
+def _skills_only_plan(plan: InterviewPlan) -> list[str]:
+    return [spec["skill"] for spec in plan.skill_specs if spec.get("skill")]
+
+
+def _prepared_question_total(plan: InterviewPlan) -> int:
+    return sum(len(group.get("questions") or []) for group in plan.question_groups)
 
 
 def _assistant_only_transcript(transcript_lines: list[dict]) -> str:
@@ -102,50 +106,51 @@ def _assistant_only_transcript(transcript_lines: list[dict]) -> str:
     return "\n".join(lines_out) if lines_out else "(empty interviewer transcript)"
 
 
-def _build_verification_user_prompt(meta: dict, transcript_lines: list[dict]) -> str:
-    interview_meta = meta.get("interviewMeta") or {}
-    prepared_plan = _prepared_question_plan(interview_meta)
-    skill_plan = _skills_without_prepared_questions(interview_meta)
+def _build_prepared_verification_user_prompt(plan: InterviewPlan, transcript_lines: list[dict]) -> str:
+    prepared_plan = _prepared_question_plan(plan)
     transcript_text = _assistant_only_transcript(transcript_lines)
 
     prepared_lines = ["Prepared questions:"]
-    if prepared_plan:
-        for group in prepared_plan:
-            prepared_lines.append(f"- Skill: {group['skill']}")
-            for item in group["questions"]:
-                prepared_lines.append(
-                    f"  - Question {item['questionNumber']}: {item['question']}"
-                )
-    else:
-        prepared_lines.append("- None")
-
-    skill_lines = ["Required skills without prepared question lists:"]
-    if skill_plan:
-        skill_lines.extend(f"- {skill}" for skill in skill_plan)
-    else:
-        skill_lines.append("- None")
+    for group in prepared_plan:
+        prepared_lines.append(f"- Skill: {group['skill']}")
+        for item in group["questions"]:
+            prepared_lines.append(f"  - Question {item['questionNumber']}: {item['question']}")
 
     return "\n".join([
         *prepared_lines,
         "",
-        *skill_lines,
-        "",
         "Interviewer transcript only:",
-        "Use this transcript to decide what the interviewer actually asked or covered.",
+        "Use this transcript to decide what the interviewer actually asked.",
         "Do not require candidate answers to verify that a prepared question was asked.",
         "",
         transcript_text,
     ])
 
 
-def _display_skill_name_map(interview_meta: dict) -> dict[str, str]:
+def _build_skills_verification_user_prompt(plan: InterviewPlan, transcript_lines: list[dict]) -> str:
+    skill_plan = _skills_only_plan(plan)
+    transcript_text = _assistant_only_transcript(transcript_lines)
+    skill_lines = ["Required skills:"]
+    skill_lines.extend(f"- {skill}" for skill in skill_plan)
+
+    return "\n".join([
+        *skill_lines,
+        "",
+        "Interviewer transcript only:",
+        "Use this transcript to decide what the interviewer actually covered.",
+        "",
+        transcript_text,
+    ])
+
+
+def _display_skill_name_map(plan: InterviewPlan) -> dict[str, str]:
     display: dict[str, str] = {}
-    for group in _normalize_question_groups(interview_meta.get("questions") or []):
+    for group in plan.question_groups:
         skill = str(group.get("skill") or "").strip()
         key = canonical_skill_key(skill)
         if key and key not in display:
             display[key] = skill
-    for spec in normalize_skill_specs(interview_meta.get("skills") or interview_meta.get("skillWeights") or []):
+    for spec in plan.skill_specs:
         skill = str(spec.get("skill") or "").strip()
         key = canonical_skill_key(skill)
         if key and key not in display:
@@ -163,10 +168,10 @@ def _normalize_skill_name(raw_skill: Any, display_map: dict[str, str]) -> str:
 
 def _normalize_verification_result(
     raw: dict[str, Any],
-    interview_meta: dict,
+    plan: InterviewPlan,
     coverage_exempt_skills: Iterable[str] = (),
 ) -> PreWrapupVerificationResult:
-    display_map = _display_skill_name_map(interview_meta)
+    display_map = _display_skill_name_map(plan)
     exempt_keys = {
         canonical_skill_key(skill)
         for skill in coverage_exempt_skills
@@ -245,24 +250,62 @@ def _normalize_verification_result(
     )
 
 
-async def verify_pre_wrapup_coverage(
+def _apply_prepared_question_tolerance(
+    result: PreWrapupVerificationResult,
+    plan: InterviewPlan,
+) -> PreWrapupVerificationResult:
+    total_questions = _prepared_question_total(plan)
+    if total_questions <= 0 or result.ready_for_wrapup:
+        return result
+
+    missing_questions = [item for item in result.missing_items if item.get("type") == "question"]
+    non_question_missing = [item for item in result.missing_items if item.get("type") != "question"]
+    if non_question_missing:
+        return result
+
+    required_questions = max(1, math.ceil(total_questions * PREPARED_QUESTION_WRAPUP_MIN_COVERAGE))
+    asked_questions = total_questions - len(missing_questions)
+    if asked_questions < required_questions:
+        return result
+
+    tolerated_marks = [
+        (str(item["skill"]), int(item["question_number"]))
+        for item in missing_questions
+        if item.get("skill") and isinstance(item.get("question_number"), int)
+    ]
+    verified_marks = list(result.verified_question_marks)
+    seen_marks = set(verified_marks)
+    for mark in tolerated_marks:
+        if mark not in seen_marks:
+            verified_marks.append(mark)
+            seen_marks.add(mark)
+
+    allowed_missing = total_questions - required_questions
+    tolerance_note = (
+        f"Prepared-question wrap-up tolerance applied: {len(missing_questions)} of {total_questions} "
+        f"questions were still missing, which is within the allowed overall gap of {allowed_missing}."
+    )
+    notes = result.notes
+    if notes:
+        notes = f"{notes} {tolerance_note}"
+    else:
+        notes = tolerance_note
+
+    return PreWrapupVerificationResult(
+        verified_question_marks=verified_marks,
+        verified_skill_completions=result.verified_skill_completions,
+        missing_items=[],
+        ready_for_wrapup=True,
+        notes=notes,
+    )
+
+
+async def _verify_prepared_question_coverage(
     *,
-    meta: dict,
+    plan: InterviewPlan,
     transcript_lines: list[dict],
     provider_cfg: dict,
-    coverage_exempt_skills: Iterable[str] = (),
 ) -> PreWrapupVerificationResult:
-    """Verify whether the full interview plan is actually covered before wrap-up."""
-    interview_meta = meta.get("interviewMeta") or {}
-    if not _prepared_question_plan(interview_meta) and not _skills_without_prepared_questions(interview_meta):
-        return PreWrapupVerificationResult(
-            verified_question_marks=[],
-            verified_skill_completions=[],
-            missing_items=[],
-            ready_for_wrapup=True,
-            notes="No structured plan was provided, so verification is trivially complete.",
-        )
-
     llm_cfg = provider_cfg.get("llm") or {}
     provider = str(llm_cfg.get("provider") or "").strip().lower()
     api_key = str(llm_cfg.get("api_key") or "").strip()
@@ -274,10 +317,73 @@ async def verify_pre_wrapup_coverage(
         provider=provider,
         api_key=api_key,
         model=model,
-        system=_VERIFY_SYSTEM_PROMPT,
-        user=_build_verification_user_prompt(meta, transcript_lines),
+        system=_PREPARED_VERIFY_SYSTEM_PROMPT,
+        user=_build_prepared_verification_user_prompt(plan, transcript_lines),
     )
-    return _normalize_verification_result(raw, interview_meta, coverage_exempt_skills)
+    return _apply_prepared_question_tolerance(_normalize_verification_result(raw, plan), plan)
+
+
+async def _verify_skills_only_coverage(
+    *,
+    plan: InterviewPlan,
+    transcript_lines: list[dict],
+    provider_cfg: dict,
+    coverage_exempt_skills: Iterable[str] = (),
+) -> PreWrapupVerificationResult:
+    llm_cfg = provider_cfg.get("llm") or {}
+    provider = str(llm_cfg.get("provider") or "").strip().lower()
+    api_key = str(llm_cfg.get("api_key") or "").strip()
+    model = str(llm_cfg.get("model") or "").strip()
+    if not provider or not api_key or not model:
+        raise ValueError("LLM provider configuration is missing for pre-wrap-up verification.")
+
+    raw = await _eval_json(
+        provider=provider,
+        api_key=api_key,
+        model=model,
+        system=_SKILLS_VERIFY_SYSTEM_PROMPT,
+        user=_build_skills_verification_user_prompt(plan, transcript_lines),
+    )
+    return _normalize_verification_result(raw, plan, coverage_exempt_skills)
+
+
+def _build_verification_user_prompt(meta: dict, transcript_lines: list[dict]) -> str:
+    """Compatibility wrapper for tests and debugging."""
+    plan = resolve_interview_plan(meta.get("interviewMeta") or {})
+    if plan.mode == "prepared_questions":
+        return _build_prepared_verification_user_prompt(plan, transcript_lines)
+    return _build_skills_verification_user_prompt(plan, transcript_lines)
+
+
+async def verify_pre_wrapup_coverage(
+    *,
+    meta: dict,
+    transcript_lines: list[dict],
+    provider_cfg: dict,
+    coverage_exempt_skills: Iterable[str] = (),
+) -> PreWrapupVerificationResult:
+    """Verify whether the active interview plan is actually covered before wrap-up."""
+    plan = resolve_interview_plan(meta.get("interviewMeta") or {})
+    if not plan.has_plan:
+        return PreWrapupVerificationResult(
+            verified_question_marks=[],
+            verified_skill_completions=[],
+            missing_items=[],
+            ready_for_wrapup=True,
+            notes="No structured plan was provided, so verification is trivially complete.",
+        )
+    if plan.mode == "prepared_questions":
+        return await _verify_prepared_question_coverage(
+            plan=plan,
+            transcript_lines=transcript_lines,
+            provider_cfg=provider_cfg,
+        )
+    return await _verify_skills_only_coverage(
+        plan=plan,
+        transcript_lines=transcript_lines,
+        provider_cfg=provider_cfg,
+        coverage_exempt_skills=coverage_exempt_skills,
+    )
 
 
 __all__ = ["PreWrapupVerificationResult", "verify_pre_wrapup_coverage"]

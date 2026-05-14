@@ -10,10 +10,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
-from livekit.agents import AgentSession, JobContext, room_io
+from livekit.agents import AgentSession, ChatContext, ChatMessage, JobContext, room_io
 from livekit.agents.llm import ToolError, function_tool
 from livekit.agents.llm.tool_context import ToolFlag
 from livekit.agents.voice import Agent, RunContext
@@ -26,10 +26,11 @@ from .avatar import maybe_attach_avatar
 from .config import Settings, settings as default_settings
 from .db import get_db
 from .evaluation import generate_structured_evaluation
+from .interview_memory import InterviewMemoryState, build_compact_chat_context
 from .interview_progress import InterviewProgressTracker
 from .metadata import InterviewDurations, compute_durations, parse_metadata
 from .pre_wrapup_verifier import verify_pre_wrapup_coverage
-from .prompt import build_prompt
+from .prompt import build_interview_memory_message, build_prompt, build_runtime_control_message
 from .provider_resolver import resolve_provider_cfg
 from .time_utils import now_iso
 from .transcript import TranscriptRecorder
@@ -126,9 +127,8 @@ def _skills_only_gate_retry_instruction(blockers: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _initial_reply_instructions(has_prepared: bool) -> str:
+def _initial_reply_instructions() -> str:
     """Kickoff turn: greet + readiness check only. Do NOT ask the first question yet."""
-    del has_prepared  # first question waits for the candidate's readiness reply
     return "Give a short greeting and ask if the candidate is ready to begin. Do not ask the first interview question yet."
 
 
@@ -169,8 +169,8 @@ def _basic_signals_from_stats(stats: dict[str, Any]) -> tuple[list[str], list[st
     return strengths, gaps
 
 
-class InterviewAgent(Agent):
-    """Interview agent with structured progress-reporting tools."""
+class _BaseInterviewAgent(Agent):
+    """Interview agent with shared runtime completion tooling."""
 
     def __init__(
         self,
@@ -180,9 +180,55 @@ class InterviewAgent(Agent):
         llm: Any,
         tts: Any,
         progress_tracker: InterviewProgressTracker,
+        transcript: TranscriptRecorder,
+        memory_state: InterviewMemoryState,
+        runtime_control_provider: Callable[[], str | None],
+        wrap_up_authorized_provider: Callable[[], bool],
     ) -> None:
         super().__init__(instructions=instructions, stt=stt, llm=llm, tts=tts)
+        self._base_prompt = instructions
         self._progress_tracker = progress_tracker
+        self._transcript = transcript
+        self._memory_state = memory_state
+        self._runtime_control_provider = runtime_control_provider
+        self._wrap_up_authorized_provider = wrap_up_authorized_provider
+
+    def _build_compact_turn_context(self, source_ctx: ChatContext) -> ChatContext:
+        self._memory_state.refresh_from_transcript(self._transcript.lines)
+        return build_compact_chat_context(
+            source_ctx=source_ctx,
+            base_instructions=self._base_prompt,
+            memory_message=build_interview_memory_message(
+                earlier_summary=self._memory_state.summary_text,
+                pending_summary=self._progress_tracker.pending_summary(),
+                runtime_gate_summary=self._progress_tracker.runtime_gate_summary(),
+                anti_repeat_summary=self._progress_tracker.anti_repeat_summary(),
+                wrap_up_authorized=self._wrap_up_authorized_provider(),
+            ),
+            runtime_control=self._runtime_control_provider(),
+            max_tail_items=self._memory_state.max_tail_items,
+        )
+
+    async def on_user_turn_completed(
+        self,
+        turn_ctx: ChatContext,
+        new_message: ChatMessage,
+    ) -> None:
+        del new_message
+        turn_ctx.items[:] = self._build_compact_turn_context(turn_ctx).items
+
+    @function_tool(flags=ToolFlag.IGNORE_ON_ENTER)
+    async def mark_interview_plan_completed(self, context: RunContext) -> str:
+        """Validate whether all required interview items are complete and wrap-up should begin now."""
+        del context
+        update = self._progress_tracker.confirm_plan_completed()
+        if not update.accepted:
+            raise ToolError(update.message)
+        return update.message
+
+
+class PreparedQuestionsInterviewAgent(_BaseInterviewAgent):
+    """Interview agent for prepared-question flow."""
 
     @function_tool(flags=ToolFlag.IGNORE_ON_ENTER)
     async def mark_question_asked(
@@ -203,6 +249,10 @@ class InterviewAgent(Agent):
             raise ToolError(update.message)
         return update.message
 
+
+class SkillsOnlyInterviewAgent(_BaseInterviewAgent):
+    """Interview agent for skills-only flow."""
+
     @function_tool(flags=ToolFlag.IGNORE_ON_ENTER)
     async def mark_skill_completed(self, context: RunContext, skill: str) -> str:
         """Record that you have finished covering one required skill with no prepared question list.
@@ -212,15 +262,6 @@ class InterviewAgent(Agent):
         """
         del context
         update = self._progress_tracker.mark_skill_completed(skill)
-        if not update.accepted:
-            raise ToolError(update.message)
-        return update.message
-
-    @function_tool(flags=ToolFlag.IGNORE_ON_ENTER)
-    async def mark_interview_plan_completed(self, context: RunContext) -> str:
-        """Validate whether all required interview items are complete and wrap-up should begin now."""
-        del context
-        update = self._progress_tracker.confirm_plan_completed()
         if not update.accepted:
             raise ToolError(update.message)
         return update.message
@@ -363,6 +404,57 @@ async def _wait_for_reconnect(
     return "timeout"
 
 
+def _build_scripted_reply_chat_ctx(
+    *,
+    session: AgentSession,
+    base_prompt: str,
+    transcript: TranscriptRecorder,
+    progress_tracker: InterviewProgressTracker,
+    memory_state: InterviewMemoryState,
+    runtime_control_provider: Callable[[], str | None],
+    wrap_up_authorized_provider: Callable[[], bool],
+) -> ChatContext:
+    memory_state.refresh_from_transcript(transcript.lines, force=True)
+    return build_compact_chat_context(
+        source_ctx=session.history,
+        base_instructions=base_prompt,
+        memory_message=build_interview_memory_message(
+            earlier_summary=memory_state.summary_text,
+            pending_summary=progress_tracker.pending_summary(),
+            runtime_gate_summary=progress_tracker.runtime_gate_summary(),
+            anti_repeat_summary=progress_tracker.anti_repeat_summary(),
+            wrap_up_authorized=wrap_up_authorized_provider(),
+        ),
+        runtime_control=runtime_control_provider(),
+        max_tail_items=memory_state.max_tail_items,
+    )
+
+
+async def _generate_interview_reply(
+    *,
+    session: AgentSession,
+    base_prompt: str,
+    transcript: TranscriptRecorder,
+    progress_tracker: InterviewProgressTracker,
+    memory_state: InterviewMemoryState,
+    runtime_control_provider: Callable[[], str | None],
+    wrap_up_authorized_provider: Callable[[], bool],
+    instructions: str,
+) -> None:
+    await session.generate_reply(
+        instructions=instructions,
+        chat_ctx=_build_scripted_reply_chat_ctx(
+            session=session,
+            base_prompt=base_prompt,
+            transcript=transcript,
+            progress_tracker=progress_tracker,
+            memory_state=memory_state,
+            runtime_control_provider=runtime_control_provider,
+            wrap_up_authorized_provider=wrap_up_authorized_provider,
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Candidate presence tracking
 # ---------------------------------------------------------------------------
@@ -493,11 +585,15 @@ async def _drive_interview(
     session: AgentSession,
     tracker: CandidateRoomTracker,
     progress_tracker: InterviewProgressTracker,
+    runtime_state: dict[str, Any],
+    memory_state: InterviewMemoryState,
+    runtime_control_provider: Callable[[], str | None],
+    wrap_up_authorized_provider: Callable[[], bool],
+    base_prompt: str,
     transcript: TranscriptRecorder,
     meta: dict,
     provider_cfg: dict,
     durations: InterviewDurations,
-    has_prepared: bool,
     db: Any,
     session_id: str,
 ) -> None:
@@ -513,21 +609,37 @@ async def _drive_interview(
         return
 
     _persist_first_candidate_join(db, session_id)
-
-    def _on_transcript_line(line: dict) -> None:
-        if line.get("role") != "user" or not bool(line.get("is_final")):
-            return
-        progress_tracker.note_candidate_response(str(line.get("text") or ""))
-
-    transcript.add_listener(_on_transcript_line)
-
-    await session.generate_reply(instructions=_initial_reply_instructions(has_prepared))
-
     wrap_up_started = False
     drive_outcome: str | None = None
     wrap_up_deadline = 0.0
     loop = asyncio.get_running_loop()
     drive_deadline = loop.time() + durations.drive_seconds
+    runtime_state["loop"] = loop
+    runtime_state["drive_deadline"] = drive_deadline
+    runtime_state["wrap_up_started"] = False
+
+    def _on_transcript_line(line: dict) -> None:
+        if not bool(line.get("is_final")):
+            return
+        role = line.get("role")
+        text = str(line.get("text") or "")
+        if role == "user":
+            progress_tracker.note_candidate_response(text)
+            return
+        if role == "assistant" and not wrap_up_started:
+            progress_tracker.note_interviewer_prompt(text)
+
+    transcript.add_listener(_on_transcript_line)
+    await _generate_interview_reply(
+        session=session,
+        base_prompt=base_prompt,
+        transcript=transcript,
+        progress_tracker=progress_tracker,
+        memory_state=memory_state,
+        runtime_control_provider=runtime_control_provider,
+        wrap_up_authorized_provider=wrap_up_authorized_provider,
+        instructions=_initial_reply_instructions(),
+    )
 
     while True:
         if tracker.connected.is_set():
@@ -581,12 +693,19 @@ async def _drive_interview(
                 except Exception:
                     logger.exception("[Interview] Pre-wrap-up verification failed; continuing interview.")
                     if tracker.connected.is_set():
-                        await session.generate_reply(
+                        await _generate_interview_reply(
+                            session=session,
+                            base_prompt=base_prompt,
+                            transcript=transcript,
+                            progress_tracker=progress_tracker,
+                            memory_state=memory_state,
+                            runtime_control_provider=runtime_control_provider,
+                            wrap_up_authorized_provider=wrap_up_authorized_provider,
                             instructions=(
                                 "Do not start wrap-up yet. A final verification step could not confirm full coverage. "
-                                "Continue the interview and ensure every required skill and prepared question is covered, "
+                                "Continue the interview and ensure every required interview item is covered, "
                                 "then call `mark_interview_plan_completed` again."
-                            )
+                            ),
                         )
                     continue
 
@@ -607,8 +726,15 @@ async def _drive_interview(
                             },
                         )
                         if tracker.connected.is_set():
-                            await session.generate_reply(
-                                instructions=_skills_only_gate_retry_instruction(blockers)
+                            await _generate_interview_reply(
+                                session=session,
+                                base_prompt=base_prompt,
+                                transcript=transcript,
+                                progress_tracker=progress_tracker,
+                                memory_state=memory_state,
+                                runtime_control_provider=runtime_control_provider,
+                                wrap_up_authorized_provider=wrap_up_authorized_provider,
+                                instructions=_skills_only_gate_retry_instruction(blockers),
                             )
                         continue
 
@@ -623,11 +749,18 @@ async def _drive_interview(
                     },
                 )
                 if tracker.connected.is_set():
-                    await session.generate_reply(
+                    await _generate_interview_reply(
+                        session=session,
+                        base_prompt=base_prompt,
+                        transcript=transcript,
+                        progress_tracker=progress_tracker,
+                        memory_state=memory_state,
+                        runtime_control_provider=runtime_control_provider,
+                        wrap_up_authorized_provider=wrap_up_authorized_provider,
                         instructions=_missing_items_retry_instruction(
                             missing_items,
                             verification.notes,
-                        )
+                        ),
                     )
                 continue
             drive_outcome = outcome
@@ -653,6 +786,7 @@ async def _drive_interview(
         reason = "plan_completed" if drive_outcome == "plan_completed" else "duration_elapsed"
         wrap_up_deadline = loop.time() + durations.conclude_buffer_seconds
         wrap_up_started = True
+        runtime_state["wrap_up_started"] = True
         wrap_up_ends_at = _persist_wrap_up_started(
             db,
             session_id,
@@ -664,9 +798,21 @@ async def _drive_interview(
                 "[Interview] Interview plan completed early; starting wrap-up.",
                 extra={"session_id": session_id, "wrap_up_ends_at": wrap_up_ends_at},
             )
+        else:
+            logger.info(
+                "[Interview] Interview duration elapsed; runtime is authorizing wrap-up.",
+                extra={"session_id": session_id, "wrap_up_ends_at": wrap_up_ends_at},
+            )
         if tracker.connected.is_set():
-            await session.generate_reply(
-                instructions=_wrap_up_instruction_text(durations.conclude_buffer_seconds)
+            await _generate_interview_reply(
+                session=session,
+                base_prompt=base_prompt,
+                transcript=transcript,
+                progress_tracker=progress_tracker,
+                memory_state=memory_state,
+                runtime_control_provider=runtime_control_provider,
+                wrap_up_authorized_provider=wrap_up_authorized_provider,
+                instructions=_wrap_up_instruction_text(durations.conclude_buffer_seconds),
             )
 
     if not wrap_up_started:
@@ -754,10 +900,9 @@ async def run_interview(
     candidate_id = meta.get("candidateId", "")
     interview_meta = meta.get("interviewMeta") or {}
     durations = compute_durations(interview_meta)
-    has_prepared = bool(interview_meta.get("questions"))
     progress_tracker = InterviewProgressTracker(interview_meta)
 
-    prompt = build_prompt(meta)
+    prompt = build_prompt(meta, plan=progress_tracker.plan)
     provider_cfg = resolve_provider_cfg(meta, cfg)
 
     logger.info(
@@ -793,14 +938,59 @@ async def run_interview(
     transcript = TranscriptRecorder(db, session_id)
 
     await ctx.connect()
-    session = AgentSession()
-    if progress_tracker.has_plan:
-        agent = InterviewAgent(
+    memory_state = InterviewMemoryState()
+    session = AgentSession(userdata=memory_state)
+    runtime_state: dict[str, Any] = {
+        "loop": None,
+        "drive_deadline": None,
+        "wrap_up_started": False,
+    }
+    def _wrap_up_authorized_provider() -> bool:
+        return bool(runtime_state.get("wrap_up_started"))
+
+    def _runtime_control_provider() -> str | None:
+        if progress_tracker.plan_mode == "none":
+            return None
+        if runtime_state.get("wrap_up_started"):
+            return build_runtime_control_message(
+                plan_mode=progress_tracker.plan_mode,
+                wrap_up_authorized=True,
+            )
+        loop = runtime_state.get("loop")
+        drive_deadline = runtime_state.get("drive_deadline")
+        if loop is not None and drive_deadline is not None:
+            remaining_minutes = max(0.0, drive_deadline - loop.time()) / 60.0
+        else:
+            remaining_minutes = max(0.0, durations.drive_seconds) / 60.0
+        return build_runtime_control_message(
+            plan_mode=progress_tracker.plan_mode,
+            remaining_minutes=remaining_minutes,
+            wrap_up_authorized=False,
+        )
+
+    if progress_tracker.plan_mode == "prepared_questions":
+        agent = PreparedQuestionsInterviewAgent(
             instructions=prompt,
             stt=stt,
             llm=llm,
             tts=tts,
             progress_tracker=progress_tracker,
+            transcript=transcript,
+            memory_state=memory_state,
+            runtime_control_provider=_runtime_control_provider,
+            wrap_up_authorized_provider=_wrap_up_authorized_provider,
+        )
+    elif progress_tracker.plan_mode == "skills_only":
+        agent = SkillsOnlyInterviewAgent(
+            instructions=prompt,
+            stt=stt,
+            llm=llm,
+            tts=tts,
+            progress_tracker=progress_tracker,
+            transcript=transcript,
+            memory_state=memory_state,
+            runtime_control_provider=_runtime_control_provider,
+            wrap_up_authorized_provider=_wrap_up_authorized_provider,
         )
     else:
         agent = Agent(instructions=prompt, stt=stt, llm=llm, tts=tts)
@@ -826,11 +1016,15 @@ async def run_interview(
             session=session,
             tracker=tracker,
             progress_tracker=progress_tracker,
+            runtime_state=runtime_state,
+            memory_state=memory_state,
+            runtime_control_provider=_runtime_control_provider,
+            wrap_up_authorized_provider=_wrap_up_authorized_provider,
+            base_prompt=prompt,
             transcript=transcript,
             meta=meta,
             provider_cfg=provider_cfg,
             durations=durations,
-            has_prepared=has_prepared,
             db=db,
             session_id=session_id,
         )
