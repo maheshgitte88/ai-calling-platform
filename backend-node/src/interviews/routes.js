@@ -1,5 +1,6 @@
 import express from "express";
 import crypto from "node:crypto";
+import multer from "multer";
 import { v4 as uuidv4 } from "uuid";
 
 import { COLLECTIONS, getDb } from "../db.js";
@@ -32,8 +33,26 @@ import {
 } from "./duration.js";
 import { ensureInterviewRecordingStarted, markRecordingFailed } from "./recording.js";
 import { triggerSessionEvaluation } from "./evaluator-client.js";
+import {
+  loadInterviewSessionForJoinToken,
+  PRECHECK_AUDIO_MAX_BYTES,
+  validatePrecheckAudioBuffer,
+} from "./precheck-helpers.js";
+import { precheckIdentityBlobPath, uploadProctorFrame } from "../storage/proctor-frames.js";
 
 const router = express.Router();
+
+const SUPPORTED_PRECHECK_IMAGE_TYPES = /^image\/(jpe?g|png|webp)$/i;
+
+const precheckAudioMulter = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: PRECHECK_AUDIO_MAX_BYTES },
+});
+
+const precheckIdentityMulter = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 3 * 1024 * 1024 },
+});
 
 // ---------------------------------------------------------------------------
 // Helpers (private to the routes module)
@@ -234,6 +253,160 @@ router.post(
       linkExpiresAt: linkExpiresAt.toISOString(),
       candidateJoinUrl,
       joinToken,
+    });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/interviews/session/precheck/meta
+// ---------------------------------------------------------------------------
+
+router.post(
+  "/session/precheck/meta",
+  asyncHandler(async (req, res) => {
+    const { joinToken } = ResolveInterviewSessionSchema.parse(req.body ?? {});
+    const db = getDb();
+    const { decoded, session } = await loadInterviewSessionForJoinToken(db, joinToken);
+    const meta = session.metadata || {};
+    const interviewMeta = meta.interviewMeta || {};
+    const rules = meta.interviewRules;
+    let rulesSummary = "";
+    if (rules != null) {
+      try {
+        rulesSummary = JSON.stringify(rules);
+        if (rulesSummary.length > 2000) {
+          rulesSummary = `${rulesSummary.slice(0, 2000)}…`;
+        }
+      } catch {
+        rulesSummary = "";
+      }
+    }
+    res.json({
+      sessionId: session.session_id,
+      participantName: session.participant_name || "Candidate",
+      interviewTitle: interviewMeta.title ?? "AI Interview",
+      instructions: String(interviewMeta.instructions || "").trim(),
+      rulesSummary,
+      linkExpiresAt: new Date(decoded.exp).toISOString(),
+    });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/interviews/session/precheck/audio
+// ---------------------------------------------------------------------------
+
+router.post(
+  "/session/precheck/audio",
+  precheckAudioMulter.single("audio"),
+  asyncHandler(async (req, res) => {
+    const joinToken = String(req.body?.joinToken || "");
+    if (!joinToken) throw new HttpError(400, "Missing joinToken");
+    const db = getDb();
+    const { session } = await loadInterviewSessionForJoinToken(db, joinToken);
+    const file = req.file;
+    if (!file?.buffer?.length) throw new HttpError(400, "Missing audio file");
+
+    const checks = validatePrecheckAudioBuffer(file.buffer, file.mimetype || "");
+
+    try {
+      await db.collection(COLLECTIONS.INTERVIEW_EVENTS).insertOne({
+        id: uuidv4(),
+        session_id: session.session_id,
+        type: "precheck_audio_ok",
+        payload: {
+          at: nowIso(),
+          bytes: checks.bytes,
+          container: checks.container,
+          variance: Math.round(checks.variance * 1000) / 1000,
+        },
+        created_at: nowIso(),
+      });
+    } catch {
+      /* best-effort audit only */
+    }
+
+    res.json({
+      ok: true,
+      checks: {
+        bytes: checks.bytes,
+        container: checks.container,
+        variance: Math.round(checks.variance * 1000) / 1000,
+      },
+    });
+  }),
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/interviews/session/precheck/identity
+// ---------------------------------------------------------------------------
+
+router.post(
+  "/session/precheck/identity",
+  precheckIdentityMulter.single("image"),
+  asyncHandler(async (req, res) => {
+    const joinToken = String(req.body?.joinToken || "");
+    if (!joinToken) throw new HttpError(400, "Missing joinToken");
+    const db = getDb();
+    const { session } = await loadInterviewSessionForJoinToken(db, joinToken);
+    const file = req.file;
+    if (!file?.buffer?.length) throw new HttpError(400, "Missing image file");
+    if (!SUPPORTED_PRECHECK_IMAGE_TYPES.test(file.mimetype || "")) {
+      throw new HttpError(400, "Unsupported image content type");
+    }
+
+    const capturedAt = nowIso();
+    const blobPath = precheckIdentityBlobPath(session, capturedAt);
+
+    let uploadResult;
+    try {
+      uploadResult = await uploadProctorFrame({
+        buffer: file.buffer,
+        blobPath,
+        contentType: file.mimetype,
+        metadata: {
+          session_id: session.session_id,
+          interview_id: session.interview_id || "",
+          candidate_id: session.candidate_id || "",
+          captured_at: capturedAt,
+          precheck: "true",
+        },
+      });
+    } catch (uploadErr) {
+      console.error(
+        "[precheck] identity upload failed",
+        JSON.stringify({
+          sessionId: session.session_id,
+          message: uploadErr?.message || String(uploadErr),
+        }),
+      );
+      throw new HttpError(502, "Failed to persist precheck image");
+    }
+
+    const doc = {
+      id: uuidv4(),
+      session_id: session.session_id,
+      interview_id: session.interview_id || null,
+      candidate_id: session.candidate_id || null,
+      captured_at: capturedAt,
+      blob_path: uploadResult.blobPath,
+      blob_url: uploadResult.url,
+      container: uploadResult.container,
+      size_bytes: uploadResult.sizeBytes,
+      content_type: file.mimetype,
+      client_meta: { precheck: true, kind: "precheck_identity" },
+      analysis_status: "pending",
+      created_at: nowIso(),
+    };
+
+    await db.collection(COLLECTIONS.INTERVIEW_PROCTOR_FRAMES).insertOne(doc);
+
+    res.status(201).json({
+      ok: true,
+      frameId: doc.id,
+      blobPath: uploadResult.blobPath,
+      url: uploadResult.url,
+      capturedAt,
     });
   }),
 );
@@ -467,11 +640,14 @@ router.get(
       .findOne({ session_id: req.params.sessionId });
     if (!session) throw new HttpError(404, "Interview session not found");
 
-    const events = await db
-      .collection(COLLECTIONS.INTERVIEW_EVENTS)
-      .find({ session_id: req.params.sessionId })
-      .sort({ created_at: 1 })
-      .toArray();
+    const includeEvents = req.query.includeEvents !== "false";
+    const events = includeEvents
+      ? await db
+          .collection(COLLECTIONS.INTERVIEW_EVENTS)
+          .find({ session_id: req.params.sessionId })
+          .sort({ created_at: 1 })
+          .toArray()
+      : [];
     const evaluation = await db
       .collection(COLLECTIONS.INTERVIEW_EVALUATIONS)
       .findOne({ session_id: req.params.sessionId });

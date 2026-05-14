@@ -17,10 +17,45 @@ export const api = {
     request("/interviews/session/start", { method: "POST", body: JSON.stringify(body) }),
   resolveInterviewSession: (body) =>
     request("/interviews/session/resolve", { method: "POST", body: JSON.stringify(body) }),
+  getInterviewPrecheckMeta: (joinToken) =>
+    request("/interviews/session/precheck/meta", {
+      method: "POST",
+      body: JSON.stringify({ joinToken }),
+    }),
+  uploadInterviewPrecheckAudio: (blob, joinToken, { signal } = {}) => {
+    const fd = new FormData();
+    fd.append("audio", blob, "precheck-audio.webm");
+    fd.append("joinToken", joinToken);
+    return fetch(`${API_BASE}/interviews/session/precheck/audio`, {
+      method: "POST",
+      body: fd,
+      signal,
+    }).then(async (res) => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    });
+  },
+  uploadInterviewPrecheckIdentity: (blob, joinToken, { signal } = {}) => {
+    const fd = new FormData();
+    fd.append("image", blob, "precheck-identity.jpg");
+    fd.append("joinToken", joinToken);
+    return fetch(`${API_BASE}/interviews/session/precheck/identity`, {
+      method: "POST",
+      body: fd,
+      signal,
+    }).then(async (res) => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || res.statusText);
+      return data;
+    });
+  },
   endInterviewSession: (sessionId, body = {}) =>
     request(`/interviews/session/${sessionId}/end`, { method: "POST", body: JSON.stringify(body) }),
-  getInterviewSession: (sessionId) =>
-    request(`/interviews/session/${sessionId}`),
+  getInterviewSession: (sessionId, options = {}) => {
+    const includeEvents = options.includeEvents === false ? "?includeEvents=false" : "";
+    return request(`/interviews/session/${sessionId}${includeEvents}`);
+  },
   addInterviewSessionEvent: (sessionId, body) =>
     request(`/interviews/session/${sessionId}/event`, { method: "POST", body: JSON.stringify(body) }),
   uploadInterviewProctorFrame: (sessionId, blob, meta = {}, { signal } = {}) => {

@@ -28,6 +28,7 @@ import {
 import { api } from "../services/api";
 import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
 import AIVoiceBoatIndicator from "../components/AIVoiceBoatIndicator";
+import InterviewPrecheck from "./InterviewPrecheck";
 
 const SESSION_POLL_INTERVAL_MS = 5000;
 const WRAP_UP_POLL_INTERVAL_MS = 1000;
@@ -35,6 +36,11 @@ const PROCTOR_INTERVAL_MS = 30_000;
 const PROCTOR_JPEG_WIDTH = 640;
 const PROCTOR_JPEG_QUALITY = 0.7;
 const PROCTOR_UPLOAD_TIMEOUT_MS = 10_000;
+const PROCTOR_TRACK_RETRY_MS = 5000;
+
+function interviewPrecheckStorageKey(token) {
+  return `interview_precheck_ok_v1_${token}`;
+}
 
 function parseIsoMs(value) {
   if (!value) return 0;
@@ -129,8 +135,21 @@ function isRecoverableRoomError(err) {
 
 export default function InterviewJoin() {
   const joinToken = useJoinToken();
-  /** resolve_loading | error | room_connecting | live | wrap_up | completed */
-  const [phase, setPhase] = useState(() => (joinToken ? "resolve_loading" : "error"));
+  /** precheck | resolve_loading | error | room_connecting | live | wrap_up | completed */
+  const [phase, setPhase] = useState(() => {
+    if (!joinToken) return "error";
+    try {
+      if (
+        typeof sessionStorage !== "undefined" &&
+        sessionStorage.getItem(interviewPrecheckStorageKey(joinToken)) === "1"
+      ) {
+        return "resolve_loading";
+      }
+    } catch {
+      /* ignore */
+    }
+    return "precheck";
+  });
   const [resolved, setResolved] = useState(null);
   const [errorInfo, setErrorInfo] = useState(() =>
     joinToken ? null : mapResolveError(new Error("Missing interview link token."))
@@ -169,8 +188,10 @@ export default function InterviewJoin() {
   }, [joinToken]);
 
   useEffect(() => {
+    if (!joinToken || phase !== "resolve_loading") return undefined;
     runResolve();
-  }, [runResolve]);
+    return undefined;
+  }, [joinToken, phase, runResolve]);
 
   useEffect(() => {
     if (!resolved?.sessionId || !["room_connecting", "live", "wrap_up"].includes(phase)) {
@@ -181,7 +202,7 @@ export default function InterviewJoin() {
       if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       let session = null;
       try {
-        const data = await api.getInterviewSession(resolved.sessionId);
+        const data = await api.getInterviewSession(resolved.sessionId, { includeEvents: false });
         session = data?.session || null;
         const st = session?.status;
         const hasEval = Boolean(data?.evaluation);
@@ -253,7 +274,7 @@ export default function InterviewJoin() {
     try {
       await api.endInterviewSession(resolved.sessionId, { reason: "candidate_ended" });
       try {
-        const data = await api.getInterviewSession(resolved.sessionId);
+        const data = await api.getInterviewSession(resolved.sessionId, { includeEvents: false });
         setCompletion(data);
       } catch {
         setCompletion({ session: { status: "ended" }, evaluation: null });
@@ -321,6 +342,20 @@ export default function InterviewJoin() {
         }
       `}</style>
 
+      {phase === "precheck" && joinToken && (
+        <InterviewPrecheck
+          joinToken={joinToken}
+          onPrecheckPassed={() => {
+            try {
+              sessionStorage.setItem(interviewPrecheckStorageKey(joinToken), "1");
+            } catch {
+              /* ignore */
+            }
+            setPhase("resolve_loading");
+          }}
+        />
+      )}
+
       {phase === "resolve_loading" && <ResolveLoadingScreen />}
 
       {phase === "error" && errorInfo && (
@@ -384,21 +419,23 @@ export default function InterviewJoin() {
         </div>
       )}
 
-      <div
-        style={{
-          position: "fixed",
-          bottom: 0,
-          left: 0,
-          right: 0,
-          zIndex: 100,
-          padding: "10px 16px 14px",
-          display: "flex",
-          justifyContent: "center",
-          pointerEvents: "none",
-        }}
-      >
-        <PoweredByHirecorrecto compact />
-      </div>
+      {phase !== "precheck" && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            zIndex: 100,
+            padding: "10px 16px 14px",
+            display: "flex",
+            justifyContent: "center",
+            pointerEvents: "none",
+          }}
+        >
+          <PoweredByHirecorrecto compact />
+        </div>
+      )}
     </>
   );
 }
@@ -751,16 +788,29 @@ function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionSta
       if (videoEl) videoEl.srcObject = null;
     };
 
+    let retryTimer = null;
+
+    const queueRetry = () => {
+      if (cancelled || retryTimer) return;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        refresh();
+      }, PROCTOR_TRACK_RETRY_MS);
+    };
+
     const refresh = async () => {
       if (cancelled) return;
       const mst = findCameraTrack();
       if (!mst) {
         detachStream();
         setActive(false);
+        queueRetry();
         return;
       }
       const ok = await attachStream(mst);
-      if (!cancelled) setActive(Boolean(ok));
+      if (cancelled) return;
+      setActive(Boolean(ok));
+      if (!ok) queueRetry();
     };
 
     refresh();
@@ -772,6 +822,7 @@ function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionSta
 
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       localParticipant.off?.("trackPublished", trackChange);
       localParticipant.off?.("trackUnpublished", trackChange);
       localParticipant.off?.("trackMuted", trackChange);
