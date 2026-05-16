@@ -107,3 +107,11 @@ export async function uploadProctorFrame({
     sizeBytes: buffer.length,
   };
 }
+
+export async function deleteProctorFrame(blobPath) {
+  if (!blobPath) return false;
+  const container = getContainerClient();
+  const blockBlob = container.getBlockBlobClient(blobPath);
+  const result = await blockBlob.deleteIfExists();
+  return Boolean(result.succeeded);
+}

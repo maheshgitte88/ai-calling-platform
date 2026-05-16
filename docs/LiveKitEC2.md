@@ -27,7 +27,7 @@ This guide covers how to deploy, update, and verify `livekit-server` and `liveki
 |---|---|---|
 | `7880` | TCP | LiveKit API / WS |
 | `7881` | UDP | WebRTC transport |
-| `50000-50100` | UDP | RTP media range |
+| `59000-59100` | UDP | WebRTC / RTP media range (matches repo `livekit.yaml`) |
 | `5060` | UDP | SIP signaling (or your custom SIP port) |
 
 Security recommendation:
@@ -82,8 +82,8 @@ port: 7880
 rtc:
   tcp_port: 7881
   use_external_ip: true
-  port_range_start: 50000
-  port_range_end: 50100
+  port_range_start: 59000
+  port_range_end: 59100
 
 keys:
   myapikey: "YOUR_LIVEKIT_API_SECRET"
@@ -153,7 +153,7 @@ docker run -d \
   --restart unless-stopped \
   -p 7880:7880 \
   -p 7881:7881/udp \
-  -p 50000-50100:50000-50100/udp \
+  -p 59000-59100:59000-59100/udp \
   -v ~/livekit.yaml:/livekit.yaml:ro \
   livekit/livekit-server:latest \
   --config /livekit.yaml
@@ -208,7 +208,7 @@ Check:
 ### Call connects but no audio / media timeout
 
 Check:
-- UDP ports blocked (`7881`, `50000-50100`)
+- UDP ports blocked (`7881`, `59000-59100`)
 - Security group or NACL blocking RTP traffic
 
 ### Random SIP calls in logs
@@ -233,7 +233,7 @@ services:
     ports:
       - "7880:7880"
       - "7881:7881/udp"
-      - "50000-50100:50000-50100/udp"
+      - "59000-59100:59000-59100/udp"
     volumes:
       - ./livekit.yaml:/livekit.yaml:ro
     command: --config /livekit.yaml

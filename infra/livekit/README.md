@@ -57,7 +57,7 @@ docker run -d \
   --network livekit-net \
   -p 7880:7880 \
   -p 7881:7881/tcp \
-  -p 50000-50100:50000-50100/udp \
+  -p 59000-59100:59000-59100/udp \
   -v "$PWD/livekit.yaml:/etc/livekit.yaml:ro" \
   livekit/livekit-server:latest \
   --config /etc/livekit.yaml
@@ -146,8 +146,18 @@ explicit `node_ip` in `livekit.yaml` so ICE candidates are reachable.
 
 ### Ports already in use
 
-- 7880 / 5060 / 7881 / 10000-10100 / 50000-50100 must be free on the host.
+- 7880 / 5060 / 7881 / 10000-10100 / **59000-59100** (UDP WebRTC) must be free on the host.
   On Windows, check with `netstat -ano | findstr :7880`.
+
+### Windows: `bind: ... forbidden by its access permissions` on UDP
+
+Hyper-V and Windows **excluded port ranges** often cover part of **50000–50100**, so Docker cannot publish those UDP ports. This stack uses **59000–59100** instead (see `livekit.yaml` and `docker-compose.yml`). If you still see bind errors, list exclusions and pick a free block:
+
+```powershell
+netsh interface ipv4 show excludedportrange protocol=udp
+```
+
+Then set `port_range_start` / `port_range_end` in `livekit.yaml` and the matching `ports:` UDP mapping in `docker-compose.yml` to a range **outside** the excluded intervals.
 
 ## Production / EC2 deployment
 

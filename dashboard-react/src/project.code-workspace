@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../../../../Hirecorrecto/project"
+		},
+		{
+			"path": "../.."
+		}
+	],
+	"settings": {
+		"cSpell.words": [
+			"Partitioner",
+			"Partitioners"
+		]
+	}
+}

@@ -469,7 +469,7 @@ VITE_API_BASE_URL=https://api.maheshgitte.online
 
 ### 6. Reminders
 
-- LiveKit **UDP** (e.g. **50000–60000**) must still be open in the security group.
+- LiveKit **UDP** for WebRTC must match `livekit.yaml` (repo default **59000–59100**; open that range in the security group).
 - Node must be listening on **`127.0.0.1:4040`**, LiveKit on **`127.0.0.1:7880`**.
 - If **403/404** on static files, that’s expected on **`api.…`** if you only proxy **`/api/`**.
 

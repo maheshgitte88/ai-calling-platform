@@ -36,10 +36,11 @@ export const api = {
       return data;
     });
   },
-  uploadInterviewPrecheckIdentity: (blob, joinToken, { signal } = {}) => {
+  uploadInterviewPrecheckIdentity: (blob, joinToken, meta = {}, { signal } = {}) => {
     const fd = new FormData();
     fd.append("image", blob, "precheck-identity.jpg");
     fd.append("joinToken", joinToken);
+    fd.append("meta", JSON.stringify(meta || {}));
     return fetch(`${API_BASE}/interviews/session/precheck/identity`, {
       method: "POST",
       body: fd,
@@ -53,8 +54,11 @@ export const api = {
   endInterviewSession: (sessionId, body = {}) =>
     request(`/interviews/session/${sessionId}/end`, { method: "POST", body: JSON.stringify(body) }),
   getInterviewSession: (sessionId, options = {}) => {
-    const includeEvents = options.includeEvents === false ? "?includeEvents=false" : "";
-    return request(`/interviews/session/${sessionId}${includeEvents}`);
+    const params = new URLSearchParams();
+    if (options.includeEvents === false) params.set("includeEvents", "false");
+    if (options.includeProctor) params.set("includeProctor", "true");
+    const qs = params.toString();
+    return request(`/interviews/session/${sessionId}${qs ? `?${qs}` : ""}`);
   },
   addInterviewSessionEvent: (sessionId, body) =>
     request(`/interviews/session/${sessionId}/event`, { method: "POST", body: JSON.stringify(body) }),

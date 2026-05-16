@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 EXPECTED_MODE = "video_interview"
 CANDIDATE_JOIN_TIMEOUT_SECONDS = 10 * 60
 RECONNECT_GRACE_SECONDS = 300
+IDLE_CHECKIN_COOLDOWN_SECONDS = 20
 
 
 def _utc_now() -> datetime:
@@ -315,6 +316,33 @@ def _persist_candidate_disconnected(db: Any, session_id: str, *, grace_seconds: 
     return grace_ends_at
 
 
+def _persist_agent_start_failed(db: Any, session_id: str, exc: Exception) -> None:
+    db.interview_sessions.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "agent_status": "failed",
+            "agent_error": str(exc),
+            "agent_failed_at": now_iso(),
+            "updated_at": now_iso(),
+        }},
+    )
+
+
+def _persist_candidate_never_joined(db: Any, session_id: str) -> None:
+    db.interview_sessions.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "status": "waiting",
+            "ended_reason": None,
+            "completed_at": None,
+            "candidate_connection_status": "waiting",
+            "reconnect_grace_started_at": None,
+            "reconnect_grace_ends_at": None,
+            "updated_at": now_iso(),
+        }},
+    )
+
+
 def _persist_wrap_up_started(
     db: Any,
     session_id: str,
@@ -359,29 +387,32 @@ async def _wait_for_drive_outcome(
     *,
     tracker: "CandidateRoomTracker",
     completion_requested: asyncio.Event,
+    idle_check_requested: asyncio.Event,
     drive_seconds: int,
 ) -> str:
     """Wait for the first interview-ending condition.
 
-    Returns one of: ``candidate_disconnected``, ``completion_requested``, ``timeout``.
+    Returns one of: ``candidate_disconnected``, ``completion_requested``, ``idle_checkin``, ``timeout``.
     """
     disconnect_task = asyncio.create_task(tracker.disconnected.wait())
     completion_requested_task = asyncio.create_task(completion_requested.wait())
+    idle_check_task = asyncio.create_task(idle_check_requested.wait())
     timeout_task = asyncio.create_task(asyncio.sleep(drive_seconds))
 
     try:
         done, pending = await asyncio.wait(
-            {disconnect_task, completion_requested_task, timeout_task},
+            {disconnect_task, completion_requested_task, idle_check_task, timeout_task},
             return_when=asyncio.FIRST_COMPLETED,
         )
     finally:
-        for task in (disconnect_task, completion_requested_task, timeout_task):
+        for task in (disconnect_task, completion_requested_task, idle_check_task, timeout_task):
             if task.done():
                 continue
             task.cancel()
         await asyncio.gather(
             disconnect_task,
             completion_requested_task,
+            idle_check_task,
             timeout_task,
             return_exceptions=True,
         )
@@ -390,6 +421,8 @@ async def _wait_for_drive_outcome(
         return "candidate_disconnected"
     if completion_requested.is_set() and completion_requested_task in done:
         return "completion_requested"
+    if idle_check_task in done:
+        return "idle_checkin"
     return "timeout"
 
 
@@ -530,6 +563,9 @@ def _persist_session_started(db: Any, session_id: str) -> None:
         {"session_id": session_id},
         {"$set": {
             "status": "in_progress",
+            "agent_status": "ready",
+            "agent_ready_at": now_iso(),
+            "agent_error": None,
             "candidate_connection_status": "waiting",
             "wrap_up_started_at": None,
             "wrap_up_ends_at": None,
@@ -610,7 +646,7 @@ async def _drive_interview(
     durations: InterviewDurations,
     db: Any,
     session_id: str,
-) -> None:
+) -> bool:
     """Run the active interview phase, including the wrap-up window.
 
     Returns once the candidate disconnects, the drive timeout fires (and
@@ -620,7 +656,7 @@ async def _drive_interview(
         await asyncio.wait_for(tracker.joined.wait(), timeout=CANDIDATE_JOIN_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         logger.info("[Interview] Candidate did not join in prestart window; ending session workflow.")
-        return
+        return False
 
     _persist_first_candidate_join(db, session_id)
     wrap_up_started = False
@@ -628,9 +664,22 @@ async def _drive_interview(
     wrap_up_deadline = 0.0
     loop = asyncio.get_running_loop()
     drive_deadline = loop.time() + durations.drive_seconds
+    idle_check_requested = asyncio.Event()
+    idle_state = {
+        "last_user_activity_at": loop.time(),
+        "last_idle_checkin_at": 0.0,
+    }
     runtime_state["loop"] = loop
     runtime_state["drive_deadline"] = drive_deadline
     runtime_state["wrap_up_started"] = False
+
+    @session.on("user_state_changed")
+    def _on_user_state_changed(event: Any) -> None:
+        state = str(getattr(event, "new_state", "") or "").lower()
+        if state in {"speaking", "listening"}:
+            idle_state["last_user_activity_at"] = loop.time()
+        if state == "away":
+            idle_check_requested.set()
 
     def _on_transcript_line(line: dict) -> None:
         if not bool(line.get("is_final")):
@@ -638,6 +687,8 @@ async def _drive_interview(
         role = line.get("role")
         text = str(line.get("text") or "")
         if role == "user":
+            idle_state["last_user_activity_at"] = loop.time()
+            idle_check_requested.clear()
             progress_tracker.note_candidate_response(text)
             return
         if role == "assistant" and not wrap_up_started:
@@ -661,6 +712,7 @@ async def _drive_interview(
             outcome = await _wait_for_drive_outcome(
                 tracker=tracker,
                 completion_requested=progress_tracker.completion_requested,
+                idle_check_requested=idle_check_requested,
                 drive_seconds=remaining_drive,
             )
             if outcome == "candidate_disconnected":
@@ -698,7 +750,38 @@ async def _drive_interview(
                     ended_reason="candidate_disconnect_timeout",
                 )
                 logger.info("[Interview] Candidate did not reconnect within grace window; ending.")
-                return
+                return True
+            if outcome == "idle_checkin":
+                idle_check_requested.clear()
+                if wrap_up_started:
+                    continue
+                seconds_since_user = max(0.0, loop.time() - float(idle_state["last_user_activity_at"]))
+                seconds_since_last_checkin = max(
+                    0.0,
+                    loop.time() - float(idle_state["last_idle_checkin_at"]),
+                )
+                if (
+                    seconds_since_user >= 15.0
+                    and seconds_since_last_checkin >= IDLE_CHECKIN_COOLDOWN_SECONDS
+                    and tracker.connected.is_set()
+                ):
+                    idle_state["last_idle_checkin_at"] = loop.time()
+                    await _generate_interview_reply(
+                        session=session,
+                        base_prompt=base_prompt,
+                        transcript=transcript,
+                        progress_tracker=progress_tracker,
+                        memory_state=memory_state,
+                        runtime_control_provider=runtime_control_provider,
+                        wrap_up_authorized_provider=wrap_up_authorized_provider,
+                        instructions=(
+                            "Keep the interview in progress. The candidate appears silent right now. "
+                            "Say one brief check-in sentence only, such as: 'Hello! Are you there?' or "
+                            "'Hello! Can you hear me clearly?' Then pause and wait for their response. "
+                            "Do not start wrap-up and do not mark completion."
+                        ),
+                    )
+                continue
             if outcome == "completion_requested":
                 logger.info(
                     "[Interview] Completion request received; starting verification.",
@@ -816,7 +899,7 @@ async def _drive_interview(
             ended_reason="candidate_disconnect_timeout",
         )
         logger.info("[Interview] Candidate remained disconnected; ending before wrap-up.")
-        return
+        return True
 
     if drive_outcome in ("timeout", "plan_completed"):
         reason = "plan_completed" if drive_outcome == "plan_completed" else "duration_elapsed"
@@ -857,7 +940,7 @@ async def _drive_interview(
             session_id,
             ended_reason="candidate_disconnected",
         )
-        return
+        return True
 
     while True:
         remaining_wrap_up = max(0.0, wrap_up_deadline - loop.time())
@@ -868,7 +951,7 @@ async def _drive_interview(
                 ended_reason="wrap_up_complete",
             )
             logger.info("[Interview] Wrap-up window ended; marking session completed.")
-            return
+            return True
 
         if tracker.connected.is_set():
             try:
@@ -880,7 +963,7 @@ async def _drive_interview(
                     ended_reason="wrap_up_complete",
                 )
                 logger.info("[Interview] Wrap-up timeout reached; ending session workflow.")
-                return
+                return True
 
             _persist_candidate_disconnected(
                 db,
@@ -911,7 +994,7 @@ async def _drive_interview(
                 ended_reason="wrap_up_disconnect_timeout",
             )
             logger.info("[Interview] Candidate did not reconnect before wrap-up ended.")
-            return
+            return True
 
         reconnect_outcome = await _wait_for_reconnect(
             tracker=tracker,
@@ -937,7 +1020,7 @@ async def _drive_interview(
             ended_reason="wrap_up_disconnect_timeout",
         )
         logger.info("[Interview] Wrap-up ended while candidate was disconnected.")
-        return
+        return True
 
 
 async def run_interview(
@@ -997,7 +1080,7 @@ async def run_interview(
 
     await ctx.connect()
     memory_state = InterviewMemoryState()
-    session = AgentSession(userdata=memory_state)
+    session = AgentSession(userdata=memory_state, user_away_timeout=15.0)
     runtime_state: dict[str, Any] = {
         "loop": None,
         "drive_deadline": None,
@@ -1061,7 +1144,11 @@ async def run_interview(
     avatar_started = await maybe_attach_avatar(
         session=session, ctx=ctx, room_options=room_options, avatar=cfg.avatar
     )
-    await session.start(room=ctx.room, agent=agent, room_options=room_options)
+    try:
+        await session.start(room=ctx.room, agent=agent, room_options=room_options)
+    except Exception as exc:
+        _persist_agent_start_failed(db, session_id, exc)
+        raise
     if avatar_started:
         logger.info("[Avatar] Simli avatar worker started for interview session")
 
@@ -1070,7 +1157,7 @@ async def run_interview(
     tracker = CandidateRoomTracker(ctx.room, _candidate_identity(candidate_id))
     tracker.attach()
     try:
-        await _drive_interview(
+        candidate_joined = await _drive_interview(
             session=session,
             tracker=tracker,
             progress_tracker=progress_tracker,
@@ -1088,6 +1175,10 @@ async def run_interview(
         )
     finally:
         tracker.detach()
+
+    if not candidate_joined:
+        _persist_candidate_never_joined(db, session_id)
+        return
 
     eval_doc = await generate_structured_evaluation(
         transcript_lines=transcript.lines,

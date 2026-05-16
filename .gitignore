@@ -8,6 +8,7 @@ extensions.json
 
 # Node dependencies
 node_modules/
+.npm-cache/
 .pnp/
 .pnp.js
 

@@ -11,21 +11,54 @@ import {
 } from "lucide-react";
 import { api } from "../services/api";
 import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
+import {
+  analyzeIdentityImageBlob,
+  analyzeProctorFrame,
+  getNetworkSignals,
+} from "../proctor/proctorEngine";
+import {
+  getScreenCaptureInfo,
+  isScreenCaptureActive,
+  requestScreenCapture,
+} from "../proctor/screenCapture";
 
 const MIN_RECORD_MS = 2500;
 const TEST_PHRASE = "I'm ready to begin my interview.";
 const JPEG_QUALITY = 0.82;
+const PROCTOR_TOAST_STREAK_NEED = 3;
+
+const DEFAULT_INSTRUCTIONS = [
+  "Use a quiet room with stable internet and good lighting.",
+  "Sit facing the camera; keep your face clearly visible throughout the interview.",
+  "Stay on this browser tab and share your full screen or window when asked (not only this tab).",
+  "Answer the AI interviewer naturally and wait for each question to finish before you speak.",
+  "Do not use notes, another device, or another person to help during the interview.",
+];
 
 const pStyles = {
   root: {
-    minHeight: "100vh",
+    minHeight: "100dvh",
+    width: "100%",
     display: "flex",
-    alignItems: "flex-start",
-    justifyContent: "center",
-    padding: "24px 16px 100px",
+    flexDirection: "column",
     position: "relative",
-    overflow: "auto",
-    background: "linear-gradient(165deg, #020617 0%, #1e1b4b 40%, #020617 100%)",
+    overflowX: "hidden",
+    overflowY: "auto",
+    background:
+      "linear-gradient(165deg, #020617 0%, #1e1b4b 40%, #020617 100%)",
+    boxSizing: "border-box",
+  },
+  shell: {
+    position: "relative",
+    zIndex: 1,
+    flex: 1,
+    minHeight: 0,
+    width: "100%",
+    maxWidth: 1280,
+    margin: "0 auto",
+    display: "flex",
+    flexDirection: "column",
+    padding: "10px 20px 84px",
     boxSizing: "border-box",
   },
   glow: {
@@ -33,7 +66,8 @@ const pStyles = {
     width: "min(90vw, 520px)",
     height: "min(90vw, 520px)",
     borderRadius: "50%",
-    background: "radial-gradient(circle, rgba(99,102,241,0.28) 0%, transparent 65%)",
+    background:
+      "radial-gradient(circle, rgba(99,102,241,0.28) 0%, transparent 65%)",
     filter: "blur(40px)",
     animation: "ij-pulse-soft 4s ease-in-out infinite",
     pointerEvents: "none",
@@ -42,79 +76,181 @@ const pStyles = {
     transform: "translateX(-50%)",
   },
   card: {
-    position: "relative",
-    zIndex: 1,
+    flex: "0 0 auto",
+    minHeight: "fit-content",
+    display: "flex",
+    flexDirection: "column",
     width: "100%",
-    maxWidth: 640,
-    padding: "clamp(20px, 4vw, 32px)",
-    borderRadius: 20,
-    background: "rgba(15,23,42,0.72)",
+    padding: "14px 18px 12px",
+    borderRadius: 16,
+    background: "rgba(15,23,42,0.82)",
     border: "1px solid rgba(148,163,184,0.18)",
     backdropFilter: "blur(12px)",
     boxSizing: "border-box",
+    overflow: "visible",
+  },
+  mainGrid: {
+    flex: "0 0 auto",
+    minHeight: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: 10,
+  },
+  row2: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: 10,
+    minHeight: 0,
+    alignItems: "stretch",
+  },
+  panel: {
+    display: "flex",
+    flexDirection: "column",
+    minHeight: 0,
+    minWidth: 0,
+    padding: "12px 14px",
+    borderRadius: 12,
+    background: "rgba(2,6,23,0.45)",
+    border: "1px solid rgba(148,163,184,0.14)",
+  },
+  panelHint: {
+    margin: "4px 0 0",
+    color: "#94a3b8",
+    fontSize: "0.78rem",
+    lineHeight: 1.4,
+  },
+  headerRow: {
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+    marginBottom: 6,
+  },
+  headerIcon: {
+    width: 36,
+    height: 36,
+    borderRadius: 10,
+    background:
+      "linear-gradient(145deg, rgba(79,70,229,0.45), rgba(30,27,75,0.95))",
+    border: "1px solid rgba(165,180,252,0.35)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+  },
+  footerBar: {
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: 14,
+    marginTop: 8,
+    paddingTop: 10,
+    borderTop: "1px solid rgba(148,163,184,0.12)",
   },
   title: {
     margin: 0,
-    fontSize: "1.35rem",
+    fontSize: "1.15rem",
     fontWeight: 700,
     color: "#f1f5f9",
     letterSpacing: "-0.02em",
   },
   sub: {
-    margin: "8px 0 0",
+    margin: "2px 0 0",
     color: "#94a3b8",
-    fontSize: "0.9rem",
-    lineHeight: 1.5,
-  },
-  section: {
-    marginTop: 22,
-    paddingTop: 18,
-    borderTop: "1px solid rgba(148,163,184,0.12)",
+    fontSize: "0.8rem",
+    lineHeight: 1.35,
   },
   sectionLabel: {
-    fontSize: "0.78rem",
+    fontSize: "0.72rem",
     fontWeight: 700,
     color: "#a5b4fc",
     textTransform: "uppercase",
     letterSpacing: "0.06em",
-    marginBottom: 10,
+    marginBottom: 6,
+  },
+  instructionsPanel: {
+    flexShrink: 0,
+    display: "flex",
+    flexDirection: "column",
+    minHeight: 0,
+    padding: "10px 14px",
+    borderRadius: 12,
+    background: "rgba(2,6,23,0.45)",
+    border: "1px solid rgba(148,163,184,0.14)",
+  },
+  instructionsScroll: {
+    maxHeight: "min(30vh, 220px)",
+    overflowY: "auto",
+    paddingRight: 4,
   },
   instructionsBox: {
     textAlign: "left",
-    maxHeight: 220,
-    overflowY: "auto",
-    padding: 14,
-    borderRadius: 12,
-    background: "rgba(2,6,23,0.55)",
-    border: "1px solid rgba(148,163,184,0.15)",
     color: "#e2e8f0",
+    fontSize: "0.82rem",
+    lineHeight: 1.5,
+  },
+  instructionsList: {
+    margin: 0,
+    paddingLeft: 20,
+  },
+  instructionsListItem: {
+    marginBottom: 8,
+  },
+  customInstructions: {
+    marginTop: 14,
+    paddingTop: 14,
+    borderTop: "1px solid rgba(148,163,184,0.12)",
+    whiteSpace: "pre-wrap",
+    color: "#cbd5e1",
     fontSize: "0.88rem",
     lineHeight: 1.55,
-    whiteSpace: "pre-wrap",
   },
   rulesBox: {
-    marginTop: 10,
-    fontSize: "0.78rem",
+    marginTop: 12,
+    fontSize: "0.82rem",
     color: "#94a3b8",
-    lineHeight: 1.45,
-    maxHeight: 100,
-    overflowY: "auto",
+    lineHeight: 1.5,
+    padding: "12px 14px",
+    borderRadius: 10,
+    background: "rgba(30,27,75,0.35)",
+    border: "1px solid rgba(165,180,252,0.15)",
   },
   videoWrap: {
-    marginTop: 12,
-    borderRadius: 12,
+    marginTop: 8,
+    borderRadius: 10,
     overflow: "hidden",
     border: "1px solid rgba(148,163,184,0.25)",
     background: "#020617",
-    aspectRatio: "16 / 10",
-    maxHeight: 280,
+    width: "100%",
+    aspectRatio: "16 / 9",
+    minHeight: 320,
+    maxHeight: 420,
     display: "flex",
     alignItems: "center",
     justifyContent: "center",
     color: "#64748b",
-    fontSize: "0.85rem",
+    fontSize: "0.8rem",
   },
   video: {
+    width: "100%",
+    height: "100%",
+    objectFit: "cover",
+  },
+  identityPreview: {
+    marginTop: 8,
+    borderRadius: 10,
+    overflow: "hidden",
+    border: "1px solid rgba(148,163,184,0.25)",
+    background: "#020617",
+    width: "100%",
+    aspectRatio: "16 / 9",
+    minHeight: 360,
+    maxHeight: 420,
+  },
+  identityPreviewImg: {
+    display: "block",
     width: "100%",
     height: "100%",
     objectFit: "cover",
@@ -156,12 +292,11 @@ const pStyles = {
     color: "#e2e8f0",
     border: "1px solid rgba(148,163,184,0.35)",
     borderRadius: 10,
-    padding: "11px 18px",
+    padding: "8px 14px",
     cursor: "pointer",
     fontWeight: 600,
-    fontSize: "0.88rem",
-    marginTop: 10,
-    marginRight: 10,
+    fontSize: "0.82rem",
+    marginTop: 8,
   },
   row: {
     display: "flex",
@@ -182,6 +317,11 @@ const pStyles = {
     fontSize: "0.82rem",
     marginTop: 8,
   },
+  statusWarn: {
+    color: "#fde68a",
+    fontSize: "0.82rem",
+    marginTop: 8,
+  },
   phrase: {
     marginTop: 10,
     padding: "12px 14px",
@@ -195,32 +335,53 @@ const pStyles = {
   },
   checkboxRow: {
     display: "flex",
-    alignItems: "flex-start",
+    alignItems: "center",
     gap: 10,
-    marginTop: 18,
+    flex: 1,
+    minWidth: 0,
     color: "#cbd5e1",
-    fontSize: "0.88rem",
-    lineHeight: 1.45,
+    fontSize: "0.84rem",
+    lineHeight: 1.35,
+    cursor: "pointer",
   },
   startBtn: {
-    display: "flex",
-    width: "100%",
+    display: "inline-flex",
+    flexShrink: 0,
     alignItems: "center",
     justifyContent: "center",
-    gap: 10,
-    marginTop: 22,
+    gap: 8,
+    marginTop: 0,
     background: "linear-gradient(135deg, #22c55e, #16a34a)",
     border: "none",
     color: "#fff",
-    padding: "14px 20px",
-    borderRadius: 12,
+    padding: "11px 22px",
+    borderRadius: 10,
     cursor: "pointer",
     fontWeight: 700,
-    fontSize: "1rem",
+    fontSize: "0.92rem",
   },
   startBtnDisabled: {
     opacity: 0.45,
     cursor: "not-allowed",
+  },
+  toastStack: {
+    position: "fixed",
+    top: 16,
+    right: 16,
+    zIndex: 200,
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    maxWidth: 320,
+  },
+  toast: {
+    borderRadius: 10,
+    border: "1px solid rgba(251,191,36,0.35)",
+    background: "rgba(15,23,42,0.92)",
+    color: "#fde68a",
+    padding: "10px 12px",
+    fontSize: "0.82rem",
+    boxShadow: "0 14px 30px -18px rgba(0,0,0,0.9)",
   },
   loadingRoot: {
     minHeight: "100vh",
@@ -228,7 +389,8 @@ const pStyles = {
     alignItems: "center",
     justifyContent: "center",
     padding: 24,
-    background: "linear-gradient(165deg, #020617 0%, #1e1b4b 40%, #020617 100%)",
+    background:
+      "linear-gradient(165deg, #020617 0%, #1e1b4b 40%, #020617 100%)",
   },
   loadingCard: {
     textAlign: "center",
@@ -272,13 +434,19 @@ function mapPrecheckMetaError(err) {
   if (lower.includes("already ended")) {
     return {
       title: "Interview has ended",
-      message: "This session is no longer active. Contact support if you still need access.",
+      message:
+        "This session is no longer active. Contact support if you still need access.",
     };
   }
-  if (lower.includes("not found") || lower.includes("join token") || lower.includes("expired")) {
+  if (
+    lower.includes("not found") ||
+    lower.includes("join token") ||
+    lower.includes("expired")
+  ) {
     return {
       title: "Link invalid or expired",
-      message: "Open the interview link from your invitation again, or request a new link.",
+      message:
+        "Open the interview link from your invitation again, or request a new link.",
     };
   }
   return {
@@ -302,12 +470,19 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
   const [identityBusy, setIdentityBusy] = useState(false);
   const [identityOk, setIdentityOk] = useState(false);
   const [identityErr, setIdentityErr] = useState(null);
+  const [identityPreviewUrl, setIdentityPreviewUrl] = useState("");
+  const [identityAnalysis, setIdentityAnalysis] = useState(null);
 
   const [audioPhase, setAudioPhase] = useState("idle");
   const [audioErr, setAudioErr] = useState(null);
   const [audioOk, setAudioOk] = useState(false);
 
   const [termsChecked, setTermsChecked] = useState(false);
+  const [screenOk, setScreenOk] = useState(() => isScreenCaptureActive());
+  const [screenInfo, setScreenInfo] = useState(() => getScreenCaptureInfo());
+  const [screenErr, setScreenErr] = useState(null);
+  const [proctorMeta, setProctorMeta] = useState(null);
+  const [toasts, setToasts] = useState([]);
 
   const videoRef = useRef(null);
   const audioContextRef = useRef(null);
@@ -316,6 +491,27 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
   const mediaRecorderRef = useRef(null);
   const recordChunksRef = useRef([]);
   const recordStartedAtRef = useRef(0);
+  const lastToastRef = useRef({});
+  const proctorStreakRef = useRef({ lighting: 0, face: 0, frontal: 0 });
+
+  useEffect(
+    () => () => {
+      if (identityPreviewUrl) URL.revokeObjectURL(identityPreviewUrl);
+    },
+    [identityPreviewUrl],
+  );
+
+  const pushToast = useCallback((message, key = message) => {
+    const now = Date.now();
+    if (lastToastRef.current[key] && now - lastToastRef.current[key] < 8000)
+      return;
+    lastToastRef.current[key] = now;
+    const id = `${key}-${now}`;
+    setToasts((items) => [...items.slice(-2), { id, message }]);
+    window.setTimeout(() => {
+      setToasts((items) => items.filter((item) => item.id !== id));
+    }, 4500);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -368,6 +564,21 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
   }, [stopMicMeter]);
 
   useEffect(() => () => stopMediaStream(), [stopMediaStream]);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      const active = isScreenCaptureActive();
+      setScreenInfo(getScreenCaptureInfo());
+      setScreenOk(active);
+      if (!active && screenOk) {
+        pushToast(
+          "Screen sharing stopped. Please enable it again before starting.",
+          "screen-stopped",
+        );
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [pushToast, screenOk]);
 
   useEffect(() => {
     const el = videoRef.current;
@@ -430,6 +641,55 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
     };
   }, [mediaStream]);
 
+  useEffect(() => {
+    if (!mediaStream || !videoRef.current) {
+      setProctorMeta(null);
+      return undefined;
+    }
+    let cancelled = false;
+    const tick = async () => {
+      const video = videoRef.current;
+      if (!video || !video.videoWidth || !video.videoHeight) return;
+      const sample = await analyzeProctorFrame(video);
+      if (cancelled) return;
+      setProctorMeta(sample);
+      const bump = (key, bad, message, toastKey) => {
+        const streak = proctorStreakRef.current;
+        if (bad) {
+          streak[key] = (streak[key] || 0) + 1;
+          if (streak[key] >= PROCTOR_TOAST_STREAK_NEED)
+            pushToast(message, toastKey);
+        } else {
+          streak[key] = 0;
+        }
+      };
+      bump(
+        "lighting",
+        sample.lightingOk === false,
+        "Lighting is low. Please move to a brighter place.",
+        "lighting",
+      );
+      bump(
+        "face",
+        sample.facePresent === false,
+        "Please keep your face visible in the camera.",
+        "face-missing",
+      );
+      bump(
+        "frontal",
+        sample.frontalOk === false,
+        "Please face the camera directly.",
+        "face-frontal",
+      );
+    };
+    const id = setInterval(tick, 3000);
+    tick();
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, [mediaStream, pushToast]);
+
   const requestDevices = useCallback(async () => {
     setDeviceError(null);
     setIdentityOk(false);
@@ -453,7 +713,11 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
     }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
+        video: {
+          facingMode: "user",
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
@@ -465,8 +729,37 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
     }
   }, [stopMicMeter]);
 
+  const requestScreenShare = useCallback(async () => {
+    setScreenErr(null);
+    try {
+      await requestScreenCapture();
+      setScreenOk(true);
+      setScreenInfo(getScreenCaptureInfo());
+    } catch (e) {
+      setScreenOk(false);
+      setScreenInfo(getScreenCaptureInfo());
+      setScreenErr(
+        e?.message || "Screen sharing is required for this interview.",
+      );
+    }
+  }, []);
+
   const captureAndUploadIdentity = useCallback(async () => {
     setIdentityErr(null);
+    const identityChecksReady =
+      proctorMeta?.facePresent === true &&
+      proctorMeta?.frontalOk === true &&
+      proctorMeta?.lightingOk === true;
+    if (!identityChecksReady) {
+      setIdentityErr(
+        "Please keep your face centered and improve lighting before capturing.",
+      );
+      pushToast(
+        "Face and lighting must both be ready before snapshot.",
+        "identity-ready",
+      );
+      return;
+    }
     const video = videoRef.current;
     if (!video || !mediaStream?.getVideoTracks()?.length) {
       setIdentityErr("Turn on your camera first.");
@@ -493,7 +786,29 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
         canvas.toBlob((b) => resolve(b), "image/jpeg", JPEG_QUALITY);
       });
       if (!blob) throw new Error("Could not encode image.");
-      await api.uploadInterviewPrecheckIdentity(blob, joinToken);
+      const capturedAnalysis = await analyzeIdentityImageBlob(blob);
+      setIdentityAnalysis(capturedAnalysis);
+      setIdentityPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(blob);
+      });
+      const capturedReady =
+        capturedAnalysis?.facePresent === true &&
+        capturedAnalysis?.frontalOk === true &&
+        capturedAnalysis?.lightingOk === true;
+      if (!capturedReady) {
+        throw new Error(
+          "Captured photo is not valid. Please keep your face centered with good lighting and retake.",
+        );
+      }
+      await api.uploadInterviewPrecheckIdentity(blob, joinToken, {
+        frameKind: "precheck_identity",
+        capturedAt: new Date().toISOString(),
+        screenCaptureActive: isScreenCaptureActive(),
+        screenCaptureSurface: getScreenCaptureInfo().displaySurface,
+        ...(capturedAnalysis || proctorMeta || {}),
+        ...(await getNetworkSignals()),
+      });
       setIdentityOk(true);
     } catch (e) {
       setIdentityErr(e?.message || "Snapshot upload failed.");
@@ -501,7 +816,7 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
     } finally {
       setIdentityBusy(false);
     }
-  }, [joinToken, mediaStream]);
+  }, [joinToken, mediaStream, proctorMeta, pushToast]);
 
   const startRecording = useCallback(() => {
     if (!mediaStream?.getAudioTracks()?.length) {
@@ -512,11 +827,15 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
     setAudioOk(false);
     recordChunksRef.current = [];
     const mime =
-      typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+      typeof MediaRecorder !== "undefined" &&
+      MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus"
         : "audio/webm";
     try {
-      const rec = new MediaRecorder(new MediaStream(mediaStream.getAudioTracks()), { mimeType: mime });
+      const rec = new MediaRecorder(
+        new MediaStream(mediaStream.getAudioTracks()),
+        { mimeType: mime },
+      );
       mediaRecorderRef.current = rec;
       rec.ondataavailable = (ev) => {
         if (ev.data?.size) recordChunksRef.current.push(ev.data);
@@ -538,7 +857,9 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
     if (!rec || audioPhase !== "recording") return;
     const elapsed = Date.now() - recordStartedAtRef.current;
     if (elapsed < MIN_RECORD_MS) {
-      setAudioErr(`Please record for at least ${Math.ceil(MIN_RECORD_MS / 1000)} seconds.`);
+      setAudioErr(
+        `Please record for at least ${Math.ceil(MIN_RECORD_MS / 1000)} seconds.`,
+      );
       return;
     }
     setAudioPhase("uploading");
@@ -546,7 +867,10 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
     await new Promise((resolve) => {
       rec.onstop = resolve;
       try {
-        if (rec.state === "recording" && typeof rec.requestData === "function") {
+        if (
+          rec.state === "recording" &&
+          typeof rec.requestData === "function"
+        ) {
           rec.requestData();
         }
         if (rec.state === "recording") {
@@ -560,7 +884,9 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
     });
     mediaRecorderRef.current = null;
     try {
-      const blob = new Blob(recordChunksRef.current, { type: rec.mimeType || "audio/webm" });
+      const blob = new Blob(recordChunksRef.current, {
+        type: rec.mimeType || "audio/webm",
+      });
       recordChunksRef.current = [];
       if (blob.size < 2048) {
         throw new Error("Recording too short or empty.");
@@ -576,12 +902,18 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
 
   const devicesReady = Boolean(
     mediaStream?.getVideoTracks()?.length &&
-      mediaStream.getVideoTracks()[0].readyState !== "ended" &&
-      mediaStream.getAudioTracks()?.length &&
-      mediaStream.getAudioTracks()[0].readyState !== "ended",
+    mediaStream.getVideoTracks()[0].readyState !== "ended" &&
+    mediaStream.getAudioTracks()?.length &&
+    mediaStream.getAudioTracks()[0].readyState !== "ended",
+  );
+  const identityChecksReady = Boolean(
+    proctorMeta?.facePresent === true &&
+    proctorMeta?.frontalOk === true &&
+    proctorMeta?.lightingOk === true,
   );
   const canStartInterview =
     devicesReady &&
+    screenOk &&
     identityOk &&
     audioOk &&
     termsChecked &&
@@ -599,8 +931,14 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
           }
         `}</style>
         <div style={pStyles.loadingCard}>
-          <Loader2 size={36} color="#818cf8" style={{ animation: "ij-pulse-soft 1.2s ease-in-out infinite" }} />
-          <p style={{ ...pStyles.title, marginTop: 20, fontSize: "1.1rem" }}>Loading interview details…</p>
+          <Loader2
+            size={36}
+            color="#818cf8"
+            style={{ animation: "ij-pulse-soft 1.2s ease-in-out infinite" }}
+          />
+          <p style={{ ...pStyles.title, marginTop: 20, fontSize: "1.1rem" }}>
+            Loading interview details…
+          </p>
         </div>
         <div
           style={{
@@ -626,9 +964,15 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
       <div style={pStyles.loadingRoot}>
         <div style={pStyles.loadingCard}>
           <AlertCircle size={36} color="#f87171" style={{ marginBottom: 8 }} />
-          <h1 style={{ ...pStyles.title, fontSize: "1.2rem" }}>{metaError.title}</h1>
+          <h1 style={{ ...pStyles.title, fontSize: "1.2rem" }}>
+            {metaError.title}
+          </h1>
           <p style={pStyles.sub}>{metaError.message}</p>
-          <button type="button" style={pStyles.ghostBtn} onClick={() => window.location.reload()}>
+          <button
+            type="button"
+            style={pStyles.ghostBtn}
+            onClick={() => window.location.reload()}
+          >
             <RefreshCw size={16} />
             Reload page
           </button>
@@ -659,196 +1003,362 @@ export default function InterviewPrecheck({ joinToken, onPrecheckPassed }) {
           0%, 100% { opacity: 0.35; transform: scale(0.98); }
           50% { opacity: 1; transform: scale(1.02); }
         }
+        @media (max-width: 1100px) {
+          [data-ij-video-wrap] { min-height: 150px !important; max-height: 200px !important; }
+          [data-ij-identity-preview] { min-height: 150px !important; max-height: 200px !important; }
+          [data-ij-instructions-scroll] { max-height: min(32vh, 240px) !important; }
+        }
+        @media (max-width: 880px) {
+          [data-ij-precheck-row2] { grid-template-columns: 1fr !important; }
+          [data-ij-shell] { padding: 10px 12px 96px !important; }
+          [data-ij-card] { padding: 12px !important; }
+          [data-ij-video-wrap] { min-height: 140px !important; max-height: 190px !important; }
+          [data-ij-identity-preview] { min-height: 140px !important; max-height: 190px !important; }
+          [data-ij-instructions-scroll] { max-height: min(40vh, 320px) !important; }
+          [data-ij-footer] { justify-content: flex-start !important; }
+          [data-ij-start-btn] { width: 100% !important; }
+        }
       `}</style>
       <div style={pStyles.root}>
         <div style={pStyles.glow} />
-        <div style={pStyles.card}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 4 }}>
-            <div
-              style={{
-                width: 44,
-                height: 44,
-                borderRadius: 12,
-                background: "linear-gradient(145deg, rgba(79,70,229,0.45), rgba(30,27,75,0.95))",
-                border: "1px solid rgba(165,180,252,0.35)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-              }}
-            >
-              <Sparkles size={22} color="#c7d2fe" strokeWidth={1.75} />
-            </div>
-            <div>
-              <h1 style={pStyles.title}>{meta?.interviewTitle || "AI Interview"}</h1>
-              <p style={pStyles.sub}>
-                Hello{meta?.participantName ? `, ${meta.participantName}` : ""}. Complete the checks below, then
-                start the interview.
-              </p>
-            </div>
-          </div>
-          {meta?.linkExpiresAt && (
-            <p style={pStyles.metaHint}>This join link expires: {new Date(meta.linkExpiresAt).toLocaleString()}</p>
-          )}
-
-          <div style={pStyles.section}>
-            <div style={pStyles.sectionLabel}>Instructions</div>
-            {meta?.instructions ? (
-              <div style={pStyles.instructionsBox}>{meta.instructions}</div>
-            ) : (
-              <div style={pStyles.instructionsBox}>
-                Stay in a quiet place, face the camera, and speak clearly. You will interview with an AI
-                interviewer; answer naturally and wait for each question to finish.
+        <div style={pStyles.shell} data-ij-shell>
+          <div style={pStyles.card} data-ij-card>
+            <div style={pStyles.headerRow}>
+              <div style={pStyles.headerIcon}>
+                <Sparkles size={20} color="#c7d2fe" strokeWidth={1.75} />
               </div>
-            )}
-            {meta?.rulesSummary ? (
-              <div style={pStyles.rulesBox}>
-                <strong style={{ color: "#94a3b8" }}>Interview rules (summary):</strong> {meta.rulesSummary}
+              <div>
+                <h1 style={pStyles.title}>
+                  {meta?.interviewTitle || "AI Interview"}
+                </h1>
+                <p style={pStyles.sub}>
+                  Hello
+                  {meta?.participantName ? `, ${meta.participantName}` : ""}.
+                  Complete setup, then start.
+                  {meta?.linkExpiresAt
+                    ? ` Link expires ${new Date(meta.linkExpiresAt).toLocaleString()}.`
+                    : ""}
+                </p>
               </div>
-            ) : null}
-          </div>
+            </div>
+            <div style={pStyles.mainGrid}>
+              <div style={pStyles.row2} data-ij-precheck-row2>
+                <div style={pStyles.panel}>
+                  <div style={pStyles.sectionLabel}>Camera and microphone</div>
+                  <p style={pStyles.panelHint}>
+                    Allow camera and microphone for this video interview.
+                  </p>
+                  <div style={pStyles.row}>
+                    <button
+                      type="button"
+                      style={pStyles.secondaryBtn}
+                      onClick={requestDevices}
+                    >
+                      <Camera size={18} />
+                      {mediaStream
+                        ? "Reconnect devices"
+                        : "Allow camera & microphone"}
+                    </button>
+                    {devicesReady && (
+                      <span style={pStyles.statusOk}>
+                        <CheckCircle2 size={16} />
+                        Devices active
+                      </span>
+                    )}
+                  </div>
+                  {deviceError && (
+                    <p style={pStyles.statusErr}>{deviceError}</p>
+                  )}
+                  <div style={pStyles.videoWrap} data-ij-video-wrap>
+                    {devicesReady ? (
+                      <video
+                        ref={videoRef}
+                        style={pStyles.video}
+                        playsInline
+                        muted
+                      />
+                    ) : (
+                      <span>Preview appears here after you allow access</span>
+                    )}
+                  </div>
+                  {devicesReady && (
+                    <>
+                      <div style={{ ...pStyles.row, marginTop: 10 }}>
+                        <Mic size={16} color="#94a3b8" />
+                        <span style={{ fontSize: "0.8rem", color: "#94a3b8" }}>
+                          Input level
+                        </span>
+                      </div>
+                      <div style={pStyles.meterTrack}>
+                        <div
+                          style={{
+                            ...pStyles.meterFill,
+                            width: `${Math.min(100, micLevel * 400)}%`,
+                          }}
+                        />
+                      </div>
+                    </>
+                  )}
+                </div>
+                <div style={pStyles.panel}>
+                  <div style={pStyles.sectionLabel}>Identity snapshot</div>
+                  <p style={pStyles.panelHint}>
+                    Capture a clear photo of your face for session verification.
+                  </p>
+                  {devicesReady && !proctorMeta && (
+                    <p style={pStyles.statusWarn}>
+                      Face check is loading. Keep your face centered in the
+                      camera.
+                    </p>
+                  )}
+                  {proctorMeta && (
+                    <p
+                      style={
+                        identityChecksReady
+                          ? pStyles.statusOk
+                          : pStyles.statusWarn
+                      }
+                    >
+                      {proctorMeta.facePresent !== true
+                        ? "Face is not clearly visible. Please sit centered in the camera."
+                        : proctorMeta.lightingOk !== true
+                          ? "Lighting needs improvement before your snapshot."
+                          : proctorMeta.frontalOk !== true
+                            ? "Please face the camera before your snapshot."
+                            : "Face and lighting checks look ready."}
+                    </p>
+                  )}
+                  <button
+                    type="button"
+                    style={{
+                      ...pStyles.secondaryBtn,
+                      opacity: devicesReady && identityChecksReady ? 1 : 0.5,
+                      cursor:
+                        devicesReady && identityChecksReady
+                          ? "pointer"
+                          : "not-allowed",
+                    }}
+                    disabled={
+                      !devicesReady || !identityChecksReady || identityBusy
+                    }
+                    onClick={captureAndUploadIdentity}
+                  >
+                    {identityBusy ? (
+                      <>
+                        <Loader2
+                          size={18}
+                          style={{
+                            animation: "ij-pulse-soft 1s ease-in-out infinite",
+                          }}
+                        />
+                        Uploading…
+                      </>
+                    ) : (
+                      <>
+                        <Camera size={18} />
+                        Capture snapshot
+                      </>
+                    )}
+                  </button>
+                  {identityOk && (
+                    <span style={{ ...pStyles.statusOk, marginLeft: 8 }}>
+                      <CheckCircle2 size={16} />
+                      Snapshot saved
+                    </span>
+                  )}
+                  {identityPreviewUrl && (
+                    <div style={pStyles.identityPreview} data-ij-identity-preview>
+                      <img
+                        src={identityPreviewUrl}
+                        alt="Captured identity snapshot preview"
+                        style={pStyles.identityPreviewImg}
+                      />
+                    </div>
+                  )}
+                  {identityAnalysis && !identityOk && (
+                    <p style={pStyles.statusWarn}>
+                      Captured check: face{" "}
+                      {identityAnalysis.facePresent ? "found" : "missing"},
+                      lighting{" "}
+                      {identityAnalysis.lightingOk ? "ok" : "not ready"},
+                      frontal {identityAnalysis.frontalOk ? "ok" : "not ready"}.
+                    </p>
+                  )}
+                  {identityErr && (
+                    <p style={pStyles.statusErr}>{identityErr}</p>
+                  )}
+                </div>
+              </div>
+              <div style={pStyles.row2} data-ij-precheck-row2>
+                <div style={pStyles.panel}>
+                  <div style={pStyles.sectionLabel}>Screen monitoring</div>
+                  <p style={pStyles.panelHint}>
+                    Share your entire screen or window (not only this tab).
+                  </p>
+                  <div style={pStyles.row}>
+                    <button
+                      type="button"
+                      style={pStyles.secondaryBtn}
+                      onClick={requestScreenShare}
+                    >
+                      <Camera size={18} />
+                      {screenOk ? "Screen sharing active" : "Share screen"}
+                    </button>
+                    {screenOk && (
+                      <span style={pStyles.statusOk}>
+                        <CheckCircle2 size={16} />
+                        Screen monitoring active
+                      </span>
+                    )}
+                  </div>
+                  {screenErr && <p style={pStyles.statusErr}>{screenErr}</p>}
+                  {screenOk && screenInfo?.displaySurface && (
+                    <p style={pStyles.metaHint}>
+                      Shared source: {screenInfo.displaySurface}
+                    </p>
+                  )}
+                </div>
+                <div style={pStyles.panel}>
+                  <div style={pStyles.sectionLabel}>Microphone audio test</div>
+                  <p style={pStyles.panelHint}>
+                    Record yourself saying the phrase below.
+                  </p>
+                  <div style={pStyles.phrase}>&ldquo;{TEST_PHRASE}&rdquo;</div>
+                  <div style={pStyles.row}>
+                    {audioPhase !== "recording" ? (
+                      <button
+                        type="button"
+                        style={{
+                          ...pStyles.secondaryBtn,
+                          opacity:
+                            devicesReady && audioPhase !== "uploading"
+                              ? 1
+                              : 0.5,
+                          cursor:
+                            devicesReady && audioPhase !== "uploading"
+                              ? "pointer"
+                              : "not-allowed",
+                        }}
+                        disabled={!devicesReady || audioPhase === "uploading"}
+                        onClick={startRecording}
+                      >
+                        <Volume2 size={18} />
+                        Start recording
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        style={pStyles.primaryBtn}
+                        onClick={stopRecordingAndUpload}
+                      >
+                        Stop &amp; verify
+                      </button>
+                    )}
+                    {audioPhase === "recording" && (
+                      <span
+                        style={{
+                          color: "#fde68a",
+                          fontSize: "0.85rem",
+                          fontWeight: 600,
+                        }}
+                      >
+                        Recording…
+                      </span>
+                    )}
+                    {audioPhase === "uploading" && (
+                      <span style={{ color: "#93c5fd", fontSize: "0.85rem" }}>
+                        Verifying with server…
+                      </span>
+                    )}
+                    {audioOk && (
+                      <span style={pStyles.statusOk}>
+                        <CheckCircle2 size={16} />
+                        Audio verified
+                      </span>
+                    )}
+                  </div>
+                  {audioErr && <p style={pStyles.statusErr}>{audioErr}</p>}
+                </div>
+              </div>
+              <div style={pStyles.instructionsPanel}>
+                <div style={pStyles.sectionLabel}>Instructions</div>
+                <div style={pStyles.instructionsScroll} data-ij-instructions-scroll>
+                  <div style={pStyles.instructionsBox}>
+                    <ol style={pStyles.instructionsList}>
+                      {DEFAULT_INSTRUCTIONS.map((line) => (
+                        <li key={line} style={pStyles.instructionsListItem}>
+                          {line}
+                        </li>
+                      ))}
+                    </ol>
+                    {meta?.instructions ? (
+                      <div style={pStyles.customInstructions}>
+                        <strong
+                          style={{
+                            color: "#a5b4fc",
+                            display: "block",
+                            marginBottom: 6,
+                          }}
+                        >
+                          Additional instructions from your recruiter
+                        </strong>
+                        {meta.instructions}
+                      </div>
+                    ) : null}
+                  </div>
+                  {meta?.rulesSummary ? (
+                    <div style={pStyles.rulesBox}>
+                      <strong style={{ color: "#c7d2fe" }}>
+                        Interview rules:{" "}
+                      </strong>
+                      {meta.rulesSummary}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+            </div>
 
-          <div style={pStyles.section}>
-            <div style={pStyles.sectionLabel}>Camera and microphone</div>
-            <p style={{ ...pStyles.sub, marginTop: 0 }}>
-              We need access to your camera and microphone for this video interview.
-            </p>
-            <div style={pStyles.row}>
-              <button type="button" style={pStyles.secondaryBtn} onClick={requestDevices}>
-                <Camera size={18} />
-                {mediaStream ? "Reconnect devices" : "Allow camera & microphone"}
+            <div style={pStyles.footerBar} data-ij-footer>
+              <label style={pStyles.checkboxRow}>
+                <input
+                  type="checkbox"
+                  checked={termsChecked}
+                  onChange={(e) => setTermsChecked(e.target.checked)}
+                  style={{ marginTop: 3 }}
+                />
+                <span>
+                  I have read the instructions and I am ready to begin the
+                  interview.
+                </span>
+              </label>
+
+              <button
+                type="button"
+                style={{
+                  ...pStyles.startBtn,
+                  ...(!canStartInterview ? pStyles.startBtnDisabled : {}),
+                }}
+                data-ij-start-btn
+                disabled={!canStartInterview}
+                onClick={() => {
+                  if (canStartInterview) onPrecheckPassed();
+                }}
+              >
+                Start interview
               </button>
-              {devicesReady && (
-                <span style={pStyles.statusOk}>
-                  <CheckCircle2 size={16} />
-                  Devices active
-                </span>
-              )}
             </div>
-            {deviceError && <p style={pStyles.statusErr}>{deviceError}</p>}
-            <div style={pStyles.videoWrap}>
-              {devicesReady ? (
-                <video ref={videoRef} style={pStyles.video} playsInline muted />
-              ) : (
-                <span>Preview appears here after you allow access</span>
-              )}
-            </div>
-            {devicesReady && (
-              <>
-                <div style={{ ...pStyles.row, marginTop: 10 }}>
-                  <Mic size={16} color="#94a3b8" />
-                  <span style={{ fontSize: "0.8rem", color: "#94a3b8" }}>Input level</span>
-                </div>
-                <div style={pStyles.meterTrack}>
-                  <div style={{ ...pStyles.meterFill, width: `${Math.min(100, micLevel * 400)}%` }} />
-                </div>
-              </>
-            )}
           </div>
-
-          <div style={pStyles.section}>
-            <div style={pStyles.sectionLabel}>Identity snapshot</div>
-            <p style={{ ...pStyles.sub, marginTop: 0 }}>
-              Capture a clear photo of your face (similar to an ID check). This is stored with your session for
-              verification.
-            </p>
-            <button
-              type="button"
-              style={{
-                ...pStyles.secondaryBtn,
-                opacity: devicesReady ? 1 : 0.5,
-                cursor: devicesReady ? "pointer" : "not-allowed",
-              }}
-              disabled={!devicesReady || identityBusy}
-              onClick={captureAndUploadIdentity}
-            >
-              {identityBusy ? (
-                <>
-                  <Loader2 size={18} style={{ animation: "ij-pulse-soft 1s ease-in-out infinite" }} />
-                  Uploading…
-                </>
-              ) : (
-                <>
-                  <Camera size={18} />
-                  Capture snapshot
-                </>
-              )}
-            </button>
-            {identityOk && (
-              <span style={{ ...pStyles.statusOk, marginLeft: 8 }}>
-                <CheckCircle2 size={16} />
-                Snapshot saved
-              </span>
-            )}
-            {identityErr && <p style={pStyles.statusErr}>{identityErr}</p>}
-          </div>
-
-          <div style={pStyles.section}>
-            <div style={pStyles.sectionLabel}>Microphone audio test</div>
-            <p style={{ ...pStyles.sub, marginTop: 0 }}>
-              Record yourself saying the phrase below. We upload a short clip to confirm your microphone is working.
-            </p>
-            <div style={pStyles.phrase}>&ldquo;{TEST_PHRASE}&rdquo;</div>
-            <div style={pStyles.row}>
-              {audioPhase !== "recording" ? (
-                <button
-                  type="button"
-                  style={{
-                    ...pStyles.secondaryBtn,
-                    opacity: devicesReady && audioPhase !== "uploading" ? 1 : 0.5,
-                    cursor: devicesReady && audioPhase !== "uploading" ? "pointer" : "not-allowed",
-                  }}
-                  disabled={!devicesReady || audioPhase === "uploading"}
-                  onClick={startRecording}
-                >
-                  <Volume2 size={18} />
-                  Start recording
-                </button>
-              ) : (
-                <button type="button" style={pStyles.primaryBtn} onClick={stopRecordingAndUpload}>
-                  Stop &amp; verify
-                </button>
-              )}
-              {audioPhase === "recording" && (
-                <span style={{ color: "#fde68a", fontSize: "0.85rem", fontWeight: 600 }}>Recording…</span>
-              )}
-              {audioPhase === "uploading" && (
-                <span style={{ color: "#93c5fd", fontSize: "0.85rem" }}>Verifying with server…</span>
-              )}
-              {audioOk && (
-                <span style={pStyles.statusOk}>
-                  <CheckCircle2 size={16} />
-                  Audio verified
-                </span>
-              )}
-            </div>
-            {audioErr && <p style={pStyles.statusErr}>{audioErr}</p>}
-          </div>
-
-          <label style={pStyles.checkboxRow}>
-            <input
-              type="checkbox"
-              checked={termsChecked}
-              onChange={(e) => setTermsChecked(e.target.checked)}
-              style={{ marginTop: 3 }}
-            />
-            <span>I have read the instructions and I am ready to begin the interview.</span>
-          </label>
-
-          <button
-            type="button"
-            style={{
-              ...pStyles.startBtn,
-              ...(!canStartInterview ? pStyles.startBtnDisabled : {}),
-            }}
-            disabled={!canStartInterview}
-            onClick={() => {
-              if (canStartInterview) onPrecheckPassed();
-            }}
-          >
-            Start interview
-          </button>
         </div>
       </div>
+      {toasts.length > 0 && (
+        <div style={pStyles.toastStack} aria-live="polite">
+          {toasts.map((toast) => (
+            <div key={toast.id} style={pStyles.toast}>
+              {toast.message}
+            </div>
+          ))}
+        </div>
+      )}
       <div
         style={{
           position: "fixed",
