@@ -31,6 +31,14 @@ function parseClientMeta(rawMeta) {
 }
 
 function clientMetaSnapshot(metaPayload) {
+  const clean = {};
+  for (const [key, value] of Object.entries(metaPayload || {})) {
+    if (value == null) {
+      clean[key] = null;
+    } else if (["string", "number", "boolean"].includes(typeof value)) {
+      clean[key] = value;
+    }
+  }
   return {
     camera_enabled: metaPayload?.cameraEnabled ?? null,
     mic_enabled: metaPayload?.micEnabled ?? null,
@@ -41,6 +49,30 @@ function clientMetaSnapshot(metaPayload) {
     width: metaPayload?.width ?? null,
     height: metaPayload?.height ?? null,
     user_agent: metaPayload?.userAgent ?? null,
+    ...clean,
+  };
+}
+
+function latestProctorFlags(metaPayload) {
+  return {
+    frame_kind: metaPayload?.frameKind || "camera_interval",
+    face_present: metaPayload?.facePresent ?? null,
+    face_count: metaPayload?.faceCount ?? null,
+    face_orientation: metaPayload?.faceOrientation ?? null,
+    frontal_ok: metaPayload?.frontalOk ?? null,
+    lighting_ok: metaPayload?.lightingOk ?? null,
+    eye_direction: metaPayload?.eyeDirection ?? null,
+    reading_pattern_score: metaPayload?.readingPatternScore ?? null,
+    reading_pattern_score_window: metaPayload?.readingPatternScoreWindow ?? null,
+    reading_pattern_warning: metaPayload?.readingPatternWarning ?? null,
+    reading_pattern_offscreen_seconds_window:
+      metaPayload?.readingPatternOffscreenSecondsWindow ?? null,
+    eye_warning: metaPayload?.eyeWarning ?? null,
+    eye_sustained_direction: metaPayload?.eyeSustainedDirection ?? null,
+    eye_sustained_seconds: metaPayload?.eyeSustainedSeconds ?? null,
+    background_clean_score: metaPayload?.backgroundCleanScore ?? null,
+    screen_capture_active: metaPayload?.screenCaptureActive ?? null,
+    updated_at: nowIso(),
   };
 }
 
@@ -67,6 +99,7 @@ router.post(
     }
 
     const capturedAt = (metaPayload && metaPayload.capturedAt) || nowIso();
+    const frameKind = metaPayload?.frameKind || "camera_interval";
     const blobPath = proctorFrameBlobPath(session, capturedAt);
 
     let uploadResult;
@@ -105,12 +138,34 @@ router.post(
       container: uploadResult.container,
       size_bytes: uploadResult.sizeBytes,
       content_type: file.mimetype,
+      frame_kind: frameKind,
       client_meta: clientMetaSnapshot(metaPayload),
       analysis_status: "pending",
       created_at: nowIso(),
     };
 
     await db.collection(COLLECTIONS.INTERVIEW_PROCTOR_FRAMES).insertOne(doc);
+    const sessionSet = {
+      proctor_latest_frame_id: doc.id,
+      proctor_latest_flags: latestProctorFlags(metaPayload),
+      updated_at: nowIso(),
+    };
+    if (frameKind === "tab_switch") {
+      sessionSet.proctor_latest_tab_switch_frame_id = doc.id;
+      sessionSet.proctor_latest_tab_switch_at = capturedAt;
+    }
+
+    await db.collection(COLLECTIONS.INTERVIEW_SESSIONS).updateOne(
+      { session_id: sessionId },
+      {
+        $set: sessionSet,
+        $max: {
+          proctor_tab_switch_count: Number(metaPayload?.tabSwitchCount) || 0,
+          proctor_not_frontal_seconds: Number(metaPayload?.notFrontalSeconds) || 0,
+          proctor_eye_movement_count: Number(metaPayload?.eyeMovementCount) || 0,
+        },
+      },
+    );
 
     res.status(201).json({
       ok: true,

@@ -12,6 +12,8 @@ import {
   Sparkles,
   RefreshCcw,
   Loader2,
+  Camera,
+  Shield,
 } from "lucide-react";
 import { api } from "../services/api";
 import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
@@ -34,13 +36,13 @@ export default function Interviews() {
 
   const openDetail = async (sessionId) => {
     setSelectedId(sessionId);
-    const d = await api.getInterviewSession(sessionId);
+    const d = await api.getInterviewSession(sessionId, { includeProctor: true });
     setDetail(d);
   };
 
   const refreshDetail = async () => {
     if (!selectedId) return;
-    const d = await api.getInterviewSession(selectedId);
+    const d = await api.getInterviewSession(selectedId, { includeProctor: true });
     setDetail(d);
     // Refresh the list too so the Score column reflects the new evaluation
     // without forcing a full page reload.
@@ -110,7 +112,10 @@ function InterviewDetailModal({ detail, onClose, onRefresh }) {
   const [evaluating, setEvaluating] = useState(false);
   const [evalError, setEvalError] = useState("");
   const hasSummary = Boolean(ev?.summary);
+  const evaluationReady = hasSummary && !evalError;
   const canEvaluate = Boolean(sessionId) && transcriptCount > 0;
+  const proctorFlags = session?.proctor_latest_flags;
+  const tabSwitchCount = Number(session?.proctor_tab_switch_count) || 0;
 
   const handleEvaluate = async () => {
     if (!sessionId || evaluating) return;
@@ -534,6 +539,24 @@ function InterviewDetailModal({ detail, onClose, onRefresh }) {
             </section>
           ) : null}
 
+          {evaluationReady && proctorFlags ? (
+            <section style={styles.section}>
+              <h3 style={styles.sectionTitle}>
+                <Activity size={16} /> Proctoring signals
+              </h3>
+              <ProctorFlagsPanel flags={proctorFlags} tabSwitchCount={tabSwitchCount} />
+            </section>
+          ) : null}
+
+          {detail?.proctorArtifacts ? (
+            <section style={styles.section}>
+              <h3 style={styles.sectionTitle}>
+                <Shield size={16} /> Proctoring artifacts
+              </h3>
+              <ProctorArtifactsSection artifacts={detail.proctorArtifacts} />
+            </section>
+          ) : null}
+
           <section style={styles.section}>
             <h3 style={styles.sectionTitle}>
               <FileJson size={16} /> Events log
@@ -559,6 +582,198 @@ function InterviewDetailModal({ detail, onClose, onRefresh }) {
         </footer>
       </div>
     </div>
+  );
+}
+
+function formatProctorTime(value) {
+  if (!value) return "—";
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
+}
+
+function ProctorArtifactsSection({ artifacts }) {
+  const counts = artifacts?.frameCounts || {};
+  const sessionCounts = artifacts?.sessionCounts || {};
+  const identity = artifacts?.identitySnapshot;
+  const audioEvents = artifacts?.precheckAudio || [];
+  const tabFrames = artifacts?.tabSwitchSnapshots || [];
+  const cameraFrames = artifacts?.cameraSnapshots || [];
+  const identityFrames = (artifacts?.frames || []).filter((f) => f.frame_kind === "precheck_identity");
+
+  const countEntries = Object.entries(counts);
+  const hasCounts = countEntries.length > 0 || artifacts?.totalFrames != null;
+
+  return (
+    <div style={styles.proctorArtifactsWrap}>
+      {hasCounts ? (
+        <div style={styles.proctorCountsGrid}>
+          <div style={styles.proctorCountCell}>
+            <span style={styles.proctorCountKey}>Total frames</span>
+            <span style={styles.proctorCountVal}>{artifacts?.totalFrames ?? 0}</span>
+          </div>
+          <div style={styles.proctorCountCell}>
+            <span style={styles.proctorCountKey}>Tab switches</span>
+            <span style={styles.proctorCountVal}>{sessionCounts.tabSwitchCount ?? 0}</span>
+          </div>
+          <div style={styles.proctorCountCell}>
+            <span style={styles.proctorCountKey}>Not frontal (s)</span>
+            <span style={styles.proctorCountVal}>{sessionCounts.notFrontalSeconds ?? 0}</span>
+          </div>
+          <div style={styles.proctorCountCell}>
+            <span style={styles.proctorCountKey}>Eye movements</span>
+            <span style={styles.proctorCountVal}>{sessionCounts.eyeMovementCount ?? 0}</span>
+          </div>
+          {countEntries.map(([kind, n]) => (
+            <div key={kind} style={styles.proctorCountCell}>
+              <span style={styles.proctorCountKey}>{kind.replace(/_/g, " ")}</span>
+              <span style={styles.proctorCountVal}>{n}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      <div style={styles.proctorArtifactBlock}>
+        <h4 style={styles.proctorArtifactHeading}>
+          <Camera size={14} /> Identity snapshot
+        </h4>
+        {identity?.blob_url ? (
+          <div style={styles.proctorIdentityRow}>
+            <a href={identity.blob_url} target="_blank" rel="noreferrer" style={styles.proctorThumbLink}>
+              <img src={identity.blob_url} alt="Identity snapshot" style={styles.proctorThumb} />
+            </a>
+            <div style={styles.proctorArtifactMeta}>
+              <div>
+                <strong>Captured:</strong> {formatProctorTime(identity.captured_at || identity.created_at)}
+              </div>
+              {identity.size_bytes != null ? (
+                <div>
+                  <strong>Size:</strong> {Math.round(identity.size_bytes / 1024)} KB
+                </div>
+              ) : null}
+              <a href={identity.blob_url} target="_blank" rel="noreferrer" style={styles.proctorOpenLink}>
+                Open full image
+              </a>
+            </div>
+          </div>
+        ) : (
+          <p style={styles.proctorMuted}>No identity snapshot stored for this session.</p>
+        )}
+        {identityFrames.length > 1 ? (
+          <ProctorFrameTable title="All identity captures" frames={identityFrames} />
+        ) : null}
+      </div>
+
+      <div style={styles.proctorArtifactBlock}>
+        <h4 style={styles.proctorArtifactHeading}>Precheck audio verification</h4>
+        {audioEvents.length ? (
+          <ul style={styles.proctorAudioList}>
+            {audioEvents.map((ev, idx) => (
+              <li key={`${ev.at}-${idx}`} style={styles.proctorAudioItem}>
+                <strong>Verified:</strong> {formatProctorTime(ev.at)}
+                {ev.bytes != null ? ` · ${ev.bytes} bytes` : ""}
+                {ev.container ? ` · ${ev.container}` : ""}
+                {ev.variance != null ? ` · variance ${ev.variance}` : ""}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p style={styles.proctorMuted}>No precheck audio verification event recorded.</p>
+        )}
+      </div>
+
+      {tabFrames.length ? <ProctorFrameTable title="Tab switch snapshots" frames={tabFrames} /> : null}
+      {cameraFrames.length ? <ProctorFrameTable title="Camera interval snapshots" frames={cameraFrames} /> : null}
+    </div>
+  );
+}
+
+function ProctorFrameTable({ title, frames }) {
+  if (!frames?.length) return null;
+  return (
+    <div style={styles.proctorArtifactBlock}>
+      <h4 style={styles.proctorArtifactHeading}>{title}</h4>
+      <div style={styles.tableScroll}>
+        <table style={styles.qTable}>
+          <thead>
+            <tr>
+              <th style={styles.qTh}>Preview</th>
+              <th style={styles.qTh}>Captured</th>
+              <th style={styles.qTh}>Kind</th>
+              <th style={styles.qTh}>Link</th>
+            </tr>
+          </thead>
+          <tbody>
+            {frames.map((f) => (
+              <tr key={f.id || `${f.frame_kind}-${f.captured_at}`}>
+                <td style={styles.qTd}>
+                  {f.blob_url ? (
+                    <a href={f.blob_url} target="_blank" rel="noreferrer">
+                      <img src={f.blob_url} alt="" style={styles.proctorThumbSmall} />
+                    </a>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+                <td style={styles.qTd}>{formatProctorTime(f.captured_at || f.created_at)}</td>
+                <td style={styles.qTd}>{f.frame_kind || "—"}</td>
+                <td style={styles.qTd}>
+                  {f.blob_url ? (
+                    <a href={f.blob_url} target="_blank" rel="noreferrer" style={styles.proctorOpenLink}>
+                      Open
+                    </a>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function ProctorFlagsPanel({ flags, tabSwitchCount }) {
+  const items = [];
+  if (flags?.face_present === false) items.push("Face not visible in latest frame");
+  if (flags?.frontal_ok === false) items.push("Candidate not facing camera");
+  if (flags?.lighting_ok === false) items.push("Lighting below threshold");
+  const eyeDir = flags?.eye_direction;
+  if (flags?.eye_warning === true) {
+    items.push(
+      `Eyes away from screen (${eyeDir || "off-center"}, ${flags?.eye_sustained_seconds ?? "?"}s)`,
+    );
+  } else if (
+    eyeDir &&
+    !["center", "unknown", "head_not_frontal"].includes(String(eyeDir))
+  ) {
+    items.push(`Eyes away from screen (${eyeDir})`);
+  }
+  if (flags?.reading_pattern_warning === true) {
+    const secs = flags?.reading_pattern_offscreen_seconds_window;
+    items.push(
+      `Reading pattern: looked away ${secs != null ? `${secs}s` : "over 9s"} in the last 20s`,
+    );
+  }
+  if (tabSwitchCount > 0) {
+    items.push(`Tab switches detected: ${tabSwitchCount}`);
+  }
+  if (!items.length) {
+    return (
+      <p style={styles.proctorOkText}>
+        No significant proctoring concerns in the latest captured signals.
+      </p>
+    );
+  }
+  return (
+    <ul style={styles.proctorFlagList}>
+      {items.map((text) => (
+        <li key={text} style={styles.proctorFlagItem}>
+          {text}
+        </li>
+      ))}
+    </ul>
   );
 }
 
@@ -1180,6 +1395,121 @@ const styles = {
     fontSize: 11,
     margin: 0,
     lineHeight: 1.45,
+  },
+  proctorOkText: {
+    margin: 0,
+    color: "#15803d",
+    fontSize: "0.9rem",
+    lineHeight: 1.5,
+  },
+  proctorFlagList: {
+    margin: 0,
+    paddingLeft: 20,
+    color: "#b45309",
+    fontSize: "0.9rem",
+    lineHeight: 1.55,
+  },
+  proctorFlagItem: {
+    marginBottom: 6,
+  },
+  proctorArtifactsWrap: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 16,
+  },
+  proctorCountsGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fill, minmax(140px, 1fr))",
+    gap: 10,
+  },
+  proctorCountCell: {
+    padding: "10px 12px",
+    borderRadius: 8,
+    background: "#f8fafc",
+    border: "1px solid #e2e8f0",
+  },
+  proctorCountKey: {
+    display: "block",
+    fontSize: "0.72rem",
+    fontWeight: 600,
+    color: "#64748b",
+    textTransform: "capitalize",
+    marginBottom: 4,
+  },
+  proctorCountVal: {
+    fontSize: "1.1rem",
+    fontWeight: 700,
+    color: "#0f172a",
+  },
+  proctorArtifactBlock: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+  },
+  proctorArtifactHeading: {
+    margin: 0,
+    fontSize: "0.88rem",
+    fontWeight: 700,
+    color: "#334155",
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+  },
+  proctorIdentityRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 14,
+    alignItems: "flex-start",
+  },
+  proctorThumbLink: {
+    display: "block",
+    borderRadius: 8,
+    overflow: "hidden",
+    border: "1px solid #e2e8f0",
+  },
+  proctorThumb: {
+    display: "block",
+    width: 120,
+    height: "auto",
+    maxHeight: 120,
+    objectFit: "cover",
+  },
+  proctorThumbSmall: {
+    display: "block",
+    width: 64,
+    height: 48,
+    objectFit: "cover",
+    borderRadius: 4,
+    border: "1px solid #e2e8f0",
+  },
+  proctorArtifactMeta: {
+    fontSize: "0.86rem",
+    color: "#475569",
+    lineHeight: 1.5,
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+  },
+  proctorOpenLink: {
+    color: "#4f46e5",
+    fontWeight: 600,
+    fontSize: "0.84rem",
+    textDecoration: "none",
+  },
+  proctorMuted: {
+    margin: 0,
+    color: "#64748b",
+    fontSize: "0.86rem",
+  },
+  proctorAudioList: {
+    margin: 0,
+    paddingLeft: 20,
+    color: "#475569",
+    fontSize: "0.86rem",
+    lineHeight: 1.5,
+  },
+  proctorAudioItem: {
+    marginBottom: 6,
   },
 
   modalFooter: {

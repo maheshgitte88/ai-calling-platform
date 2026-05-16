@@ -50,6 +50,19 @@ export function proctorFrameBlobPath(session, capturedAtIso) {
 }
 
 /**
+ * Pre-interview identity snapshot (candidate checklist / audit).
+ *
+ *     interviews/<interview>/<candidate>/<session>/precheck/<timestamp>.jpg
+ */
+export function precheckIdentityBlobPath(session, capturedAtIso) {
+  const interview = safeSegment(session?.interview_id, "interview");
+  const candidate = safeSegment(session?.candidate_id, "candidate");
+  const sessionId = safeSegment(session?.session_id, "session");
+  const stamp = String(capturedAtIso || new Date().toISOString()).replace(/[:.]/g, "-");
+  return `interviews/${interview}/${candidate}/${sessionId}/precheck/${stamp}.jpg`;
+}
+
+/**
  * Upload a proctor frame buffer to Azure Blob Storage.
  *
  * Metadata keys/values are sanitized to Azure's allowed alphabet/length so
@@ -93,4 +106,12 @@ export async function uploadProctorFrame({
     url: blockBlob.url,
     sizeBytes: buffer.length,
   };
+}
+
+export async function deleteProctorFrame(blobPath) {
+  if (!blobPath) return false;
+  const container = getContainerClient();
+  const blockBlob = container.getBlockBlobClient(blobPath);
+  const result = await blockBlob.deleteIfExists();
+  return Boolean(result.succeeded);
 }

@@ -28,13 +28,33 @@ import {
 import { api } from "../services/api";
 import PoweredByHirecorrecto from "../components/PoweredByHirecorrecto";
 import AIVoiceBoatIndicator from "../components/AIVoiceBoatIndicator";
+import InterviewPrecheck from "./InterviewPrecheck";
+import {
+  analyzeProctorFrame,
+  createProctorAccumulator,
+  getNetworkSignals,
+} from "../proctor/proctorEngine";
+import {
+  captureStreamFrame,
+  getScreenCaptureInfo,
+  getScreenCaptureStream,
+  isScreenCaptureActive,
+} from "../proctor/screenCapture";
 
 const SESSION_POLL_INTERVAL_MS = 5000;
 const WRAP_UP_POLL_INTERVAL_MS = 1000;
 const PROCTOR_INTERVAL_MS = 30_000;
+const RESOLVE_RETRY_DELAY_MS = 2000;
+const RESOLVE_MAX_AUTO_RETRIES = 20;
 const PROCTOR_JPEG_WIDTH = 640;
 const PROCTOR_JPEG_QUALITY = 0.7;
 const PROCTOR_UPLOAD_TIMEOUT_MS = 10_000;
+const PROCTOR_TRACK_RETRY_MS = 5000;
+const PROCTOR_TOAST_STREAK_NEED = 3;
+
+function interviewPrecheckStorageKey(token) {
+  return `interview_precheck_ok_v2_${token}`;
+}
 
 function parseIsoMs(value) {
   if (!value) return 0;
@@ -129,8 +149,21 @@ function isRecoverableRoomError(err) {
 
 export default function InterviewJoin() {
   const joinToken = useJoinToken();
-  /** resolve_loading | error | room_connecting | live | wrap_up | completed */
-  const [phase, setPhase] = useState(() => (joinToken ? "resolve_loading" : "error"));
+  /** precheck | resolve_loading | error | room_connecting | live | wrap_up | completed */
+  const [phase, setPhase] = useState(() => {
+    if (!joinToken) return "error";
+    try {
+      if (
+        typeof sessionStorage !== "undefined" &&
+        sessionStorage.getItem(interviewPrecheckStorageKey(joinToken)) === "1"
+      ) {
+        return "resolve_loading";
+      }
+    } catch {
+      /* ignore */
+    }
+    return "precheck";
+  });
   const [resolved, setResolved] = useState(null);
   const [errorInfo, setErrorInfo] = useState(() =>
     joinToken ? null : mapResolveError(new Error("Missing interview link token."))
@@ -139,6 +172,8 @@ export default function InterviewJoin() {
   const [completion, setCompletion] = useState(null);
   const [leaving, setLeaving] = useState(false);
   const pollRef = useRef(null);
+  const resolveRetryTimeoutRef = useRef(null);
+  const resolveAttemptRef = useRef(0);
   const hasEverConnectedRef = useRef(false);
 
   const clearPoll = () => {
@@ -148,12 +183,30 @@ export default function InterviewJoin() {
     }
   };
 
+  const clearResolveRetry = () => {
+    if (resolveRetryTimeoutRef.current) {
+      clearTimeout(resolveRetryTimeoutRef.current);
+      resolveRetryTimeoutRef.current = null;
+    }
+  };
+
+  const isTransientResolveError = (err) => {
+    const msg = String(err?.message || "").toLowerCase();
+    return (
+      msg.includes("being prepared")
+      || msg.includes("still joining")
+      || msg.includes("retry in a moment")
+    );
+  };
+
   const runResolve = useCallback(async () => {
     if (!joinToken) {
       setErrorInfo(mapResolveError(new Error("Missing interview link token.")));
       setPhase("error");
       return;
     }
+    clearResolveRetry();
+    resolveAttemptRef.current += 1;
     setPhase("resolve_loading");
     setErrorInfo(null);
     setSessionInfo(null);
@@ -161,16 +214,33 @@ export default function InterviewJoin() {
     try {
       const resp = await api.resolveInterviewSession({ joinToken });
       setResolved(resp);
+      resolveAttemptRef.current = 0;
       setPhase("room_connecting");
     } catch (e) {
+      if (
+        isTransientResolveError(e)
+        && resolveAttemptRef.current < RESOLVE_MAX_AUTO_RETRIES
+      ) {
+        resolveRetryTimeoutRef.current = setTimeout(() => {
+          runResolve();
+        }, RESOLVE_RETRY_DELAY_MS);
+        return;
+      }
+      resolveAttemptRef.current = 0;
       setErrorInfo(mapResolveError(e));
       setPhase("error");
     }
   }, [joinToken]);
 
   useEffect(() => {
+    if (!joinToken || phase !== "resolve_loading") return undefined;
     runResolve();
-  }, [runResolve]);
+    return undefined;
+  }, [joinToken, phase, runResolve]);
+
+  useEffect(() => () => {
+    clearResolveRetry();
+  }, []);
 
   useEffect(() => {
     if (!resolved?.sessionId || !["room_connecting", "live", "wrap_up"].includes(phase)) {
@@ -181,7 +251,7 @@ export default function InterviewJoin() {
       if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       let session = null;
       try {
-        const data = await api.getInterviewSession(resolved.sessionId);
+        const data = await api.getInterviewSession(resolved.sessionId, { includeEvents: false });
         session = data?.session || null;
         const st = session?.status;
         const hasEval = Boolean(data?.evaluation);
@@ -253,7 +323,7 @@ export default function InterviewJoin() {
     try {
       await api.endInterviewSession(resolved.sessionId, { reason: "candidate_ended" });
       try {
-        const data = await api.getInterviewSession(resolved.sessionId);
+        const data = await api.getInterviewSession(resolved.sessionId, { includeEvents: false });
         setCompletion(data);
       } catch {
         setCompletion({ session: { status: "ended" }, evaluation: null });
@@ -321,6 +391,20 @@ export default function InterviewJoin() {
         }
       `}</style>
 
+      {phase === "precheck" && joinToken && (
+        <InterviewPrecheck
+          joinToken={joinToken}
+          onPrecheckPassed={() => {
+            try {
+              sessionStorage.setItem(interviewPrecheckStorageKey(joinToken), "1");
+            } catch {
+              /* ignore */
+            }
+            setPhase("resolve_loading");
+          }}
+        />
+      )}
+
       {phase === "resolve_loading" && <ResolveLoadingScreen />}
 
       {phase === "error" && errorInfo && (
@@ -384,21 +468,23 @@ export default function InterviewJoin() {
         </div>
       )}
 
-      <div
-        style={{
-          position: "fixed",
-          bottom: 0,
-          left: 0,
-          right: 0,
-          zIndex: 100,
-          padding: "10px 16px 14px",
-          display: "flex",
-          justifyContent: "center",
-          pointerEvents: "none",
-        }}
-      >
-        <PoweredByHirecorrecto compact />
-      </div>
+      {phase !== "precheck" && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 0,
+            left: 0,
+            right: 0,
+            zIndex: 100,
+            padding: "10px 16px 14px",
+            display: "flex",
+            justifyContent: "center",
+            pointerEvents: "none",
+          }}
+        >
+          <PoweredByHirecorrecto compact />
+        </div>
+      )}
     </>
   );
 }
@@ -699,7 +785,34 @@ function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionSta
   const canvasRef = useRef(null);
   const inflightRef = useRef(false);
   const abortRef = useRef(null);
+  const accumulatorRef = useRef(createProctorAccumulator());
+  const tabSwitchCountRef = useRef(0);
+  const tabHiddenAtRef = useRef(null);
+  const lastToastRef = useRef({});
+  const proctorStreakRef = useRef({ lighting: 0, face: 0, frontal: 0, eyes: 0, reading: 0 });
   const [active, setActive] = useState(false);
+  const [toasts, setToasts] = useState([]);
+
+  const bumpProctorStreak = useCallback((key, bad) => {
+    const streak = proctorStreakRef.current;
+    if (bad) {
+      streak[key] = (streak[key] || 0) + 1;
+      return streak[key] >= PROCTOR_TOAST_STREAK_NEED;
+    }
+    streak[key] = 0;
+    return false;
+  }, []);
+
+  const pushToast = useCallback((message, key = message) => {
+    const now = Date.now();
+    if (lastToastRef.current[key] && now - lastToastRef.current[key] < 8000) return;
+    lastToastRef.current[key] = now;
+    const id = `${key}-${now}`;
+    setToasts((items) => [...items.slice(-2), { id, message }]);
+    window.setTimeout(() => {
+      setToasts((items) => items.filter((item) => item.id !== id));
+    }, 4500);
+  }, []);
 
   useEffect(() => {
     if (!room || !sessionId || !candidateIdentity) {
@@ -751,16 +864,29 @@ function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionSta
       if (videoEl) videoEl.srcObject = null;
     };
 
+    let retryTimer = null;
+
+    const queueRetry = () => {
+      if (cancelled || retryTimer) return;
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        refresh();
+      }, PROCTOR_TRACK_RETRY_MS);
+    };
+
     const refresh = async () => {
       if (cancelled) return;
       const mst = findCameraTrack();
       if (!mst) {
         detachStream();
         setActive(false);
+        queueRetry();
         return;
       }
       const ok = await attachStream(mst);
-      if (!cancelled) setActive(Boolean(ok));
+      if (cancelled) return;
+      setActive(Boolean(ok));
+      if (!ok) queueRetry();
     };
 
     refresh();
@@ -772,6 +898,7 @@ function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionSta
 
     return () => {
       cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
       localParticipant.off?.("trackPublished", trackChange);
       localParticipant.off?.("trackUnpublished", trackChange);
       localParticipant.off?.("trackMuted", trackChange);
@@ -783,6 +910,41 @@ function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionSta
 
   useEffect(() => {
     if (!active || !sessionId) return undefined;
+
+    let analysisCancelled = false;
+    const analyzeTick = async () => {
+      const videoEl = videoRef.current;
+      if (!videoEl || !videoEl.videoWidth || !videoEl.videoHeight) return;
+      const sample = await analyzeProctorFrame(videoEl, {
+        calibration: accumulatorRef.current.calibration(),
+      });
+      if (analysisCancelled) return;
+      accumulatorRef.current.add(sample);
+      const summary = accumulatorRef.current.summary();
+      if (bumpProctorStreak("lighting", sample.lightingOk === false)) {
+        pushToast("Lighting is low. Please move to a brighter place.", "lighting");
+      }
+      if (bumpProctorStreak("face", sample.facePresent === false)) {
+        pushToast("Please keep your face visible in the camera.", "face-missing");
+      }
+      if (bumpProctorStreak("frontal", sample.frontalOk === false)) {
+        pushToast("Please face the camera directly.", "face-frontal");
+      }
+      const eyeOffCenterNow =
+        sample?.eyeDirection &&
+        !["unknown", "head_not_frontal", "center"].includes(sample.eyeDirection);
+      if (bumpProctorStreak("eyes", eyeOffCenterNow)) {
+        pushToast("Please keep your eyes near the interview screen.", "eyes");
+      }
+      if (summary.readingPatternWarning) {
+        pushToast(
+          "We detected extended looking away from the screen. Please keep your focus on the interview.",
+          "reading-pattern",
+        );
+      }
+    };
+    const analysisTimer = setInterval(analyzeTick, 1000);
+    analyzeTick();
 
     const captureOnce = async () => {
       if (inflightRef.current) return;
@@ -813,16 +975,24 @@ function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionSta
 
       const local = room?.localParticipant;
       const meta = {
+        frameKind: "camera_interval",
         capturedAt: new Date().toISOString(),
         cameraEnabled: Boolean(local?.isCameraEnabled),
         micEnabled: Boolean(local?.isMicrophoneEnabled),
         screenShareEnabled: Boolean(local?.isScreenShareEnabled),
+        screenCaptureActive: isScreenCaptureActive(),
+        screenCaptureSurface: getScreenCaptureInfo().displaySurface,
+        tabSwitchCount: tabSwitchCountRef.current,
+        tabHiddenAt: tabHiddenAtRef.current,
+        tabVisibleAt: typeof document !== "undefined" && document.visibilityState === "visible" ? new Date().toISOString() : null,
         connectionState,
         documentVisibility: typeof document !== "undefined" ? document.visibilityState : null,
         windowFocused: typeof document !== "undefined" ? document.hasFocus?.() ?? null : null,
         width: targetW,
         height: targetH,
         userAgent: typeof navigator !== "undefined" ? navigator.userAgent : null,
+        ...accumulatorRef.current.summary(),
+        ...(await getNetworkSignals()),
       };
 
       const controller = new AbortController();
@@ -851,6 +1021,8 @@ function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionSta
     document.addEventListener("visibilitychange", onVisible);
 
     return () => {
+      analysisCancelled = true;
+      clearInterval(analysisTimer);
       clearTimeout(startTimer);
       clearInterval(interval);
       document.removeEventListener("visibilitychange", onVisible);
@@ -863,13 +1035,71 @@ function ProctorFrameCapture({ room, sessionId, candidateIdentity, connectionSta
         abortRef.current = null;
       }
     };
-  }, [active, sessionId, room, connectionState]);
+  }, [active, sessionId, room, connectionState, pushToast, bumpProctorStreak]);
+
+  useEffect(() => {
+    if (!sessionId) return undefined;
+
+    const uploadTabSwitchFrame = async (hiddenAt) => {
+      const stream = getScreenCaptureStream();
+      if (!isScreenCaptureActive() || !stream) {
+        pushToast("Screen sharing stopped. Please re-enable it for tab-switch monitoring.", "screen-stopped");
+        return;
+      }
+      try {
+        const frame = await captureStreamFrame(stream, { maxWidth: 1280, quality: 0.72 });
+        if (!frame?.blob) return;
+        await api.uploadInterviewProctorFrame(sessionId, frame.blob, {
+          frameKind: "tab_switch",
+          capturedAt: new Date().toISOString(),
+          tabSwitchCount: tabSwitchCountRef.current,
+          tabHiddenAt: hiddenAt,
+          tabVisibleAt: null,
+          screenCaptureActive: true,
+          screenCaptureSurface: getScreenCaptureInfo().displaySurface,
+          documentVisibility: typeof document !== "undefined" ? document.visibilityState : null,
+          width: frame.width,
+          height: frame.height,
+          ...accumulatorRef.current.summary(),
+          ...(await getNetworkSignals()),
+        });
+      } catch {
+        /* best effort */
+      }
+    };
+
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        tabSwitchCountRef.current += 1;
+        tabHiddenAtRef.current = new Date().toISOString();
+        window.setTimeout(() => uploadTabSwitchFrame(tabHiddenAtRef.current), 1200);
+        return;
+      }
+      if (document.visibilityState === "visible" && !isScreenCaptureActive()) {
+        pushToast("Screen sharing stopped. Please re-enable it for tab-switch monitoring.", "screen-stopped");
+      }
+    };
+
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [sessionId, pushToast]);
 
   return (
-    <div aria-hidden style={styles.proctorHidden}>
-      <video ref={videoRef} muted playsInline />
-      <canvas ref={canvasRef} />
-    </div>
+    <>
+      {toasts.length > 0 && (
+        <div style={styles.proctorToastStack} aria-live="polite">
+          {toasts.map((toast) => (
+            <div key={toast.id} style={styles.proctorToast}>
+              {toast.message}
+            </div>
+          ))}
+        </div>
+      )}
+      <div aria-hidden style={styles.proctorHidden}>
+        <video ref={videoRef} muted playsInline />
+        <canvas ref={canvasRef} />
+      </div>
+    </>
   );
 }
 
@@ -1457,5 +1687,25 @@ const styles = {
     pointerEvents: "none",
     left: -10000,
     top: -10000,
+  },
+  proctorToastStack: {
+    position: "absolute",
+    top: 58,
+    right: 14,
+    zIndex: 40,
+    display: "flex",
+    flexDirection: "column",
+    gap: 8,
+    width: "min(320px, calc(100vw - 32px))",
+    pointerEvents: "none",
+  },
+  proctorToast: {
+    borderRadius: 10,
+    border: "1px solid rgba(251,191,36,0.35)",
+    background: "rgba(15,23,42,0.92)",
+    color: "#fde68a",
+    padding: "10px 12px",
+    fontSize: "0.82rem",
+    boxShadow: "0 14px 30px -18px rgba(0,0,0,0.9)",
   },
 };
