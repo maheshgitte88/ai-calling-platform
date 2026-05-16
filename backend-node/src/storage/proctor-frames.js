@@ -2,6 +2,7 @@ import {
   BlobServiceClient,
   StorageSharedKeyCredential,
 } from "@azure/storage-blob";
+import { webcrypto } from "node:crypto";
 import { env } from "../config.js";
 
 /**
@@ -12,6 +13,10 @@ import { env } from "../config.js";
  */
 
 let _containerClient = null;
+
+if (!globalThis.crypto) {
+  globalThis.crypto = webcrypto;
+}
 
 function getContainerClient() {
   if (_containerClient) return _containerClient;
