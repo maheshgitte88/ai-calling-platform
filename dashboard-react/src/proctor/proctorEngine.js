@@ -3,6 +3,7 @@ import {
   FilesetResolver,
   ImageSegmenter,
 } from "@mediapipe/tasks-vision";
+import { API_BASE } from "../services/api.js";
 
 const TASKS_VERSION = "0.10.35";
 const LOCAL_WASM_PATH = "/mediapipe/wasm";
@@ -77,33 +78,33 @@ async function createEngine() {
     originalInfo.apply(console, args);
   };
   try {
-  const wasmPath = (await resourceExists(`${LOCAL_WASM_PATH}/vision_wasm_internal.wasm`))
-    ? LOCAL_WASM_PATH
-    : CDN_WASM_PATH;
-  const vision = await FilesetResolver.forVisionTasks(wasmPath);
-  const faceModel = await chooseAsset(LOCAL_FACE_MODEL, CDN_FACE_MODEL);
-  const segmenterModel = await chooseAsset(LOCAL_SEGMENTER_MODEL, CDN_SEGMENTER_MODEL);
+    const wasmPath = (await resourceExists(`${LOCAL_WASM_PATH}/vision_wasm_internal.wasm`))
+      ? LOCAL_WASM_PATH
+      : CDN_WASM_PATH;
+    const vision = await FilesetResolver.forVisionTasks(wasmPath);
+    const faceModel = await chooseAsset(LOCAL_FACE_MODEL, CDN_FACE_MODEL);
+    const segmenterModel = await chooseAsset(LOCAL_SEGMENTER_MODEL, CDN_SEGMENTER_MODEL);
 
-  const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: faceModel },
-    runningMode: "VIDEO",
-    numFaces: 2,
-    outputFaceBlendshapes: true,
-    outputFacialTransformationMatrixes: true,
-  });
-
-  let imageSegmenter = null;
-  try {
-    imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: segmenterModel },
+    const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: faceModel },
       runningMode: "VIDEO",
-      outputCategoryMask: true,
+      numFaces: 2,
+      outputFaceBlendshapes: true,
+      outputFacialTransformationMatrixes: true,
     });
-  } catch {
-    imageSegmenter = null;
-  }
 
-  return { faceLandmarker, imageSegmenter, modelReady: true, wasmPath, faceModel, segmenterModel };
+    let imageSegmenter = null;
+    try {
+      imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: segmenterModel },
+        runningMode: "VIDEO",
+        outputCategoryMask: true,
+      });
+    } catch {
+      imageSegmenter = null;
+    }
+
+    return { faceLandmarker, imageSegmenter, modelReady: true, wasmPath, faceModel, segmenterModel };
   } finally {
     console.info = originalInfo;
   }
@@ -117,30 +118,30 @@ async function createImageEngine() {
     originalInfo.apply(console, args);
   };
   try {
-  const wasmPath = (await resourceExists(`${LOCAL_WASM_PATH}/vision_wasm_internal.wasm`))
-    ? LOCAL_WASM_PATH
-    : CDN_WASM_PATH;
-  const vision = await FilesetResolver.forVisionTasks(wasmPath);
-  const faceModel = await chooseAsset(LOCAL_FACE_MODEL, CDN_FACE_MODEL);
-  const segmenterModel = await chooseAsset(LOCAL_SEGMENTER_MODEL, CDN_SEGMENTER_MODEL);
-  const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
-    baseOptions: { modelAssetPath: faceModel },
-    runningMode: "IMAGE",
-    numFaces: 2,
-    outputFaceBlendshapes: true,
-    outputFacialTransformationMatrixes: true,
-  });
-  let imageSegmenter = null;
-  try {
-    imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
-      baseOptions: { modelAssetPath: segmenterModel },
+    const wasmPath = (await resourceExists(`${LOCAL_WASM_PATH}/vision_wasm_internal.wasm`))
+      ? LOCAL_WASM_PATH
+      : CDN_WASM_PATH;
+    const vision = await FilesetResolver.forVisionTasks(wasmPath);
+    const faceModel = await chooseAsset(LOCAL_FACE_MODEL, CDN_FACE_MODEL);
+    const segmenterModel = await chooseAsset(LOCAL_SEGMENTER_MODEL, CDN_SEGMENTER_MODEL);
+    const faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+      baseOptions: { modelAssetPath: faceModel },
       runningMode: "IMAGE",
-      outputCategoryMask: true,
+      numFaces: 2,
+      outputFaceBlendshapes: true,
+      outputFacialTransformationMatrixes: true,
     });
-  } catch {
-    imageSegmenter = null;
-  }
-  return { faceLandmarker, imageSegmenter, modelReady: true, wasmPath, faceModel, segmenterModel };
+    let imageSegmenter = null;
+    try {
+      imageSegmenter = await ImageSegmenter.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: segmenterModel },
+        runningMode: "IMAGE",
+        outputCategoryMask: true,
+      });
+    } catch {
+      imageSegmenter = null;
+    }
+    return { faceLandmarker, imageSegmenter, modelReady: true, wasmPath, faceModel, segmenterModel };
   } finally {
     console.info = originalInfo;
   }
@@ -646,7 +647,7 @@ export async function getNetworkSignals() {
   let apiPingMs = null;
   try {
     const started = performance.now();
-    await fetch("/api/interviews/sessions?limit=1", { method: "GET", cache: "no-store" });
+    await fetch(`${API_BASE}/interviews/sessions?limit=1`, { method: "GET", cache: "no-store" });
     apiPingMs = Math.round(performance.now() - started);
   } catch {
     apiPingMs = null;
